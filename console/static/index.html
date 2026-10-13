@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>autotrade 交易控制台</title>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="https://unpkg.com/element-plus@2.9.1/dist/index.css" />
+  <link rel="stylesheet" href="https://unpkg.com/element-plus@2.9.1/theme-chalk/dark/css-vars.css" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div id="app" v-cloak>
+    <!-- 顶栏 -->
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo">autotrade</span>
+        <span class="sub">交易控制台 · 1M 实时 · 限价 + STOP 子单</span>
+      </div>
+      <div class="statusbar">
+        <span class="risk-input">
+          <span class="risk-label">单笔资金 $</span>
+          <el-input-number v-model="riskUsd" :min="10" :step="100" size="small" controls-position="right" style="width:110px"></el-input-number>
+        </span>
+        <span class="risk-input">
+          <span class="risk-label">最大仓位</span>
+          <el-input-number v-model="maxPositionPct" :min="10" :max="200" :step="10" size="small" controls-position="right" style="width:110px"></el-input-number>
+        </span>
+        <el-tag :type="status.dry_run ? 'warning' : 'danger'" effect="dark" size="small">{{ status.dry_run ? 'DRY-RUN' : 'LIVE' }}</el-tag>
+        <el-tag :type="status.connected ? 'success' : 'info'" effect="dark" size="small">{{ status.connected ? 'IBKR 已连接' : 'IBKR 未连接' }}</el-tag>
+        <el-tag v-if="!status.market_running" type="danger" effect="dark" size="small">行情断开</el-tag>
+        <span class="stat-item">净值 <b>{{ fmtMoney(status.equity) }}</b></span>
+        <span class="stat-item">日盈亏 <b :class="pnlClass(status.daily_pnl)">{{ fmtMoney(status.daily_pnl) }}</b></span>
+        <span class="stat-item">TV <b>{{ clock(tvTime) }}</b></span>
+        <span class="stat-item">IBKR <b>{{ clock(ibkrTime) }}</b></span>
+        <span class="stat-item">更新延时 <b :class="(status.bar_update_delay || 0) > 5 ? 'delay-warn' : ''">{{ status.bar_update_delay == null ? '—' : status.bar_update_delay + 's' }}</b></span>
+        <span class="stat-item">最大 <b>{{ maxDelay }}s</b></span>
+      </div>
+    </header>
+
+    <main class="layout">
+      <div class="workspace">
+      <!-- 四宫格下单台（左） -->
+      <section class="grid">
+        <div v-for="(slot, i) in slotRows" :key="i" class="tile" :class="slot.side === 'long' ? 'tile-long' : (slot.side === 'short' ? 'tile-short' : '')">
+          <!-- 第一行：选股 + 现价 -->
+          <div class="tile-head">
+            <el-select v-model="slots[i].symbol" filterable placeholder="选择股票" class="tile-select" :ref="el => setSelectRef(el, i)" @keyup.enter="confirmSelect(i)">
+              <el-option v-for="sym in watchlist" :key="sym" :label="sym.split(':').pop()" :value="sym"></el-option>
+            </el-select>
+            <span class="price-value">{{ slot.close }}</span>
+          </div>
+
+          <!-- tab：EMA / ST回踩 -->
+          <el-tabs v-model="slots[i].limitType" class="tile-tabs" stretch>
+            <el-tab-pane label="EMA" name="ema"></el-tab-pane>
+            <el-tab-pane label="ST回踩" name="channel"></el-tab-pane>
+          </el-tabs>
+
+          <!-- 当前 tab 的限价 + 止损 -->
+          <div class="tile-quote">
+            <div class="quote-row">
+              <span class="indic-label">{{ slots[i].limitType === 'ema' ? 'EMA7 限价' : '通道 限价' }}</span>
+              <b class="accent quote-val">{{ slot.limitPx }}</b>
+            </div>
+            <div class="quote-row">
+              <span class="indic-label">ST 止损</span>
+              <b class="stop quote-val">{{ slot.stopPx }}</b>
+            </div>
+            <div class="quote-row" v-if="slot.stopDist != null">
+              <span class="indic-label">止损距离</span>
+              <b :class="slot.tooClose ? 'warn' : ''">{{ slot.stopDist }}<span v-if="slot.tooClose" class="warn-tag">⚠ 过近</span></b>
+            </div>
+          </div>
+
+          <!-- 计算结果 -->
+          <div class="tile-calc">
+            <div class="calc-row">
+              <div class="calc-item"><span class="calc-label">限价</span><b class="accent">{{ slot.limitPx }}</b></div>
+              <div class="calc-item"><span class="calc-label">股数</span><b>{{ slot.qty }}</b></div>
+            </div>
+            <div class="calc-row">
+              <div class="calc-item"><span class="calc-label">金额</span><b>{{ fmtMoney(slot.amount) }}</b></div>
+              <div class="calc-item"><span class="calc-label">仓位占比</span><b class="risk">{{ slot.equityRatio }}%</b></div>
+            </div>
+          </div>
+
+          <!-- 下单按钮（多绿空红，含实际风险） -->
+          <el-button :type="slot.side === 'long' ? 'success' : 'danger'" class="tile-btn" :disabled="!slot.ready || placing" @click="placeOrder(slot)">
+            {{ slot.side === 'short' ? '卖空' : '买入' }} {{ slot.qty }} 股 · {{ slots[i].limitType === 'ema' ? 'EMA' : 'ST回踩' }}（风险{{ fmtMoney(slot.risk) }}）
+          </el-button>
+        </div>
+      </section>
+
+      <!-- 订单批次（右） -->
+      <section class="panel orders">
+        <h2 class="panel-title">订单批次（止损子单随父单自动取消）</h2>
+        <el-table :data="lots" size="small" style="width:100%">
+          <el-table-column prop="lot_id" label="批次" width="110"></el-table-column>
+          <el-table-column prop="symbol" label="标的" width="110"></el-table-column>
+          <el-table-column label="方向" width="70">
+            <template #default="{ row }">
+              <el-tag :type="row.side === 'long' ? 'success' : 'danger'" size="small" effect="dark">{{ row.side === 'long' ? '多' : '空' }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="状态" width="100">
+            <template #default="{ row }"><el-tag :type="stateTag(row.state)" size="small">{{ row.state }}</el-tag></template>
+          </el-table-column>
+          <el-table-column prop="qty" label="股数" width="75"></el-table-column>
+          <el-table-column prop="entry_px" label="限价" width="90"></el-table-column>
+          <el-table-column prop="stop_px" label="止损" width="90"></el-table-column>
+          <el-table-column prop="reason" label="备注" min-width="140" show-overflow-tooltip></el-table-column>
+          <el-table-column label="盈亏" width="100">
+            <template #default="{ row }"><b :class="pnlClass(row.pnl)">{{ fmtMoney(row.pnl) }}</b></template>
+          </el-table-column>
+          <el-table-column label="操作" width="150" fixed="right">
+            <template #default="{ row }">
+              <el-button size="small" type="warning" :disabled="row.state !== 'ACTIVE'" @click="closeLot(row)">平仓</el-button>
+              <el-button size="small" type="danger" :disabled="!(row.state === 'PENDING' || (status.dry_run && row.state === 'ACTIVE'))" @click="cancelLot(row)">撤单</el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+
+        <!-- 底部面板：选股 / 运行日志（tab 切换，与订单表格平分高度） -->
+        <div class="log-panel">
+          <el-tabs v-model="bottomTab" class="bottom-tabs">
+            <!-- 回踩信号 tab -->
+            <el-tab-pane name="stab">
+              <template #label>信号<b v-if="stabEvents.filter(e => e.stage === 'confirmed').length" class="stab-badge">{{ stabEvents.filter(e => e.stage === 'confirmed').length }}</b></template>
+              <div class="stab-panel">
+                <div class="stab-header">
+                  <span class="muted">入场信号</span>
+                  <el-button size="small" type="danger" plain @click="clearSignals">清除信号</el-button>
+                </div>
+                <div v-if="!stabEvents.length" class="muted log-empty">暂无 ST 回踩信号</div>
+                <div v-for="ev in stabEvents" :key="ev.symbol" class="stab-row" :class="'stab-' + ev.stage">
+                  <span class="screen-ticker">{{ ev.ticker }}</span>
+                  <span :class="ev.side === 'long' ? 'screen-tag-long' : 'screen-tag-short'">{{ ev.side === 'long' ? '多' : '空' }}</span>
+                  <span class="stab-stage">{{ stabStage(ev) }}</span>
+                  <span v-if="ev.stage === 'confirmed'" class="muted">限价{{ ev.limit_px }} 止损{{ ev.stop_px }}</span>
+                  <span class="stab-actions">
+                    <el-button v-if="ev.stage === 'confirmed'" size="small" type="success" @click="confirmStab(ev)">下单</el-button>
+                  </span>
+                </div>
+              </div>
+            </el-tab-pane>
+            <!-- 选股 tab -->
+            <el-tab-pane label="选股" name="screen">
+              <div class="screen-grid">
+                <div class="screen-col">
+                  <div class="screen-col-title long">多头（强→弱）</div>
+                  <div v-for="r in screen.long" :key="r.symbol" class="screen-row" :class="[r.qualified ? 'screen-ok-long' : 'screen-gray', r.pullback ? 'pullback-blink' : '']" @click="pickScreen(r)">
+                    <span class="screen-ticker">{{ r.ticker }}</span>
+                    <span class="screen-bars">{{ r.bars }}根</span>
+                    <span class="screen-atr pnl-pos">+{{ r.move_atr }}</span>
+                  </div>
+                  <div v-if="!screen.long.length" class="muted log-empty">暂无多头</div>
+                </div>
+                <div class="screen-col" v-if="allowShort">
+                  <div class="screen-col-title short">空头（强→弱）</div>
+                  <div v-for="r in screen.short" :key="r.symbol" class="screen-row" :class="[r.qualified ? 'screen-ok-short' : 'screen-gray', r.pullback ? 'pullback-blink' : '']" @click="pickScreen(r)">
+                    <span class="screen-ticker">{{ r.ticker }}</span>
+                    <span class="screen-bars">{{ r.bars }}根</span>
+                    <span class="screen-atr pnl-neg">{{ r.move_atr }}</span>
+                  </div>
+                  <div v-if="!screen.short.length" class="muted log-empty">暂无空头</div>
+                </div>
+                <div class="screen-col screen-col-pb">
+                  <div class="screen-col-title pb">回踩事件</div>
+                  <div v-for="r in screen.pullbacks" :key="r.symbol" class="screen-row pullback-blink" @click="pickScreen(r)">
+                    <span class="screen-ticker">{{ r.ticker }}</span>
+                    <span :class="r.side === 'long' ? 'screen-tag-long' : 'screen-tag-short'">{{ r.side === 'long' ? '多' : '空' }}</span>
+                    <span class="screen-atr" :class="r.side === 'long' ? 'pnl-pos' : 'pnl-neg'">{{ r.side === 'long' ? '+' : '' }}{{ r.move_atr }}</span>
+                  </div>
+                  <div v-if="!screen.pullbacks.length" class="muted log-empty">暂无回踩</div>
+                </div>
+              </div>
+            </el-tab-pane>
+            <!-- 运行日志 tab -->
+            <el-tab-pane label="运行日志" name="log">
+              <div class="log-body">
+                <div v-for="(l, i) in logs" :key="i" class="log-line" :class="'log-' + l.level.toLowerCase()">
+                  <span class="log-time">{{ logTime(l.ts) }}</span>
+                  <span class="log-level">{{ l.level }}</span>
+                  <span class="log-name">{{ l.name }}</span>
+                  <span class="log-msg">{{ l.msg }}</span>
+                </div>
+                <div v-if="!logs.length" class="muted log-empty">暂无日志</div>
+              </div>
+            </el-tab-pane>
+            <el-tab-pane label="绩效" name="perf">
+              <div class="perf-panel">
+                <div v-if="!performance || !performance.count" class="muted log-empty">暂无交易记录（平仓后自动归档统计）</div>
+                <template v-else>
+                  <div class="perf-overall">
+                    <div class="perf-stat"><span>总笔数</span><b>{{ performance.count }}</b></div>
+                    <div class="perf-stat"><span>胜率</span><b>{{ performance.overall.win_rate }}%</b></div>
+                    <div class="perf-stat"><span>盈亏比</span><b>{{ performance.overall.profit_factor ?? '—' }}</b></div>
+                    <div class="perf-stat"><span>累计盈亏</span><b :class="pnlClass(performance.overall.total_pnl)">{{ fmtMoney(performance.overall.total_pnl) }}</b></div>
+                    <div class="perf-stat"><span>每笔期望</span><b :class="pnlClass(performance.overall.expectancy)">{{ fmtMoney(performance.overall.expectancy) }}</b></div>
+                    <div class="perf-stat"><span>平均浮亏MAE</span><b class="pnl-neg">{{ fmtMoney(performance.overall.avg_mae) }}</b></div>
+                    <div class="perf-stat"><span>平均浮盈MFE</span><b class="pnl-pos">{{ fmtMoney(performance.overall.avg_mfe) }}</b></div>
+                    <div class="perf-stat"><span>目标RR</span><b>{{ performance.overall.avg_target_rr }}</b></div>
+                    <div class="perf-stat"><span>实际RR</span><b :class="pnlClass(performance.overall.avg_actual_rr)">{{ performance.overall.avg_actual_rr }}</b></div>
+                  </div>
+                  <div class="perf-group">
+                    <div class="perf-group-title">按信号类型</div>
+                    <div v-for="(s, k) in performance.by_type" :key="k" class="perf-row">
+                      <span class="perf-name">{{ k || '未知' }}</span>
+                      <span>笔数{{ s.count }}</span>
+                      <span>胜率{{ s.win_rate }}%</span>
+                      <span>RR {{ s.avg_actual_rr }}</span>
+                      <b :class="pnlClass(s.total_pnl)">{{ fmtMoney(s.total_pnl) }}</b>
+                    </div>
+                  </div>
+                  <div class="perf-group">
+                    <div class="perf-group-title">按方向</div>
+                    <div v-for="(s, k) in performance.by_side" :key="k" class="perf-row">
+                      <span class="perf-name">{{ k === 'long' ? '多头' : '空头' }}</span>
+                      <span>笔数{{ s.count }}</span>
+                      <span>胜率{{ s.win_rate }}%</span>
+                      <span>RR {{ s.avg_actual_rr }}</span>
+                      <b :class="pnlClass(s.total_pnl)">{{ fmtMoney(s.total_pnl) }}</b>
+                    </div>
+                  </div>
+                </template>
+              </div>
+            </el-tab-pane>
+            <el-tab-pane label="事件" name="events">
+              <div class="events-panel">
+                <div class="events-filter">
+                  <el-select v-model="eventFilter" size="small" style="width:140px">
+                    <el-option label="全部事件" value="all"></el-option>
+                    <el-option label="回踩信号" value="pierce_signal"></el-option>
+                    <el-option label="下单" value="order_placed"></el-option>
+                    <el-option label="平仓" value="order_closed"></el-option>
+                    <el-option label="撤单" value="order_cancelled"></el-option>
+                  </el-select>
+                  <span class="muted" style="margin-left:8px">共 {{ filteredEvents.length }} 条</span>
+                </div>
+                <div class="events-list">
+                  <div v-if="!filteredEvents.length" class="muted log-empty">暂无事件</div>
+                  <div v-for="(e, i) in filteredEvents" :key="i" class="event-row">
+                    <span class="event-time">{{ logTime(e.ts) }}</span>
+                    <span class="event-type" :class="'evt-' + e.type">{{ eventTypeText(e.type) }}</span>
+                    <span class="event-ticker">{{ (e.symbol || '').split(':').pop() || e.ticker || '—' }}</span>
+                    <span class="event-detail muted">{{ e.side || '' }} {{ e.qty ? 'x' + e.qty : '' }} {{ e.limit_px ? '@' + e.limit_px : '' }} {{ e.error || '' }}</span>
+                  </div>
+                </div>
+              </div>
+            </el-tab-pane>
+          </el-tabs>
+        </div>
+      </section>
+      </div>
+    </main>
+  </div>
+
+  <script src="https://unpkg.com/vue@3.5.13/dist/vue.global.prod.js"></script>
+  <script src="https://unpkg.com/element-plus@2.9.1/dist/index.full.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

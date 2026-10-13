@@ -1,0 +1,137 @@
+# -*- coding: utf-8 -*-
+"""
+风控硬性限额 (RiskGate)
+=======================
+
+实盘唯一兜底（验证路径跳过 paper 直接实盘小仓位），
+第一笔真实订单前必须就位。所有开仓请求必须先过 RiskGate。
+
+规则（参数集中在 config.py 的 RISK_* 段）：
+1. 以损定量：qty = RISK_PER_TRADE_USD / (entry - stop)，再被
+   RISK_MAX_ORDER_QTY 封顶；
+2. 同时持仓数 <= RISK_MAX_OPEN_POSITIONS；
+3. 日亏损熔断：当日累计盈亏 <= -RISK_DAILY_LOSS_LIMIT_USD 后，
+   当日不再开新仓（halt 状态落盘 logs/halt-YYYYMMDD，重启不丢）；
+4. 止损价合法性：多仓 stop < entry、空仓 stop > entry，且距离 > 0。
+
+参考 nautilus_ibkr_helloworld 的分层风控（时段/熔断/冷却/以损定量），
+v1 先实现硬性限额，冷却/相关组等后续补。
+"""
+
+import logging
+import math
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+HALT_DIR = PROJECT_ROOT / "logs"
+
+
+@dataclass(frozen=True)
+class RiskConfig:
+    per_trade_pct: float = 0.001      # 单笔风险 = 账户净值 × 0.1%
+    per_trade_usd: float = 200.0      # 净值未知时的降级固定额
+    max_order_qty: int = 200
+    max_open_positions: int = 3
+    daily_loss_limit_usd: float = 1000.0
+    daily_loss_halt_enabled: bool = False  # 日亏损熔断开关（默认关闭）
+
+
+class RiskGate:
+    """开仓前的硬性风控闸门。全部方法纯内存 + halt 标志落盘。"""
+
+    def __init__(self, cfg: RiskConfig, halt_dir: Path = HALT_DIR) -> None:
+        self.cfg = cfg
+        self._halt_dir = halt_dir
+
+    # ------------------------------------------------------------------
+    # 以损定量
+    # ------------------------------------------------------------------
+
+    def size_position(self, entry: float, stop: float,
+                      equity: Optional[float] = None) -> int:
+        """
+        qty = floor(风险额 / |entry - stop|)，风险额 = 净值 × per_trade_pct
+        （equity 为 None 时用 per_trade_usd 固定额）。返回 0 = 距离非法。
+        """
+        dist = abs(entry - stop)
+        if dist <= 0:
+            return 0
+        risk_usd = (equity * self.cfg.per_trade_pct
+                    if equity else self.cfg.per_trade_usd)
+        qty = math.floor(risk_usd / dist)
+        return min(qty, self.cfg.max_order_qty)
+
+    # ------------------------------------------------------------------
+    # 开仓检查
+    # ------------------------------------------------------------------
+
+    def check_new_order(self, symbol: str, side: str, entry: float,
+                        stop: float, qty: int,
+                        open_positions: int,
+                        daily_pnl: Optional[float] = None,
+                        risk_usd: float = 0) -> Tuple[bool, str]:
+        """
+        返回 (是否放行, 原因)。daily_pnl 为当日累计盈亏（实时+已实现），
+        由调用方从 IBKR 账户摘要取得；None = 取不到（FA 口径未解决时），
+        熔断检查跳过但每次显式告警（不静默失效）。
+        risk_usd 为设定风险金额：实际风险（qty×|entry−stop|）超出其 10% 则拦截。
+        """
+        if self.is_halted():
+            return False, "日亏损熔断中，今日不再开新仓"
+        if self.cfg.daily_loss_halt_enabled and daily_pnl is not None:
+            if daily_pnl <= -self.cfg.daily_loss_limit_usd:
+                self.halt(f"daily_pnl={daily_pnl:.2f} 触发熔断")
+                return False, f"日亏损 {daily_pnl:.2f} 达到熔断线，已熔断"
+        if open_positions >= self.cfg.max_open_positions:
+            return False, (f"持仓数 {open_positions} 达到上限 "
+                           f"{self.cfg.max_open_positions}")
+        if qty <= 0:
+            return False, "qty <= 0"
+        if stop <= 0 or entry <= 0:
+            return False, f"价格非法: entry={entry} stop={stop}（止损必须为正）"
+        if qty > self.cfg.max_order_qty:
+            return False, f"qty {qty} 超过单笔硬顶 {self.cfg.max_order_qty}"
+        if side == "long" and not stop < entry:
+            return False, f"多仓止损 {stop} 必须低于入场 {entry}"
+        if side == "short" and not stop > entry:
+            return False, f"空仓止损 {stop} 必须高于入场 {entry}"
+        # 风险偏差容差：实际风险 ≤ 设定风险 × 1.10（允许 10% 上浮）
+        if risk_usd and risk_usd > 0:
+            actual = qty * abs(entry - stop)
+            if actual > risk_usd * 1.10:
+                return False, (f"实际风险 {actual:.2f} 超出设定风险 "
+                               f"{risk_usd:.2f} 的 10% 容差")
+        return True, "ok"
+
+    # ------------------------------------------------------------------
+    # 熔断状态（落盘防重启绕过，按自然日生效）
+    # ------------------------------------------------------------------
+
+    def _halt_file(self) -> Path:
+        return self._halt_dir / f"halt-{time.strftime('%Y%m%d')}"
+
+    def is_halted(self) -> bool:
+        return self._halt_file().exists()
+
+    def halt(self, reason: str) -> None:
+        try:
+            self._halt_dir.mkdir(parents=True, exist_ok=True)
+            self._halt_file().write_text(
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} {reason}\n",
+                encoding="utf-8")
+        except OSError:
+            logger.exception("熔断标志落盘失败")
+        logger.error("🚨 风控熔断: %s", reason)
+
+    def reset_halt(self) -> bool:
+        """人工解除当日熔断（谨慎使用）。"""
+        try:
+            self._halt_file().unlink(missing_ok=True)
+            return True
+        except OSError:
+            return False

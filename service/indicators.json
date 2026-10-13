@@ -1,0 +1,52 @@
+[
+  {
+    "key": "supertrend",
+    "id": "STD;Supertrend",
+    "name": "超级趋势(内置, 5M 信号源)",
+    "comment": "STD 内置指标, translate 匿名可得; plots: Up_Trend/Down_Trend/Body_Middle/趋势切换信号"
+  },
+  {
+    "key": "supertrend_1m",
+    "id": "STD;Supertrend",
+    "timeframe": "1",
+    "inputs": {
+      "Factor": 2.0,
+      "ATR_Length": 10
+    },
+    "name": "超级趋势1M(10,2) 跟踪止损线",
+    "comment": "1分钟周期 ST(10,2)，线值作为 TRAIL 跟踪止损的初始触发价"
+  },
+  {
+    "key": "fast_slow_ma",
+    "id": "USER;5c1a17e8fd934e30adb3aa7aad30a42c",
+    "name": "fast slow ma(私有)",
+    "comment": "用户私有脚本, 需 sessionid; plots: MA_1/MA_2 等"
+  },
+  {
+    "key": "attack_zone",
+    "id": "USER;8ab4f534e5874b47b24a5ce5c49acace",
+    "name": "5M 进攻区域(私有)",
+    "comment": "用户私有脚本, 图形型指标(boxes/lines) + Bar_Color 方向值; 实测必须 extended 会话才有输出"
+  },
+  {
+    "key": "st_channel_www",
+    "id": "USER;f1157c7728c047069c21e72dcb8f94a2",
+    "name": "st_channel_www (SuperTrend Channel)",
+    "comment": "SuperTrend+Channel 组合; Up_Trend/Down_Trend=ST止损线, Uptrend_Channel=ST+ATR(多头通道上边), Downtrend_Channel=ST-ATR(空头通道下边), Body_Middle=中线; 参数 ATR Length=10 ST Factor=3 Channel ATR Multiplier=1"
+  },
+  {
+    "key": "ema7",
+    "id": "STD;EMA",
+    "inputs": {
+      "Length": 7
+    },
+    "name": "EMA(7)",
+    "comment": "EMA 限价单价格线; STD;EMA Length=7; 云端 plot 字段名 'EMA'"
+  },
+  {
+    "key": "st_strength",
+    "id": "USER;aa6f71ec42fc48839479878b4a36965d",
+    "name": "st_strength (趋势强度)",
+    "comment": "趋势强度: plot0=持续K线数 plot1=整体平均ATR plot2=推动幅度 plot3=推动ATR数; 参数 ATR Length=10 ST Factor=3"
+  }
+]

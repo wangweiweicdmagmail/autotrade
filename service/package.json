@@ -1,0 +1,13 @@
+{
+  "name": "autotrade-tv-cloud",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TradingView 云端数据服务：基于 @mathieuc/tradingview (TradingView-API) 后台获取 K线/指标/信号数据",
+  "main": "tv_cloud.js",
+  "scripts": {
+    "collect": "node tv_cloud.js"
+  },
+  "dependencies": {
+    "@mathieuc/tradingview": "^3.0.1"
+  }
+}

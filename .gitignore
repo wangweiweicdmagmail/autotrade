@@ -1,0 +1,11 @@
+# 敏感凭据（TradingView sessionid，切勿提交）
+service/creds.json
+
+# 运行日志与交易记录（含交易信号/账户数据，切勿提交）
+logs/
+
+# 依赖与缓存
+node_modules/
+__pycache__/
+*.pyc
+.DS_Store
