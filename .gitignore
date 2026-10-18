@@ -1,6 +1,9 @@
 # 敏感凭据（TradingView sessionid，切勿提交）
 service/creds.json
 
+# LLM API key（交易 Agent，切勿提交）
+.env
+
 # 运行日志与交易记录（含交易信号/账户数据，切勿提交）
 logs/
 

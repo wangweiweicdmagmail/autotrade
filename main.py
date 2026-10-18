@@ -44,6 +44,7 @@ from engine.strategy import (
 from execution.ibkr import IBKRGateway
 from execution.position import PositionManager
 from execution.risk import RiskConfig, RiskGate
+from execution.writer_lock import acquire_writer_lock
 
 logger = logging.getLogger(__name__)
 
@@ -311,6 +312,8 @@ def main() -> None:
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, stop_event.set)
+        if not acquire_writer_lock("logs/autotrade_writer.lock"):
+            raise RuntimeError("另一个 autotrade 执行写进程正在运行，禁止重复管理订单")
         await scheduler(stop_event)
 
     try:

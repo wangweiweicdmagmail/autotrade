@@ -10,9 +10,9 @@ TradingView 实时订阅采集器 (RealtimeCollector)
 数据流：
     node tv_cloud_daemon.js --symbols ...（常驻，每 1s 输出 tick）
       -> Python asyncio subprocess stdout 逐行解析
-        -> self._snapshot: {symbol: {bar, ema7, st}}
+        -> self._snapshot: {symbol: {bar, bar_c, ts, ts_c}}
 
-1M K线/EMA7 + 5M st_channel（ST 线 + channel 边沿）。
+5M K线 + trend_state 单指标（ts=实时值，ts_c=上一根已收盘确认值）。
 """
 
 import asyncio
@@ -115,7 +115,7 @@ class RealtimeCollector:
                 logger.warning("daemon 重启失败（5s 后重试）: %s", e)
 
     def latest(self) -> Dict[str, dict]:
-        """返回最新快照 {symbol: {bar, ema7, st}}。"""
+        """返回最新快照 {symbol: {bar, bar_c, ts, ts_c}}。"""
         return self._snapshot
 
     def age(self) -> float:

@@ -51,17 +51,59 @@ COLLECT_TIMEOUT = 15.0
 # 后台监控的股票池 = 用户的 TradingView 自选列表（2026-10-09 从图表 CDP 同步）
 # 同步脚本：service/sync_watchlist.py（从 TV 图表右侧自选表读取并写回本列表）
 WATCHLIST: List[str] = [
-    "BLACKBULL:WTI", "NASDAQ:PANW", "NASDAQ:APP", "NYSE:CRCL",
-    "NASDAQ:HOOD", "NASDAQ:QCOM", "NASDAQ:COIN", "NASDAQ:MSTR",
-    "NASDAQ:AVGO", "NASDAQ:SPCX", "NASDAQ:MU", "NASDAQ:SNDK",
-    "NASDAQ:SKHY", "NASDAQ:MRVL", "NASDAQ:SMCI", "NASDAQ:NBIS",
-    "NASDAQ:ARM", "NYSE:BE", "NASDAQ:WMT", "NASDAQ:NFLX",
-    "NASDAQ:ADBE", "NYSE:UBER", "NASDAQ:PLTR", "NASDAQ:AAPL",
-    "NASDAQ:MRNA", "AMEX:SPY", "CAPITALCOM:SPX500", "NASDAQ:GOOGL",
-    "NYSE:BA", "NASDAQ:META", "NASDAQ:MSFT", "NASDAQ:QQQ",
-    "NYSE:DELL", "NASDAQ:AMZN", "CAPITALCOM:NAS100", "NYSE:BABA",
-    "NASDAQ:TSLA", "NASDAQ:NVDA", "NASDAQ:SMH", "NYSE:TSM",
-    "NASDAQ:AMD", "NYSE:ORCL", "NASDAQ:INTC", "NASDAQ:CRWV",
+    "NASDAQ:NBIS",
+    "NASDAQ:PANW",
+    "NASDAQ:SMCI",
+    "NASDAQ:SKHY",
+    "NASDAQ:SNDK",
+    "NASDAQ:MSTR",
+    "NASDAQ:ARM",
+    "NASDAQ:MU",
+    "NASDAQ:MRVL",
+    "NYSE:BE",
+    "NASDAQ:AVGO",
+    "NASDAQ:SPCX",
+    "NASDAQ:APP",
+    "NASDAQ:QCOM",
+    "NASDAQ:COIN",
+    "BLACKBULL:WTI",
+    "NYSE:CRCL",
+    "NASDAQ:HOOD",
+    "NASDAQ:TSLA",
+    "NASDAQ:WMT",
+    "NASDAQ:MRNA",
+    "NASDAQ:CRWV",
+    "NYSE:SNOW",
+    "NASDAQ:PLTR",
+    "NYSE:NOW",
+    "NASDAQ:AMD",
+    "NASDAQ:INTC",
+    "NASDAQ:NFLX",
+    "NYSE:DELL",
+    "NYSE:ORCL",
+    "NASDAQ:ADBE",
+    "NASDAQ:META",
+    "NYSE:UNH",
+    "NYSE:TSM",
+    "NASDAQ:SMH",
+    "NASDAQ:GOOGL",
+    "NASDAQ:QQQ",
+    "NASDAQ:MSFT",
+    "CAPITALCOM:NAS100",
+    "NASDAQ:AMZN",
+    "OTC:RBLK",
+    "NYSE:UBER",
+    "AMEX:SPY",
+    "CAPITALCOM:SPX500",
+    "NYSE:BABA",
+    "AMEX:XLV",
+    "NASDAQ:NVDA",
+    "NASDAQ:AAPL",
+    "NASDAQ:ASML",
+    "AMEX:XLP",
+    "NYSE:BA",
+    "AMEX:XLB",
+    "AMEX:XLU"
 ]
 
 # 八宫格布局参数（对齐 Premium 套餐每标签页 8 图上限）
@@ -178,19 +220,50 @@ RISK_PER_TRADE_USD = 200.0        # 净值未知时的降级固定风险额
 RISK_MAX_ORDER_QTY = 100000       # 单笔最大股数硬顶（仅极端兜底，不再干扰以损定量）
 RISK_MAX_OPEN_POSITIONS = 3       # 最大同时持仓数
 RISK_DAILY_LOSS_LIMIT_USD = 1000.0  # 日亏损熔断（SOD 净值锚点口径）
-ALLOW_SHORT = False               # 是否允许做空（暂时只做多头）
-ENTRY_LIMIT_PREMIUM_PCT = 0.5     # 入场用 marketable LIMIT：限价 = 参考价 ±0.5%
+ALLOW_SHORT = True                # 是否允许做空（2026-10-17 起双向交易：
+                                  # 方向 = trend_state/ST 方向，无反向订单）
+ENTRY_LIMIT_PREMIUM_PCT = 0.5     # marketable 限价溢价（平仓单用）
                                   # （延迟行情下 IBKR 拒 bare MARKET，error 10349）
 
-# 跟踪止损（TRAIL 括号子单，止损止盈一体）：
-#   初始触发价 = 1 分钟 SuperTrend(10,2) 线值（云端采集 st_1m_line）
-#   跟踪幅度   = TRAIL_ATR_MULT × ATR(14)（5M，随信号快照采集）
+# ⚠️ 已废弃（2026-10-17）：TRAIL 跟踪止损路径已删除，止损统一为
+#    STP 固定止损子单，触发价 = 限价 ∓ 1×ATR（trend_state 的 Atr_Value）。
+#    以下两个配置仅被旧 main.py 提案卡链路引用，控制台链路不再使用。
 TRAIL_ATR_MULT = 2.0
-TP_RR = 0.0                       # 不挂独立止盈单：TRAIL 跟踪止损兼任止盈
+TP_RR = 0.0
 
 # ---------------------------------------------------------------------------
 # 运行模式开关
 # ---------------------------------------------------------------------------
+
+# 工具订单专用 88 数字号段；其他系统不得复用。发号状态含跨进程锁与原子写。
+TOOL_ORDER_ID_BASE = 88000000
+TOOL_ORDER_ID_MAX = 88999999
+TOOL_ORDER_ID_STATE_PATH = "logs/tool_order_id.json"
+
+# 持仓扫描与止损守卫
+AUTO_CLOSE_ON_ST_FLIP = True
+STOP_GUARD_ENABLED = True
+
+# 外部订单清理：号段外且不在旧工具白名单的挂单撤销、持仓平仓（默认按用户要求开启）
+EXTERNAL_ORDER_CLEANUP_ENABLED = _os.environ.get("EXTERNAL_ORDER_CLEANUP_ENABLED", "1") == "1"
+
+# 全自动策略：单引擎并行实例上限（理论无上限，实际最多 5 个）
+AUTO_MAX_INSTANCES = 5
+
+
+def validate_config() -> None:
+    required = (
+        "TOOL_ORDER_ID_BASE", "TOOL_ORDER_ID_MAX", "TOOL_ORDER_ID_STATE_PATH",
+        "AUTO_CLOSE_ON_ST_FLIP", "STOP_GUARD_ENABLED",
+        "EXTERNAL_ORDER_CLEANUP_ENABLED",
+    )
+    missing = [name for name in required if name not in globals()]
+    if missing:
+        raise RuntimeError(f"缺少运行配置: {', '.join(missing)}")
+    if TOOL_ORDER_ID_BASE > TOOL_ORDER_ID_MAX:
+        raise RuntimeError("工具订单号段配置无效")
+
+
 # 数据源选择：
 #   "mock"  - 内置模拟数据源，无需任何外部连接，跑通全流程用
 #   "cloud" - TradingView 云端数据服务（service/tv_cloud.js，

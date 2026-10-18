@@ -1,0 +1,240 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © wangweiweicdma
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © wangweiweicdma
+
+//@version=6
+indicator("trend_state", overlay = true, timeframe = "", timeframe_gaps = true)
+// indicator("trend_state", overlay = true)
+
+//====================================================================
+// 输入参数
+//====================================================================
+
+atrPeriod = input.int(10, "ATR Length", minval = 1)
+
+factor = input.float(
+     3.0,
+     "Supertrend Factor",
+     minval = 0.01,
+     step = 0.01
+)
+
+channelATR = input.float(
+     1.2,
+     "Channel ATR Multiplier",
+     minval = 0.0,
+     step = 0.1
+)
+
+grpState  = "趋势状态判断"
+stateLB   = input.int(5, "回看 K 线数", minval = 1, group = grpState)
+atrMult   = input.float(1, "EMA 差值 > ATR ×", minval = 0.0, step = 0.1, group = grpState)
+showTable = input.bool(true, "右上角显示状态", group = grpState)
+showZone  = input.bool(true, "EMA 面积填充", group = grpState)
+
+emafast = ta.ema(close, 20)
+emaslow = ta.ema(close, 100)
+
+ema_size = emafast - emaslow
+
+//====================================================================
+// Supertrend
+//====================================================================
+
+[supertrend, direction] = ta.supertrend(factor, atrPeriod)
+
+supertrend := barstate.isfirst ? na : supertrend
+
+atr = ta.atr(atrPeriod)
+
+isUpTrend = direction < 0
+isDownTrend = direction > 0
+
+//====================================================================
+// ST 延续时间（5M bar 数）与 ST 线推进次数
+//====================================================================
+
+stDir = isUpTrend ? 1 : isDownTrend ? -1 : 0
+stFlip = stDir != nz(stDir[1], stDir)
+stPush = (isUpTrend and not na(supertrend[1]) and supertrend > supertrend[1]) or (isDownTrend and not na(supertrend[1]) and supertrend < supertrend[1])
+
+var int stStartBar = bar_index
+var int stPushCount = 0
+if stFlip
+    stStartBar := bar_index
+    stPushCount := 0
+else if stPush
+    stPushCount += 1
+
+stDurationBars = bar_index - stStartBar
+
+//====================================================================
+// 趋势状态判断
+// 单边多头 = 1，单边空头 = -1，震荡 = 0
+//====================================================================
+
+ema_size_prev = ema_size[stateLB]
+
+// 数据未就绪（前 stateLB 根 / EMA 未形成 / ATR 未形成）时，状态直接判 false
+dataOK = not na(ema_size) and not na(ema_size_prev) and not na(atr)
+
+// 条件 2：当前与 stateLB 根前都保持 close/fast/slow 同向排列
+bullAlign = close > emafast and emafast > emaslow and close[stateLB] > emafast[stateLB] and emafast[stateLB] > emaslow[stateLB]
+bearAlign = close < emafast and emafast < emaslow and close[stateLB] < emafast[stateLB] and emafast[stateLB] < emaslow[stateLB]
+
+// 条件 1+2+3+4，dataOK 为 false 时整体即 false，不会产生 na
+bullOK = dataOK and isUpTrend   and bullAlign and ema_size >  atr * atrMult 
+bearOK = dataOK and isDownTrend and bearAlign and ema_size < -atr * atrMult 
+
+trendState = bullOK ? 1 : bearOK ? -1 : 0
+
+//====================================================================
+// 状态输出 1：数据窗口数值
+// 注：autotrade 数据层（service/tv_cloud_daemon.js）通过 WS 订阅读取 plot 值，
+//     未 plot 的变量读不到。字段名 = plot 标题（空格转下划线）。
+//====================================================================
+
+plot(trendState, "Trend State", display = display.data_window)
+plot(atr, "Atr Value", display = display.data_window)
+plot(stDurationBars, "ST Duration Bars", display = display.data_window)
+plot(stPushCount, "ST Push Count", display = display.data_window)
+
+//====================================================================
+// 状态输出 2：右上角状态表
+//====================================================================
+
+// var table stateTable = table.new(position.top_right, 1, 2, bgcolor = color.new(color.black, 20))
+
+// if showTable and barstate.islast
+//     stateTxt = bullOK ? "单边多头" : bearOK ? "单边空头" : "震荡"
+//     stateCol = bullOK ? color.green : bearOK ? color.red : color.gray
+//     table.cell(stateTable, 0, 0, "趋势状态", text_color = color.gray, text_size = size.small)
+//     table.cell(stateTable, 0, 1, stateTxt + "  (" + str.tostring(trendState) + ")", text_color = color.white, bgcolor = stateCol, text_size = size.large)
+
+//====================================================================
+// EMA 面积图
+// 状态 1 = 绿，-1 = 红，0 = 灰
+//====================================================================
+
+pFast = plot(emafast, "EMA Fast", color = color.new(color.orange, 0), linewidth = 2)
+pSlow = plot(emaslow, "EMA Slow", color = color.new(color.blue, 0), linewidth = 2)
+
+zoneColor = trendState == 1 ? color.new(color.green, 10) : trendState == -1 ? color.new(color.red, 10) : color.new(color.gray, 70)
+fill(pFast, pSlow, title = "EMA Zone", color = showZone ? zoneColor : color.new(color.white, 100))
+
+//====================================================================
+// ATR Channel（原逻辑）
+//====================================================================
+
+channelEdge = isUpTrend
+     ? supertrend + atr * channelATR
+     : supertrend - atr * channelATR
+
+channelEdge := barstate.isfirst ? na : channelEdge
+
+//====================================================================
+// Supertrend 主线（原逻辑）
+//====================================================================
+
+upTrend = plot(
+     isUpTrend ? supertrend : na,
+     "Up Trend",
+     color = color.green,
+     linewidth = 3,
+     style = plot.style_linebr
+)
+
+downTrend = plot(
+     isDownTrend ? supertrend : na,
+     "Down Trend",
+     color = color.red,
+     linewidth = 3,
+     style = plot.style_linebr
+)
+
+upChannel = plot(
+     isUpTrend ? channelEdge : na,
+     "Uptrend Channel",
+     color = color.green,
+     linewidth = 1,
+     style = plot.style_linebr
+)
+
+downChannel = plot(
+     isDownTrend ? channelEdge : na,
+     "Downtrend Channel",
+     color = color.red,
+     linewidth = 1,
+     style = plot.style_linebr
+)
+
+//====================================================================
+// 原版 Supertrend 背景（原逻辑）
+//====================================================================
+
+bodyMiddle = plot(
+     barstate.isfirst ? na : (open + close) / 2,
+     "Body Middle",
+     display = display.none
+)
+
+fill(
+     bodyMiddle,
+     upTrend,
+     title = "Uptrend background",
+     color = color.new(color.green, 90),
+     fillgaps = false
+)
+
+fill(
+     bodyMiddle,
+     downTrend,
+     title = "Downtrend background",
+     color = color.new(color.red, 90),
+     fillgaps = false
+)
+
+//====================================================================
+// 原 Alerts（不动）
+//====================================================================
+
+alertcondition(
+     direction[1] > direction,
+     title = "Downtrend to Uptrend",
+     message = "The Supertrend value switched from Downtrend to Uptrend"
+)
+
+alertcondition(
+     direction[1] < direction,
+     title = "Uptrend to Downtrend",
+     message = "The Supertrend value switched from Uptrend to Downtrend"
+)
+
+alertcondition(
+     direction[1] != direction,
+     title = "Trend Change",
+     message = "The Supertrend value switched from Uptrend to Downtrend or vice versa"
+)
+
+//====================================================================
+// 状态切换 Alerts
+//====================================================================
+alertcondition(
+     trendState == 1 and nz(trendState[1], 0) != 1,
+     title = "进入单边多头",
+     message = "trendState = 1：单边多头开始"
+)
+
+alertcondition(
+     trendState == -1 and nz(trendState[1], 0) != -1,
+     title = "进入单边空头",
+     message = "trendState = -1：单边空头开始"
+)
+
+alertcondition(
+     trendState == 0 and nz(trendState[1], 0) != 0,
+     title = "进入震荡",
+     message = "trendState = 0：震荡开始"
+)
+

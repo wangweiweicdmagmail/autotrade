@@ -15,7 +15,7 @@
     <header class="topbar">
       <div class="brand">
         <span class="logo">autotrade</span>
-        <span class="sub">交易控制台 · 1M 实时 · 限价 + STOP 子单</span>
+        <span class="sub">交易控制台 · 5M 实时 · 限价 + STOP 子单</span>
       </div>
       <div class="statusbar">
         <span class="risk-input">
@@ -40,7 +40,7 @@
 
     <main class="layout">
       <div class="workspace">
-      <!-- 四宫格下单台（左） -->
+      <!-- 宫格下单台（左） -->
       <section class="grid">
         <div v-for="(slot, i) in slotRows" :key="i" class="tile" :class="slot.side === 'long' ? 'tile-long' : (slot.side === 'short' ? 'tile-short' : '')">
           <!-- 第一行：选股 + 现价 -->
@@ -51,25 +51,34 @@
             <span class="price-value">{{ slot.close }}</span>
           </div>
 
-          <!-- tab：EMA / ST回踩 -->
+          <!-- tab：EMA快线 / 通道边沿 / 中点限价单 -->
           <el-tabs v-model="slots[i].limitType" class="tile-tabs" stretch>
-            <el-tab-pane label="EMA" name="ema"></el-tab-pane>
-            <el-tab-pane label="ST回踩" name="channel"></el-tab-pane>
+            <el-tab-pane label="EMA快线" name="ema"></el-tab-pane>
+            <el-tab-pane label="通道边沿" name="channel"></el-tab-pane>
+            <el-tab-pane label="中点限价单" name="midpoint"></el-tab-pane>
           </el-tabs>
 
           <!-- 当前 tab 的限价 + 止损 -->
           <div class="tile-quote">
             <div class="quote-row">
-              <span class="indic-label">{{ slots[i].limitType === 'ema' ? 'EMA7 限价' : '通道 限价' }}</span>
-              <b class="accent quote-val">{{ slot.limitPx }}</b>
+              <span class="indic-label">{{ slots[i].limitType === 'ema' ? 'EMA快线 限价' : (slots[i].limitType === 'channel' ? '通道边沿 限价' : '中点 限价') }}</span>
+              <b class="accent quote-val">{{ slot.limitPx ?? '—' }}</b>
             </div>
             <div class="quote-row">
-              <span class="indic-label">ST 止损</span>
-              <b class="stop quote-val">{{ slot.stopPx }}</b>
+              <span class="indic-label">止损 1×ATR</span>
+              <b class="stop quote-val">{{ slot.stopPx ?? '—' }}</b>
             </div>
             <div class="quote-row" v-if="slot.stopDist != null">
               <span class="indic-label">止损距离</span>
-              <b :class="slot.tooClose ? 'warn' : ''">{{ slot.stopDist }}<span v-if="slot.tooClose" class="warn-tag">⚠ 过近</span></b>
+              <b>{{ slot.stopDist }}</b>
+            </div>
+            <div class="quote-row">
+              <span class="indic-label">趋势状态</span>
+              <b :class="trendClass(slot.trendState)">{{ trendText(slot.trendState) }}</b>
+            </div>
+            <div class="quote-row">
+              <span class="indic-label">EMA 发散度</span>
+              <b>{{ slot.divergence ?? '—' }}</b>
             </div>
           </div>
 
@@ -83,36 +92,51 @@
               <div class="calc-item"><span class="calc-label">金额</span><b>{{ fmtMoney(slot.amount) }}</b></div>
               <div class="calc-item"><span class="calc-label">仓位占比</span><b class="risk">{{ slot.equityRatio }}%</b></div>
             </div>
+            <div class="calc-row">
+              <div class="calc-item"><span class="calc-label">实际风险</span><b class="risk-red">{{ fmtMoney(slot.risk) }}</b></div>
+            </div>
           </div>
 
-          <!-- 下单按钮（多绿空红，含实际风险） -->
-          <el-button :type="slot.side === 'long' ? 'success' : 'danger'" class="tile-btn" :disabled="!slot.ready || placing" @click="placeOrder(slot)">
-            {{ slot.side === 'short' ? '卖空' : '买入' }} {{ slot.qty }} 股 · {{ slots[i].limitType === 'ema' ? 'EMA' : 'ST回踩' }}（风险{{ fmtMoney(slot.risk) }}）
+          <!-- 下单按钮（多绿空红，震荡禁用） -->
+          <el-button :type="slot.side === 'long' ? 'success' : (slot.side === 'short' ? 'danger' : 'info')" class="tile-btn" :disabled="!slot.ready || placing" @click="placeOrder(slot)">
+            {{ slot.side === 'long' ? '买入' : (slot.side === 'short' ? '卖出' : '震荡') }} {{ slot.qty }} 股 · {{ typeLabel(slots[i].limitType) }}
           </el-button>
         </div>
       </section>
 
       <!-- 订单批次（右） -->
       <section class="panel orders">
-        <h2 class="panel-title">订单批次（止损子单随父单自动取消）</h2>
-        <el-table :data="lots" size="small" style="width:100%">
-          <el-table-column prop="lot_id" label="批次" width="110"></el-table-column>
+        <h2 class="panel-title">订单批次（全生命周期跟踪：挂单→持仓→平仓）</h2>
+        <el-table :data="sortedLots" size="small" style="width:100%">
           <el-table-column prop="symbol" label="标的" width="110"></el-table-column>
-          <el-table-column label="方向" width="70">
+          <el-table-column label="状态" width="130">
             <template #default="{ row }">
-              <el-tag :type="row.side === 'long' ? 'success' : 'danger'" size="small" effect="dark">{{ row.side === 'long' ? '多' : '空' }}</el-tag>
+              <el-tag :type="stateTag(row.state)" size="small">{{ row.state }}</el-tag>
+              <div v-if="row.state === 'CLOSED' && row.exit_reason" class="muted exit-reason">{{ exitReasonLabel(row.exit_reason) }}</div>
             </template>
           </el-table-column>
-          <el-table-column label="状态" width="100">
-            <template #default="{ row }"><el-tag :type="stateTag(row.state)" size="small">{{ row.state }}</el-tag></template>
+          <el-table-column label="股数" width="75">
+            <template #default="{ row }">{{ row.state === 'PENDING' ? row.qty : row.filled_qty }}</template>
           </el-table-column>
-          <el-table-column prop="qty" label="股数" width="75"></el-table-column>
-          <el-table-column prop="entry_px" label="限价" width="90"></el-table-column>
-          <el-table-column prop="stop_px" label="止损" width="90"></el-table-column>
-          <el-table-column prop="reason" label="备注" min-width="140" show-overflow-tooltip></el-table-column>
-          <el-table-column label="盈亏" width="100">
-            <template #default="{ row }"><b :class="pnlClass(row.pnl)">{{ fmtMoney(row.pnl) }}</b></template>
+          <el-table-column label="入/限价" width="90">
+            <template #default="{ row }">{{ row.avg_fill > 0 ? row.avg_fill.toFixed(2) : row.entry_px.toFixed(2) }}</template>
           </el-table-column>
+          <el-table-column prop="stop_px" label="止损" width="90">
+            <template #default="{ row }">{{ row.stop_px > 0 ? row.stop_px.toFixed(2) : '—' }}</template>
+          </el-table-column>
+          <el-table-column label="平仓价" width="90">
+            <template #default="{ row }">{{ row.state === 'CLOSED' && row.exit_px > 0 ? row.exit_px.toFixed(2) : '—' }}</template>
+          </el-table-column>
+          <el-table-column label="盈亏" width="110">
+            <template #default="{ row }">
+              <template v-if="row.state === 'CLOSED' || row.state === 'ACTIVE' || row.state === 'CLOSING'">
+                <b :class="pnlClass(lotPnl(row))">{{ fmtMoney(lotPnl(row)) }}</b>
+                <div v-if="row.state === 'CLOSED' && row.actual_rr" class="muted exit-reason">RR {{ row.actual_rr }}</div>
+              </template>
+              <span v-else class="muted">—</span>
+            </template>
+          </el-table-column>
+          <el-table-column prop="reason" label="备注" min-width="120" show-overflow-tooltip></el-table-column>
           <el-table-column label="操作" width="150" fixed="right">
             <template #default="{ row }">
               <el-button size="small" type="warning" :disabled="row.state !== 'ACTIVE'" @click="closeLot(row)">平仓</el-button>
@@ -124,56 +148,252 @@
         <!-- 底部面板：选股 / 运行日志（tab 切换，与订单表格平分高度） -->
         <div class="log-panel">
           <el-tabs v-model="bottomTab" class="bottom-tabs">
-            <!-- 回踩信号 tab -->
-            <el-tab-pane name="stab">
-              <template #label>信号<b v-if="stabEvents.filter(e => e.stage === 'confirmed').length" class="stab-badge">{{ stabEvents.filter(e => e.stage === 'confirmed').length }}</b></template>
-              <div class="stab-panel">
-                <div class="stab-header">
-                  <span class="muted">入场信号</span>
-                  <el-button size="small" type="danger" plain @click="clearSignals">清除信号</el-button>
+            <!-- 选股 tab -->
+            <el-tab-pane label="选股" name="screen">
+              <div class="screen-wrap">
+                <div class="screen-sort">
+                  <span>排序（高→低）</span>
+                  <el-select v-model="screenSort" size="small" style="width:150px">
+                    <el-option label="EMA 发散度" value="divergence"></el-option>
+                    <el-option label="ST 持续根数" value="duration"></el-option>
+                    <el-option label="ST 推进次数" value="push"></el-option>
+                  </el-select>
                 </div>
-                <div v-if="!stabEvents.length" class="muted log-empty">暂无 ST 回踩信号</div>
-                <div v-for="ev in stabEvents" :key="ev.symbol" class="stab-row" :class="'stab-' + ev.stage">
-                  <span class="screen-ticker">{{ ev.ticker }}</span>
-                  <span :class="ev.side === 'long' ? 'screen-tag-long' : 'screen-tag-short'">{{ ev.side === 'long' ? '多' : '空' }}</span>
-                  <span class="stab-stage">{{ stabStage(ev) }}</span>
-                  <span v-if="ev.stage === 'confirmed'" class="muted">限价{{ ev.limit_px }} 止损{{ ev.stop_px }}</span>
-                  <span class="stab-actions">
-                    <el-button v-if="ev.stage === 'confirmed'" size="small" type="success" @click="confirmStab(ev)">下单</el-button>
-                  </span>
+                <div class="screen-grid">
+                  <div class="screen-col">
+                    <div class="screen-col-title long">多头（强→弱）</div>
+                    <div v-for="r in sortedScreenLong" :key="r.symbol" class="screen-row" :class="r.qualified ? 'screen-ok-long' : 'screen-gray'" @click="pickScreen(r)">
+                      <span class="screen-ticker">{{ r.ticker }}</span>
+                      <span class="screen-close">{{ r.close }}</span>
+                      <span class="screen-st">ST {{ r.st_duration_bars == null ? '—' : r.st_duration_bars + '根' }} / {{ r.st_push_count == null ? '—' : r.st_push_count + '次' }}</span>
+                      <span class="screen-atr pnl-pos" title="|EMA20 − EMA100| / ATR(10)">{{ r.divergence }}</span>
+                    </div>
+                    <div v-if="!sortedScreenLong.length" class="muted log-empty">暂无多头</div>
+                  </div>
+                  <div class="screen-col">
+                    <div class="screen-col-title short">空头（强→弱）</div>
+                    <div v-for="r in sortedScreenShort" :key="r.symbol" class="screen-row" :class="r.qualified ? 'screen-ok-short' : 'screen-gray'" @click="pickScreen(r)">
+                      <span class="screen-ticker">{{ r.ticker }}</span>
+                      <span class="screen-close">{{ r.close }}</span>
+                      <span class="screen-st">ST {{ r.st_duration_bars == null ? '—' : r.st_duration_bars + '根' }} / {{ r.st_push_count == null ? '—' : r.st_push_count + '次' }}</span>
+                      <span class="screen-atr pnl-neg" title="|EMA20 − EMA100| / ATR(10)">{{ r.divergence }}</span>
+                    </div>
+                    <div v-if="!sortedScreenShort.length" class="muted log-empty">暂无空头</div>
+                  </div>
                 </div>
               </div>
             </el-tab-pane>
-            <!-- 选股 tab -->
-            <el-tab-pane label="选股" name="screen">
-              <div class="screen-grid">
-                <div class="screen-col">
-                  <div class="screen-col-title long">多头（强→弱）</div>
-                  <div v-for="r in screen.long" :key="r.symbol" class="screen-row" :class="[r.qualified ? 'screen-ok-long' : 'screen-gray', r.pullback ? 'pullback-blink' : '']" @click="pickScreen(r)">
-                    <span class="screen-ticker">{{ r.ticker }}</span>
-                    <span class="screen-bars">{{ r.bars }}根</span>
-                    <span class="screen-atr pnl-pos">+{{ r.move_atr }}</span>
-                  </div>
-                  <div v-if="!screen.long.length" class="muted log-empty">暂无多头</div>
+            <!-- 影子回测 tab -->
+            <el-tab-pane label="影子" name="shadow">
+              <div class="perf-panel">
+                <div class="perf-overall">
+                  <div class="perf-stat"><span>事件总数</span><b>{{ shadow.stats.total_events || 0 }}</b></div>
+                  <div class="perf-stat"><span>跟踪中</span><b>{{ shadow.stats.active || 0 }}</b></div>
+                  <div class="perf-stat"><span>已结算</span><b>{{ shadow.stats.settled || 0 }}</b></div>
+                  <div class="perf-stat"><span>止损数</span><b class="pnl-neg">{{ shadow.stats.stopped || 0 }}</b></div>
+                  <div class="perf-stat"><span>未达1R直接亏损</span><b class="pnl-neg">{{ shadow.stats.no_1r_count || 0 }}（{{ shadow.stats.no_1r_pct || 0 }}%）</b></div>
+                  <div class="perf-stat"><span>平均止损前MFE</span><b class="pnl-pos">{{ shadow.stats.avg_mfe_before_stop || 0 }}R</b></div>
+                  <div class="perf-stat"><span>平均收盘前MFE</span><b class="pnl-pos">{{ shadow.stats.avg_mfe_eod || 0 }}R</b></div>
+                  <div class="perf-stat"><span>平均结果RR</span><b :class="pnlClass(shadow.stats.avg_outcome_rr || 0)">{{ shadow.stats.avg_outcome_rr || 0 }}</b></div>
                 </div>
-                <div class="screen-col" v-if="allowShort">
-                  <div class="screen-col-title short">空头（强→弱）</div>
-                  <div v-for="r in screen.short" :key="r.symbol" class="screen-row" :class="[r.qualified ? 'screen-ok-short' : 'screen-gray', r.pullback ? 'pullback-blink' : '']" @click="pickScreen(r)">
-                    <span class="screen-ticker">{{ r.ticker }}</span>
-                    <span class="screen-bars">{{ r.bars }}根</span>
-                    <span class="screen-atr pnl-neg">{{ r.move_atr }}</span>
+                <div class="perf-group">
+                  <div class="perf-group-title">N 倍盈亏比分布（占已结算 %）</div>
+                  <div class="perf-row shadow-dist-head">
+                    <span class="perf-name">N</span>
+                    <span>止损前≥N</span>
+                    <span>收盘前≥N</span>
                   </div>
-                  <div v-if="!screen.short.length" class="muted log-empty">暂无空头</div>
-                </div>
-                <div class="screen-col screen-col-pb">
-                  <div class="screen-col-title pb">回踩事件</div>
-                  <div v-for="r in screen.pullbacks" :key="r.symbol" class="screen-row pullback-blink" @click="pickScreen(r)">
-                    <span class="screen-ticker">{{ r.ticker }}</span>
-                    <span :class="r.side === 'long' ? 'screen-tag-long' : 'screen-tag-short'">{{ r.side === 'long' ? '多' : '空' }}</span>
-                    <span class="screen-atr" :class="r.side === 'long' ? 'pnl-pos' : 'pnl-neg'">{{ r.side === 'long' ? '+' : '' }}{{ r.move_atr }}</span>
+                  <div v-for="n in ['1','2','3','4','5']" :key="n" class="perf-row">
+                    <span class="perf-name">{{ n }}R</span>
+                    <span>{{ (shadow.stats.dist_before_stop[n] || {}).count || 0 }} 笔（{{ (shadow.stats.dist_before_stop[n] || {}).pct || 0 }}%）</span>
+                    <span>{{ (shadow.stats.dist_eod[n] || {}).count || 0 }} 笔（{{ (shadow.stats.dist_eod[n] || {}).pct || 0 }}%）</span>
                   </div>
-                  <div v-if="!screen.pullbacks.length" class="muted log-empty">暂无回踩</div>
                 </div>
+                <div class="perf-group">
+                  <div class="perf-group-title">按线型 / 方向（≥1R 占比）</div>
+                  <div v-for="(d, k) in shadow.stats.by_line" :key="k" class="perf-row">
+                    <span class="perf-name">{{ k === 'ema' ? 'EMA快线' : '通道边沿' }}</span>
+                    <span>笔数{{ d.count }}</span>
+                    <span>≥1R {{ d.pct_ge_1r }}%</span>
+                    <span>平均MFE {{ d.avg_mfe }}R</span>
+                  </div>
+                  <div v-for="(d, k) in shadow.stats.by_side" :key="k" class="perf-row">
+                    <span class="perf-name">{{ k === 'long' ? '多头' : '空头' }}</span>
+                    <span>笔数{{ d.count }}</span>
+                    <span>≥1R {{ d.pct_ge_1r }}%</span>
+                  </div>
+                </div>
+                <div class="perf-group">
+                  <div class="perf-group-title">历史回测（指定标的 + 交易日）</div>
+                  <div class="shadow-bt-form">
+                    <el-input v-model="btSymbol" size="small" placeholder="如 NVDA" style="width:120px"></el-input>
+                    <el-date-picker v-model="btDay" size="small" type="date" value-format="YYYY-MM-DD" placeholder="交易日（默认昨日）" style="width:180px"></el-date-picker>
+                    <el-button size="small" type="primary" :loading="btLoading" @click="runBacktest">回测</el-button>
+                    <span v-if="btError" class="shadow-bt-err">{{ btError }}</span>
+                  </div>
+                  <template v-if="btResult">
+                    <div class="perf-row shadow-dist-head">
+                      <span class="perf-name">{{ btResult.symbol }} {{ btResult.day }}</span>
+                      <span>事件 {{ btResult.stats.total_events }}</span>
+                      <span>未达1R {{ btResult.stats.no_1r_pct }}%</span>
+                      <span>平均结果 {{ btResult.stats.avg_outcome_rr }}R</span>
+                    </div>
+                    <div v-for="t in btResult.trades" :key="t.shadow_id" class="perf-row">
+                      <span class="perf-name">{{ hmET(t.bar_time) }}</span>
+                      <span :class="t.side === 'long' ? 'pnl-pos' : 'pnl-neg'">{{ t.side === 'long' ? '多' : '空' }} {{ t.line_type === 'ema' ? 'EMA' : '通道' }}</span>
+                      <span>入 {{ t.entry }} 损 {{ t.stop }}</span>
+                      <span>止损前 {{ t.mfe_rr }}R / 收盘前 {{ t.mfe_rr_eod }}R</span>
+                      <b :class="pnlClass(t.outcome_rr)">{{ t.outcome_rr }}R</b>
+                    </div>
+                    <div v-if="!btResult.trades.length" class="muted log-empty">该日无回踩事件</div>
+                  </template>
+                </div>
+                <div class="perf-group">
+                  <div class="perf-group-title">当日回踩事件（实时推演）</div>
+                  <div class="perf-row shadow-dist-head">
+                    <span class="perf-name">时间</span>
+                    <span>标的/方向/线</span>
+                    <span>入场/止损</span>
+                    <span>止损前MFE / 收盘前MFE</span>
+                    <span>结果</span>
+                  </div>
+                  <div v-for="t in shadow.events" :key="t.shadow_id" class="perf-row">
+                    <span class="perf-name">{{ hmET(t.bar_time) }}</span>
+                    <span>{{ t.ticker }} <b :class="t.side === 'long' ? 'pnl-pos' : 'pnl-neg'">{{ t.side === 'long' ? '多' : '空' }}</b> {{ t.line_type === 'ema' ? 'EMA' : '通道' }}</span>
+                    <span>{{ t.entry }} / {{ t.stop }}</span>
+                    <span>{{ t.mfe_rr }}R / {{ t.mfe_rr_eod }}R</span>
+                    <b :class="t.settled ? pnlClass(t.outcome_rr) : 'muted'">{{ t.settled ? t.outcome_rr + 'R' : (t.stopped ? '已止损' : '跟踪中') }}</b>
+                  </div>
+                  <div v-if="!shadow.events.length" class="muted log-empty">暂无回踩事件（盘中实时检测：ema_fast / channel_edge 刺穿收回）</div>
+                </div>
+              </div>
+            </el-tab-pane>
+            <!-- 自动策略 tab -->
+            <el-tab-pane :label="auto.proposals && auto.proposals.length ? '自动策略 (' + auto.proposals.length + ')' : '自动策略'" name="auto">
+              <div class="perf-panel">
+                <div class="shadow-bt-form">
+                  <el-tag :type="auto.enabled ? 'success' : 'info'" size="small">
+                    {{ auto.enabled ? '运行中' : '已停止' }}{{ auto.strategy ? ' · ' + auto.strategy : '' }}
+                  </el-tag>
+                  <el-input v-model="autoSymbols" size="small" placeholder="标的，逗号分隔（空=全池，上限5实例）" style="width:300px"></el-input>
+                  <el-button size="small" type="primary" :loading="autoBusy" @click="startAuto">启动</el-button>
+                  <el-button size="small" type="warning" :disabled="!auto.enabled" @click="stopAuto(false)">停止</el-button>
+                  <el-button size="small" type="danger" :disabled="!auto.enabled" @click="stopAuto(true)">停止并全平</el-button>
+                  <span class="muted">tick 产生候选 → 人工确认下单 · bar 收盘管理：2R保本 → ST单向跟踪 · 人工仓自动收养</span>
+                </div>
+                <div v-if="auto.proposals && auto.proposals.length" class="proposal-section">
+                  <div class="perf-group-title">待确认开仓候选（{{ auto.proposals.length }}）· 仅在产生候选的 5M 周期内有效</div>
+                  <div v-for="p in auto.proposals" :key="p.proposal_id" class="proposal-row">
+                    <span class="perf-name">{{ p.symbol.split(':').pop() }}</span>
+                    <span :class="p.side === 'long' ? 'pnl-pos' : 'pnl-neg'">
+                      {{ p.side === 'long' ? '多' : '空' }} / {{ p.line === 'ema' ? 'EMA' : '通道' }}
+                    </span>
+                    <span>发散度 <b>{{ p.divergence == null ? '—' : p.divergence }}</b></span>
+                    <span>ST延续 <b>{{ p.st_duration_bars == null ? '—' : p.st_duration_bars + '根' }}</b> / 推进 <b>{{ p.st_push_count == null ? '—' : p.st_push_count + '次' }}</b></span>
+                    <span>入/损 <b>{{ p.limit_px }} / {{ p.stop_px }}</b></span>
+                    <span>数量 <b>x{{ p.qty }}</b> / 风险 {{ fmtMoney(p.risk_usd) }}</span>
+                    <span>市值 <b>{{ fmtMoney(p.amount) }}</b> / {{ p.position_pct == null ? '净值未知' : p.position_pct + '%' }}</span>
+                    <span class="muted">{{ hmET(p.created_at) }} · {{ Math.max(0, Math.floor(now - p.created_at)) }}s</span>
+                    <span class="proposal-actions">
+                      <el-button size="small" type="primary" :loading="autoProposalBusy[p.proposal_id]" :disabled="p.processing" @click="decideAutoProposal(p, 'approve')">确认开仓</el-button>
+                      <el-button size="small" :disabled="p.processing || autoProposalBusy[p.proposal_id]" @click="decideAutoProposal(p, 'reject')">忽略</el-button>
+                    </span>
+                    <span v-if="p.error" class="proposal-error">{{ p.error }}</span>
+                  </div>
+                </div>
+                <div class="perf-row shadow-dist-head">
+                  <span class="perf-name">标的</span>
+                  <span>状态</span>
+                  <span>方向/线</span>
+                  <span>入场/止损</span>
+                  <span>浮盈R / MFE</span>
+                  <span>备注</span>
+                </div>
+                <div v-for="i in auto.instances" :key="i.inst_id" class="perf-row">
+                  <span class="perf-name">{{ i.symbol.split(':').pop() }}</span>
+                  <span><el-tag size="small" :type="autoStateTag(i.state)">{{ i.state }}{{ i.adopted ? '·养' : '' }}</el-tag></span>
+                  <span :class="i.side === 'long' ? 'pnl-pos' : (i.side === 'short' ? 'pnl-neg' : 'muted')">
+                    {{ i.side === 'long' ? '多' : (i.side === 'short' ? '空' : '—') }}{{ i.line ? ' / ' + i.line : '' }}
+                  </span>
+                  <span>{{ i.entry_px || '—' }} / {{ i.stop_px || '—' }}{{ i.breakeven_done ? ' (已保本)' : '' }}</span>
+                  <span :class="pnlClass(i.unrealized_r)">{{ i.state === 'ACTIVE' ? i.unrealized_r + 'R' : '—' }} / {{ i.mfe_r }}R</span>
+                  <b class="muted">{{ i.done_reason || i.strategy }}</b>
+                </div>
+                <div v-if="!auto.instances.length" class="muted log-empty">暂无策略实例（输入标的点启动；人工开仓会被自动收养管理）</div>
+              </div>
+            </el-tab-pane>
+            <!-- 回测工作台 tab -->
+            <el-tab-pane label="回测" name="backtest">
+              <div class="perf-panel">
+                <div class="shadow-bt-form">
+                  <el-input v-model="wbSymbol" size="small" placeholder="如 NVDA" style="width:110px"></el-input>
+                  <el-date-picker v-model="wbDay" size="small" type="date" value-format="YYYY-MM-DD" placeholder="交易日（默认昨日）" style="width:170px"></el-date-picker>
+                  <el-button size="small" type="primary" :loading="wbLoading" @click="wbLoad">加载数据</el-button>
+                  <template v-if="wb">
+                    <el-button size="small" :disabled="wb.done" @click="wbStep(1)">单步</el-button>
+                    <el-button size="small" :disabled="wb.done" @click="wbStep(10)">步进×10</el-button>
+                    <el-button size="small" type="success" :disabled="wb.done" @click="wbRunAll">全部运行</el-button>
+                    <el-tag size="small" :type="wb.done ? 'info' : 'warning'">{{ wb.cursor }}/{{ wb.total_bars }} 根{{ wb.done ? ' · 已完成' : '' }}</el-tag>
+                  </template>
+                  <span v-if="wbError" class="shadow-bt-err">{{ wbError }}</span>
+                </div>
+                <template v-if="wb">
+                  <div v-if="wb.current_bar" class="bt-bar">
+                    <b>{{ wb.current_bar.hm }}</b>
+                    O{{ wb.current_bar.open }} H{{ wb.current_bar.high }} L{{ wb.current_bar.low }} C{{ wb.current_bar.close }}
+                    <span :class="trendClass(wb.current_bar.trend_state)">{{ trendText(wb.current_bar.trend_state) }}</span>
+                    <span class="muted">EMA {{ fmt2(wb.current_bar.ema_fast) }} · 通道 {{ fmt2(wb.current_bar.channel_edge) }} · ST {{ fmt2(wb.current_bar.supertrend) }} · ATR {{ fmt2(wb.current_bar.atr) }}</span>
+                  </div>
+                  <!-- 策略实例 -->
+                  <div class="perf-group">
+                    <div class="perf-group-title">策略实例</div>
+                    <div v-for="i in wb.instances" :key="i.inst_id" class="perf-row">
+                      <span class="perf-name">{{ i.symbol.split(':').pop() }}</span>
+                      <span><el-tag size="small" :type="autoStateTag(i.state)">{{ i.state }}</el-tag></span>
+                      <span :class="i.side === 'long' ? 'pnl-pos' : (i.side === 'short' ? 'pnl-neg' : 'muted')">{{ i.side === 'long' ? '多' : (i.side === 'short' ? '空' : '—') }}{{ i.line ? ' / ' + i.line : '' }}</span>
+                      <span>{{ i.entry_px || '—' }} / {{ i.stop_px || '—' }}{{ i.breakeven_done ? ' (已保本)' : '' }}</span>
+                      <span :class="pnlClass(i.unrealized_r)">{{ i.state === 'ACTIVE' ? i.unrealized_r + 'R' : '—' }} / {{ i.mfe_r }}R</span>
+                      <b class="muted">{{ i.done_reason || '' }}</b>
+                    </div>
+                  </div>
+                  <!-- 订单生命周期 -->
+                  <div class="perf-group">
+                    <div class="perf-group-title">订单生命周期（{{ wb.orders.length }}）</div>
+                    <div v-for="o in wb.orders" :key="o.lot_id" class="bt-order">
+                      <div class="perf-row">
+                        <span class="perf-name">{{ o.symbol.split(':').pop() }}</span>
+                        <span :class="o.side === 'long' ? 'pnl-pos' : 'pnl-neg'">{{ o.side === 'long' ? '多' : '空' }} x{{ o.qty }}</span>
+                        <span v-if="o.placed">入 {{ o.placed.limit }} 损 {{ o.placed.stop }}</span>
+                        <span v-if="o.closed">出 {{ o.closed.px }} [{{ exitReasonText(o.closed.reason) }}]</span>
+                        <b v-if="o.pnl != null" :class="pnlClass(o.pnl)">{{ o.pnl > 0 ? '+' : '' }}{{ o.pnl }} · {{ o.rr }}R · MFE {{ o.mfe_r }}R</b>
+                        <b v-else class="muted">{{ o.state }}</b>
+                      </div>
+                      <div class="bt-timeline">
+                        <span v-if="o.placed" class="bt-tl">挂单 {{ o.placed.hm }} @{{ o.placed.limit }} / 损 {{ o.placed.stop }}</span>
+                        <span v-if="o.filled" class="bt-tl tl-fill">成交 {{ o.filled.hm }} @{{ o.filled.px }}</span>
+                        <span v-if="o.expired" class="bt-tl muted">过期撤单 {{ o.expired.hm }}</span>
+                        <span v-if="o.breakeven" class="bt-tl tl-be">保本 {{ o.breakeven.hm }} →{{ o.breakeven.stop }}（{{ o.breakeven.unrealized_r }}R）</span>
+                        <span v-for="(t, ti) in o.trails" :key="ti" class="bt-tl tl-trail">跟踪 {{ t.hm }} {{ t.old }}→{{ t.new }}</span>
+                        <span v-if="o.closed" class="bt-tl tl-close">了结 {{ o.closed.hm }} @{{ o.closed.px }}［{{ exitReasonText(o.closed.reason) }}］</span>
+                      </div>
+                    </div>
+                    <div v-if="!wb.orders.length" class="muted log-empty">暂无订单（推进 bar 后产生）</div>
+                  </div>
+                  <!-- 汇总 -->
+                  <div v-if="wb.done && wb.summary.count" class="perf-group">
+                    <div class="perf-group-title">当日汇总</div>
+                    <div class="perf-row">
+                      <span>成交 {{ wb.summary.count }} 笔</span>
+                      <span>胜率 {{ wb.summary.win_rate }}%</span>
+                      <span>总 PnL <b :class="pnlClass(wb.summary.total_pnl)">{{ wb.summary.total_pnl }}</b></span>
+                      <span>平均 RR {{ wb.summary.avg_rr }}</span>
+                      <span>平均 MFE {{ wb.summary.avg_mfe_r }}R</span>
+                      <span>最大 MFE <b class="pnl-pos">{{ wb.summary.max_mfe_r }}R</b></span>
+                      <span>未达1R {{ wb.summary.no_1r_count }}（{{ wb.summary.no_1r_pct }}%）</span>
+                    </div>
+                  </div>
+                </template>
+                <div v-if="!wb" class="muted log-empty">输入标的和交易日，点「加载数据」开始回测；之后可单步推进或全部运行</div>
               </div>
             </el-tab-pane>
             <!-- 运行日志 tab -->
@@ -231,7 +451,8 @@
                 <div class="events-filter">
                   <el-select v-model="eventFilter" size="small" style="width:140px">
                     <el-option label="全部事件" value="all"></el-option>
-                    <el-option label="回踩信号" value="pierce_signal"></el-option>
+                    <el-option label="自动策略" value="auto_prefix"></el-option>
+                    <el-option label="回踩事件" value="pullback_event"></el-option>
                     <el-option label="下单" value="order_placed"></el-option>
                     <el-option label="平仓" value="order_closed"></el-option>
                     <el-option label="撤单" value="order_cancelled"></el-option>

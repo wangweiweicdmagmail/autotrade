@@ -31,14 +31,40 @@ async def fetch_watchlist() -> list:
     if not chart:
         raise RuntimeError("未找到 TV 图表页：请先启动 TradingView Chrome(9222) 并打开图表")
 
-    js = """(() => {
-      const items = document.querySelectorAll('.layout__area--right [data-symbol-full]');
-      return JSON.stringify([...items].map(el => el.getAttribute('data-symbol-full')));
+    # 自选表是虚拟列表（只渲染可见行），必须边滚动边收集取并集，
+    # 否则只能读到前 ~44 行（2026-10-16 实测 scrollHeight 1644 只渲染 44/52）。
+    js = """(async () => {
+      const root = document.querySelector('.layout__area--right');
+      if (!root) return '[]';
+      const rows = root.querySelectorAll('[data-symbol-full]');
+      if (!rows.length) return '[]';
+      let sc = rows[0].parentElement;
+      while (sc && sc.scrollHeight <= sc.clientHeight + 5) sc = sc.parentElement;
+      const seen = new Set();
+      const collect = () => root.querySelectorAll('[data-symbol-full]')
+        .forEach(el => seen.add(el.getAttribute('data-symbol-full')));
+      if (!sc) { collect(); return JSON.stringify([...seen]); }
+      sc.scrollTop = 0;
+      await new Promise(r => setTimeout(r, 400));
+      let stable = 0, last = -1, iter = 0;
+      while (stable < 3 && iter < 60) {
+        collect();
+        if (seen.size === last) stable++; else { stable = 0; last = seen.size; }
+        sc.scrollTop += Math.max(200, sc.clientHeight - 100);
+        await new Promise(r => setTimeout(r, 250));
+        iter++;
+      }
+      sc.scrollTop = sc.scrollHeight;
+      await new Promise(r => setTimeout(r, 400));
+      collect();
+      sc.scrollTop = 0;
+      return JSON.stringify([...seen]);
     })()"""
 
     async with connect(chart["webSocketDebuggerUrl"], max_size=16*1024*1024) as ws:
         await ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate",
-                                  "params": {"expression": js, "returnByValue": True}}))
+                                  "params": {"expression": js, "returnByValue": True,
+                                             "awaitPromise": True}}))
         while True:
             msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
             if msg.get("id") == 1:

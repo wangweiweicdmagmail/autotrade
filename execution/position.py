@@ -215,6 +215,10 @@ class PositionManager:
         """
         anomalies: List[str] = []
         broker = await self._gw.positions()
+        if broker is None:
+            msg = "IBKR 持仓快照不可用，本次对账不执行任何处置"
+            logger.warning("%s", msg)
+            return [msg]
         for sym, unit in list(self.units.items()):
             ticker = sym.split(":")[-1]
             net = broker.get(ticker, 0.0)
