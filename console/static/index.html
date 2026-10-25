@@ -15,6 +15,8 @@
     <header class="topbar">
       <div class="brand">
         <span class="logo">autotrade</span>
+        <button class="deck-toggle-btn" @click="deckCollapsed = !deckCollapsed"
+                :title="deckCollapsed ? '展开交易台' : '收起交易台'">⚡ {{ deckCollapsed ? '▶' : '◀' }}</button>
         <span class="sub">交易控制台 · 5M 实时 · 限价 + STOP 子单</span>
       </div>
       <div class="statusbar">
@@ -26,11 +28,25 @@
           <span class="risk-label">最大仓位</span>
           <el-input-number v-model="maxPositionPct" :min="10" :max="200" :step="10" size="small" controls-position="right" style="width:110px"></el-input-number>
         </span>
+        <span class="risk-input">
+          <!-- 全局止损 ATR 倍数：值以快照为准（全客户端同步），编辑中不被快照覆盖 -->
+          <span class="risk-label">止损 ATR×</span>
+          <el-input-number v-model="atrMult" :min="0.2" :max="5" :step="0.1" size="small" controls-position="right" style="width:110px"
+                           @focus="atrMultDirty = true" @blur="atrMultDirty = false" @change="saveAtrMult"></el-input-number>
+        </span>
+        <span class="risk-input">
+          <!-- iMessage 告警收件人：值以快照为准（全客户端同步），编辑中不被快照覆盖 -->
+          <span class="risk-label">iMessage</span>
+          <el-input v-model="imessageRecipient" size="small" placeholder="告警收件人（空=关）" style="width:180px"
+                    @focus="imessageDirty = true" @blur="imessageDirty = false" @change="saveImessage"></el-input>
+        </span>
         <el-tag :type="status.dry_run ? 'warning' : 'danger'" effect="dark" size="small">{{ status.dry_run ? 'DRY-RUN' : 'LIVE' }}</el-tag>
         <el-tag :type="status.connected ? 'success' : 'info'" effect="dark" size="small">{{ status.connected ? 'IBKR 已连接' : 'IBKR 未连接' }}</el-tag>
         <el-tag v-if="!status.market_running" type="danger" effect="dark" size="small">行情断开</el-tag>
         <span class="stat-item">净值 <b>{{ fmtMoney(status.equity) }}</b></span>
         <span class="stat-item">日盈亏 <b :class="pnlClass(status.daily_pnl)">{{ fmtMoney(status.daily_pnl) }}</b></span>
+        <span class="stat-item">风险 <b :class="totalRiskClass">${{ fmtMoney(status.total_risk_usd) }}/{{ fmtMoney(status.max_total_risk_usd) }}</b></span>
+        <span class="stat-item">仓位 <b>{{ status.total_position_pct == null ? '—' : status.total_position_pct + '%' }}</b></span>
         <span class="stat-item">TV <b>{{ clock(tvTime) }}</b></span>
         <span class="stat-item">IBKR <b>{{ clock(ibkrTime) }}</b></span>
         <span class="stat-item">更新延时 <b :class="(status.bar_update_delay || 0) > 5 ? 'delay-warn' : ''">{{ status.bar_update_delay == null ? '—' : status.bar_update_delay + 's' }}</b></span>
@@ -38,10 +54,30 @@
       </div>
     </header>
 
+    <!-- 告警横幅：活跃告警（数据陈旧/TWS断线/裸仓等），可逐条消除，服务端解除自动消失 -->
+    <div v-if="visibleAlerts.length" class="alert-banner">
+      <div v-for="a in visibleAlerts" :key="a.key" class="alert-item" :class="a.level">
+        <b class="alert-title">{{ a.title }}</b>
+        <span class="alert-msg">{{ a.msg }}</span>
+        <span class="alert-since muted">{{ fvgAgo(a.since) }}</span>
+        <button class="alert-x" title="消除（解除后自动复位）" @click="dismissAlert(a.key)">×</button>
+      </div>
+    </div>
+
+    <!-- master 审批条：有待确认交易员时显示（仅 master 可见，确认/拒绝后随 WS 快照消失） -->
+    <div v-if="traderName === 'master' && clients.pending && clients.pending.length" class="approve-bar">
+      <span v-for="c in clients.pending" :key="c.token_prefix" class="approve-item">
+        <span class="approve-text">新交易员待确认：<b>{{ c.name }}</b>（{{ c.token_prefix }}）</span>
+        <el-button size="small" type="success" @click="approveClient(c)">确认</el-button>
+        <el-button size="small" type="danger" plain @click="rejectClient(c)">拒绝</el-button>
+      </span>
+    </div>
+
     <main class="layout">
       <div class="workspace">
-      <!-- 宫格下单台（左） -->
-      <section class="grid">
+      <!-- 宫格下单台（悬浮可折叠：开关在左上角 logo 旁，展开时悬浮于内容上方） -->
+      <div v-if="!deckCollapsed" class="deck">
+        <section class="grid deck-grid">
         <div v-for="(slot, i) in slotRows" :key="i" class="tile" :class="slot.side === 'long' ? 'tile-long' : (slot.side === 'short' ? 'tile-short' : '')">
           <!-- 第一行：选股 + 现价 -->
           <div class="tile-head">
@@ -51,45 +87,31 @@
             <span class="price-value">{{ slot.close }}</span>
           </div>
 
-          <!-- tab：EMA快线 / 通道边沿 / 中点限价单 -->
+          <!-- tab：市价单（默认） / EMA快线 / 通道边沿 / 中点限价单 / 回踩限价单 -->
           <el-tabs v-model="slots[i].limitType" class="tile-tabs" stretch>
+            <el-tab-pane label="市价单" name="market"></el-tab-pane>
             <el-tab-pane label="EMA快线" name="ema"></el-tab-pane>
             <el-tab-pane label="通道边沿" name="channel"></el-tab-pane>
             <el-tab-pane label="中点限价单" name="midpoint"></el-tab-pane>
+            <el-tab-pane label="回踩限价单" name="retest"></el-tab-pane>
           </el-tabs>
 
-          <!-- 当前 tab 的限价 + 止损 -->
+          <!-- 当前 tab 的限价 + 止损（止损行合并显示距离幅度百分比） -->
           <div class="tile-quote">
             <div class="quote-row">
-              <span class="indic-label">{{ slots[i].limitType === 'ema' ? 'EMA快线 限价' : (slots[i].limitType === 'channel' ? '通道边沿 限价' : '中点 限价') }}</span>
+              <span class="indic-label">{{ slots[i].limitType === 'ema' ? 'EMA快线 限价' : (slots[i].limitType === 'channel' ? '通道边沿 限价' : (slots[i].limitType === 'retest' ? '回踩 限价' : (slots[i].limitType === 'market' ? '市价（约）' : '中点 限价'))) }}</span>
               <b class="accent quote-val">{{ slot.limitPx ?? '—' }}</b>
             </div>
             <div class="quote-row">
-              <span class="indic-label">止损 1×ATR</span>
-              <b class="stop quote-val">{{ slot.stopPx ?? '—' }}</b>
-            </div>
-            <div class="quote-row" v-if="slot.stopDist != null">
-              <span class="indic-label">止损距离</span>
-              <b>{{ slot.stopDist }}</b>
-            </div>
-            <div class="quote-row">
-              <span class="indic-label">趋势状态</span>
-              <b :class="trendClass(slot.trendState)">{{ trendText(slot.trendState) }}</b>
-            </div>
-            <div class="quote-row">
-              <span class="indic-label">EMA 发散度</span>
-              <b>{{ slot.divergence ?? '—' }}</b>
+              <span class="indic-label">{{ slots[i].limitType === 'retest' ? '止损 上上根K线' : ('止损 ' + atrMult + '×ATR') }}</span>
+              <b class="stop quote-val"><span class="stop-pct-main">{{ slot.stopDistPct != null ? slot.stopDistPct + '%' : '—' }}</span><small class="stop-px-sub">{{ slot.stopPx ?? '' }}</small></b>
             </div>
           </div>
 
-          <!-- 计算结果 -->
+          <!-- 计算结果：股数 / 仓位占比 / 实际风险（金额不再显示，占比即资金口径） -->
           <div class="tile-calc">
             <div class="calc-row">
-              <div class="calc-item"><span class="calc-label">限价</span><b class="accent">{{ slot.limitPx }}</b></div>
               <div class="calc-item"><span class="calc-label">股数</span><b>{{ slot.qty }}</b></div>
-            </div>
-            <div class="calc-row">
-              <div class="calc-item"><span class="calc-label">金额</span><b>{{ fmtMoney(slot.amount) }}</b></div>
               <div class="calc-item"><span class="calc-label">仓位占比</span><b class="risk">{{ slot.equityRatio }}%</b></div>
             </div>
             <div class="calc-row">
@@ -97,18 +119,33 @@
             </div>
           </div>
 
-          <!-- 下单按钮（多绿空红，震荡禁用） -->
+          <!-- 下单按钮（多绿空红，震荡也放行，与服务端闸门一致） -->
           <el-button :type="slot.side === 'long' ? 'success' : (slot.side === 'short' ? 'danger' : 'info')" class="tile-btn" :disabled="!slot.ready || placing" @click="placeOrder(slot)">
             {{ slot.side === 'long' ? '买入' : (slot.side === 'short' ? '卖出' : '震荡') }} {{ slot.qty }} 股 · {{ typeLabel(slots[i].limitType) }}
           </el-button>
         </div>
       </section>
+      </div>
 
       <!-- 订单批次（右） -->
       <section class="panel orders">
         <h2 class="panel-title">订单批次（全生命周期跟踪：挂单→持仓→平仓）</h2>
-        <el-table :data="sortedLots" size="small" style="width:100%">
-          <el-table-column prop="symbol" label="标的" width="110"></el-table-column>
+        <el-table :data="sortedLots" size="small" style="width:100%" :row-class-name="lotRowClass"
+                  class="tv-link-table" @row-click="row => row.symbol && tvShow(row.symbol)">
+          <el-table-column label="操作" width="400" fixed="left">
+            <template #default="{ row }">
+              <el-button class="op-btn" type="success" :disabled="!(row.state === 'ACTIVE' && !row.breakeven_reached)" @click.stop="breakevenLot(row)">保本</el-button>
+              <el-button class="op-btn" type="primary" :disabled="!(row.state === 'ACTIVE' && row.filled_qty > 1)" @click.stop="closeHalf(row)">平半</el-button>
+              <el-button class="op-btn" type="warning" :disabled="row.state !== 'ACTIVE'" @click.stop="closeLot(row)">平仓</el-button>
+              <el-button class="op-btn" type="danger" :disabled="!(row.state === 'PENDING' || (status.dry_run && row.state === 'ACTIVE'))" @click.stop="cancelLot(row)">撤单</el-button>
+            </template>
+          </el-table-column>
+          <el-table-column label="标的" width="110">
+            <template #default="{ row }"><span class="lot-symbol">{{ tickerOf(row.symbol) }}</span></template>
+          </el-table-column>
+          <el-table-column label="交易员" width="70">
+            <template #default="{ row }"><span :class="traderClass(row.trader)">{{ row.trader || '—' }}</span></template>
+          </el-table-column>
           <el-table-column label="状态" width="130">
             <template #default="{ row }">
               <el-tag :type="stateTag(row.state)" size="small">{{ row.state }}</el-tag>
@@ -119,44 +156,186 @@
             <template #default="{ row }">{{ row.state === 'PENDING' ? row.qty : row.filled_qty }}</template>
           </el-table-column>
           <el-table-column label="入/限价" width="90">
-            <template #default="{ row }">{{ row.avg_fill > 0 ? row.avg_fill.toFixed(2) : row.entry_px.toFixed(2) }}</template>
+            <template #default="{ row }"><span class="lot-price">{{ row.avg_fill > 0 ? row.avg_fill.toFixed(2) : row.entry_px.toFixed(2) }}</span></template>
           </el-table-column>
           <el-table-column prop="stop_px" label="止损" width="90">
-            <template #default="{ row }">{{ row.stop_px > 0 ? row.stop_px.toFixed(2) : '—' }}</template>
-          </el-table-column>
-          <el-table-column label="平仓价" width="90">
-            <template #default="{ row }">{{ row.state === 'CLOSED' && row.exit_px > 0 ? row.exit_px.toFixed(2) : '—' }}</template>
+            <template #default="{ row }"><span class="lot-price">{{ row.stop_px > 0 ? row.stop_px.toFixed(2) : '—' }}</span></template>
           </el-table-column>
           <el-table-column label="盈亏" width="110">
             <template #default="{ row }">
               <template v-if="row.state === 'CLOSED' || row.state === 'ACTIVE' || row.state === 'CLOSING'">
-                <b :class="pnlClass(lotPnl(row))">{{ fmtMoney(lotPnl(row)) }}</b>
+                <b class="lot-pnl" :class="pnlClass(lotPnl(row))">{{ fmtMoney(lotPnl(row)) }}</b>
                 <div v-if="row.state === 'CLOSED' && row.actual_rr" class="muted exit-reason">RR {{ row.actual_rr }}</div>
+                <!-- mark 价新鲜度：TV 价格时间戳超过 60s 未更新时显示（该股无新成交，盈亏是旧价） -->
+                <div v-else-if="markStaleText(row)" class="mark-stale">{{ markStaleText(row) }}</div>
               </template>
               <span v-else class="muted">—</span>
             </template>
           </el-table-column>
-          <el-table-column prop="reason" label="备注" min-width="120" show-overflow-tooltip></el-table-column>
-          <el-table-column label="操作" width="150" fixed="right">
-            <template #default="{ row }">
-              <el-button size="small" type="warning" :disabled="row.state !== 'ACTIVE'" @click="closeLot(row)">平仓</el-button>
-              <el-button size="small" type="danger" :disabled="!(row.state === 'PENDING' || (status.dry_run && row.state === 'ACTIVE'))" @click="cancelLot(row)">撤单</el-button>
-            </template>
+          <el-table-column label="仓位占比" width="90">
+            <template #default="{ row }"><b class="lot-pct">{{ posPct(row) }}</b></template>
           </el-table-column>
+          <el-table-column label="平仓价" width="90">
+            <template #default="{ row }">{{ row.state === 'CLOSED' && row.exit_px > 0 ? row.exit_px.toFixed(2) : '—' }}</template>
+          </el-table-column>
+          <el-table-column prop="reason" label="备注" min-width="120" show-overflow-tooltip></el-table-column>
         </el-table>
 
         <!-- 底部面板：选股 / 运行日志（tab 切换，与订单表格平分高度） -->
         <div class="log-panel">
           <el-tabs v-model="bottomTab" class="bottom-tabs">
+            <!-- FVG 监控 tab（第一个，默认选中） -->
+            <el-tab-pane label="FVG 监控" name="fvg">
+              <div class="fvg-panel">
+                <div class="fvg-head">
+                  <span class="fvg-title">FVG 动态监控</span>
+                  <div class="fvg-window">
+                    <span v-for="w in [15, 30, 60]" :key="w" :class="{ on: fvgWindow === w }" @click="fvgWindow = w">{{ w >= 60 ? '1 小时' : w + ' 分钟' }}</span>
+                  </div>
+                  <span class="fvg-legend">ATR 倍数 = 缺口高度 ÷ ATR(10) · 按时间倒序 · 5M 收盘确认</span>
+                  <span class="fvg-tick-toggle" :title="fvgTickOn ? '五分钟滴答提醒：开（点击关闭）' : '五分钟滴答提醒：关（点击开启）'" @click="toggleFvgTick">{{ fvgTickOn ? '🔊' : '🔇' }}</span>
+                  <span class="fvg-ratio-filter" title="低于该 ATR 倍数的 FVG 事件不弹窗、不语音（监控列表不受影响）">通报 ≥
+                    <el-input-number v-model="fvgNotifyMinRatio" :min="0" :max="10" :step="0.1" size="small" @change="saveFvgNotifyMinRatio"></el-input-number>
+                    ×ATR</span>
+                  <el-checkbox v-model="fvgPmFilter" size="small" class="pm-filter"
+                               title="盘前区间过滤（全局设置）：多头事件仅显示现价>盘前高点、空头事件仅显示现价<盘前低点；无盘前区间数据的标的保留"
+                               @change="v => savePmFilter('fvg_premarket_filter', v)">盘前过滤</el-checkbox>
+                  <div class="fvg-stats">
+                    <span class="fvg-chip long">多头 {{ fvgStats.long }}</span>
+                    <span class="fvg-chip short">空头 {{ fvgStats.short }}</span>
+                    <span class="fvg-chip ratio">≥1×ATR 共 {{ fvgStats.ge1 }} 个</span>
+                    <span class="fvg-chip retest">回踩 {{ fvgStats.retest }} 个</span>
+                  </div>
+                </div>
+                <div class="fvg-cols">
+                  <div class="fvg-col" v-for="side in ['long', 'short']" :key="side">
+                    <div class="fvg-col-title" :class="side">
+                      {{ side === 'long' ? '▲ 多头 FVG（需求区缺口）' : '▼ 空头 FVG（供应区缺口）' }}
+                      <small>{{ side === 'long' ? 'low > high[2]，回踩即潜在支撑' : 'high < low[2]，反弹即潜在压力' }}</small>
+                    </div>
+                    <div class="fvg-col-rows">
+                      <template v-for="slot in fvgSlotsFiltered" :key="slot.bar_time">
+                        <template v-if="slot[side] && slot[side].length">
+                          <div v-for="ev in slot[side]" :key="ev.id" class="fvg-row tv-link" :class="{ fresh: fvgIsFresh(ev) }"
+                               title="点击切 TV 图表到该标的" @click="tvShow(ev.symbol)">
+                            <div class="f-time"><b>{{ hmET(ev.bar_time) }}</b><small>{{ fvgAgo(ev.bar_time) }}</small></div>
+                            <div class="f-dir" :class="side === 'long' ? 'up' : 'dn'">{{ side === 'long' ? '▲' : '▼' }}</div>
+                            <div class="f-sym">{{ ev.ticker }}</div>
+                            <div class="f-zone">{{ ev.bottom.toFixed(2) }} ~ {{ ev.top.toFixed(2) }}<small>缺口高 ${{ ev.height.toFixed(2) }}</small></div>
+                            <div class="f-ratio" :class="fvgRatioClass(ev.ratio)">
+                              <div class="lbl">{{ ev.ratio == null ? '—' : ev.ratio.toFixed(1) + '× ATR' }}</div>
+                              <div class="bar"><i :style="{ width: fvgRatioWidth(ev.ratio) + '%' }"></i></div>
+                            </div>
+                            <div class="f-state">
+                              <span v-if="ev.retested" class="retested">已回踩</span>
+                              <span v-else :class="ev.state">{{ fvgStateText(ev.state) }}</span>
+                              <button v-if="fvgCanChase(ev)" class="fvg-chase-btn" :class="side"
+                                      title="现价贴近缺口边缘，按市价追价" @click.stop="chaseFvg(ev)">追</button>
+                            </div>
+                          </div>
+                        </template>
+                        <div v-else class="fvg-row fvg-empty">
+                          <div class="f-time"><b>{{ hmET(slot.bar_time) }}</b><small>{{ fvgAgo(slot.bar_time) }}</small></div>
+                          <span class="fvg-empty-text">{{ side === 'long' ? '多' : '空' }} FVG · 本 5 分钟无缺口</span>
+                        </div>
+                      </template>
+                      <div v-if="!fvgSlotsFiltered.length" class="muted log-empty">暂无数据（等待 5M bar 收盘确认）</div>
+                    </div>
+                  </div>
+                  <!-- 第三列：FVG 首次回踩（每个 FVG 终身只报一次，按回踩时间倒序） -->
+                  <div class="fvg-col">
+                    <div class="fvg-col-title retest">
+                      ⚡ FVG 回踩（首次）
+                      <small>首次回踩才有价值，第二次不再报</small>
+                    </div>
+                    <div class="fvg-col-rows">
+                      <div v-for="rt in fvgRetestsFiltered" :key="rt.id" class="fvg-row tv-link"
+                           title="点击切 TV 图表到该标的" @click="tvShow(rt.symbol)">
+                        <div class="f-time"><b>{{ hmET(rt.retest_time) }}</b><small>{{ fvgAgo(rt.retest_time) }}</small></div>
+                        <div class="f-dir" :class="rt.side === 'long' ? 'up' : 'dn'">{{ rt.side === 'long' ? '▲' : '▼' }}</div>
+                        <div class="f-sym">{{ rt.ticker }}</div>
+                        <div class="f-zone">{{ rt.bottom.toFixed(2) }} ~ {{ rt.top.toFixed(2) }}<small>踩到 ${{ rt.retest_px != null ? rt.retest_px.toFixed(2) : '—' }}</small></div>
+                        <div class="f-ratio" :class="fvgRatioClass(rt.ratio)">
+                          <div class="lbl">{{ rt.ratio == null ? '—' : rt.ratio.toFixed(1) + '× ATR' }}</div>
+                          <div class="bar"><i :style="{ width: fvgRatioWidth(rt.ratio) + '%' }"></i></div>
+                        </div>
+                        <div class="f-state"><span class="retest">首次回踩</span></div>
+                      </div>
+                      <div v-if="!fvgRetestsFiltered.length" class="fvg-row fvg-empty">
+                        <span class="fvg-empty-text">暂无回踩</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </el-tab-pane>
+            <!-- 盘前新闻 tab（第二位）：大盘情绪+主题 / 自选股热点卡 / 原始头条 -->
+            <el-tab-pane label="盘前新闻" name="news">
+              <div class="perf-panel news-panel">
+                <div class="news-head">
+                  <span class="news-title">盘前热点新闻</span>
+                  <template v-if="news && !news.empty">
+                    <span class="news-mood">{{ (news.summary && news.summary.market_mood) || '（LLM 降级：纯标题列表）' }}</span>
+                    <span class="muted">生成 {{ news.generated_at_et }} · 耗时 {{ news.elapsed_s }}s<span v-if="news.summary_meta && news.summary_meta.model"> · {{ news.summary_meta.model }}</span></span>
+                  </template>
+                  <el-button size="small" type="primary" :loading="newsBusy" @click="refreshNews">刷新</el-button>
+                </div>
+                <div v-if="!news || news.empty" class="muted log-empty">今日暂无盘前新闻（每天 07:30 ET 自动生成，或点「刷新」手动生成）</div>
+                <template v-else>
+                  <!-- 大盘主题 -->
+                  <div v-if="news.summary && news.summary.themes && news.summary.themes.length" class="news-themes">
+                    <div v-for="t in news.summary.themes" :key="t.topic" class="news-theme">
+                      <b class="news-topic">{{ t.topic }}</b>
+                      <span class="news-theme-sum">{{ t.summary }}</span>
+                      <span v-for="s in (t.symbols || [])" :key="s" class="news-sym tv-link"
+                            :class="{ hot: newsHot[s] }" :title="newsHot[s] || ''"
+                            @click="tvShow(s)">{{ s }}</span>
+                    </div>
+                  </div>
+                  <!-- 自选股热点卡片 -->
+                  <div v-if="hotList.length" class="news-hot">
+                    <div v-for="h in hotList" :key="h.ticker" class="news-card">
+                      <div class="news-card-line1">
+                        <b class="news-ticker tv-link" title="点击切 TV 图表到该标的" @click="tvShow(h.ticker)">{{ h.ticker }}</b>
+                        <span class="news-sent" :class="h.sentiment">{{ { pos: '偏多', neg: '偏空', neu: '中性' }[h.sentiment] || h.sentiment }}</span>
+                        <span class="news-cat">{{ h.catalyst }}</span>
+                      </div>
+                      <div class="news-gist">{{ h.gist }}</div>
+                      <div class="news-headline" :title="h.headline">{{ h.headline }}</div>
+                    </div>
+                  </div>
+                  <!-- 原始头条 -->
+                  <div class="perf-group">
+                    <div class="perf-group-title">大盘头条（{{ (news.market_headlines || []).length }}）</div>
+                    <div v-for="(h, i) in (news.market_headlines || [])" :key="i" class="news-raw">
+                      <span class="muted news-raw-time">{{ hmET(h.published) }}</span>{{ h.title }}
+                    </div>
+                  </div>
+                  <div class="perf-group" v-if="news.ticker_news && Object.keys(news.ticker_news).length">
+                    <div class="perf-group-title">个股原新闻（{{ Object.keys(news.ticker_news).length }} 票）</div>
+                    <template v-for="(items, tk) in news.ticker_news" :key="tk">
+                      <div v-for="(h, i) in items" :key="tk + i" class="news-raw">
+                        <span class="news-sym tv-link" :class="{ hot: newsHot[tk] }" @click="tvShow(tk)">{{ tk }}</span>
+                        <span class="muted news-raw-time">{{ hmET(h.published) }}</span>{{ h.title }}
+                      </div>
+                    </template>
+                  </div>
+                </template>
+              </div>
+            </el-tab-pane>
             <!-- 选股 tab -->
             <el-tab-pane label="选股" name="screen">
               <div class="screen-wrap">
                 <div class="screen-sort">
+                  <el-checkbox v-model="screenPmFilter" size="small" class="pm-filter"
+                               title="盘前区间过滤（全局设置）：多头仅保留现价>盘前高点、空头仅保留现价<盘前低点；无盘前区间数据的标的保留"
+                               @change="v => savePmFilter('screen_premarket_filter', v)">盘前过滤</el-checkbox>
                   <span>排序（高→低）</span>
                   <el-select v-model="screenSort" size="small" style="width:150px">
                     <el-option label="EMA 发散度" value="divergence"></el-option>
                     <el-option label="ST 持续根数" value="duration"></el-option>
                     <el-option label="ST 推进次数" value="push"></el-option>
+                    <el-option label="FVG 累积" value="fvg"></el-option>
                   </el-select>
                 </div>
                 <div class="screen-grid">
@@ -166,6 +345,9 @@
                       <span class="screen-ticker">{{ r.ticker }}</span>
                       <span class="screen-close">{{ r.close }}</span>
                       <span class="screen-st">ST {{ r.st_duration_bars == null ? '—' : r.st_duration_bars + '根' }} / {{ r.st_push_count == null ? '—' : r.st_push_count + '次' }}</span>
+                      <span class="screen-fvg" :class="r.fvg_last_dir === 1 ? 'pnl-pos' : (r.fvg_last_dir === -1 ? 'pnl-neg' : 'muted')" title="ST 同向 FVG 累积计数">{{ r.fvg_cum_count == null ? '—' : 'FVG' + (r.fvg_last_dir === 1 ? '▲' : (r.fvg_last_dir === -1 ? '▼' : '')) + r.fvg_cum_count }}</span>
+                      <span class="screen-pm" title="盘前高/低（进攻区域指标）">{{ r.pmh != null ? r.pmh + '/' + r.pml : '' }}</span>
+                      <span v-if="newsHot[r.ticker]" class="news-badge" :title="newsHot[r.ticker]">新闻</span>
                       <span class="screen-atr pnl-pos" title="|EMA20 − EMA100| / ATR(10)">{{ r.divergence }}</span>
                     </div>
                     <div v-if="!sortedScreenLong.length" class="muted log-empty">暂无多头</div>
@@ -176,6 +358,9 @@
                       <span class="screen-ticker">{{ r.ticker }}</span>
                       <span class="screen-close">{{ r.close }}</span>
                       <span class="screen-st">ST {{ r.st_duration_bars == null ? '—' : r.st_duration_bars + '根' }} / {{ r.st_push_count == null ? '—' : r.st_push_count + '次' }}</span>
+                      <span class="screen-fvg" :class="r.fvg_last_dir === 1 ? 'pnl-pos' : (r.fvg_last_dir === -1 ? 'pnl-neg' : 'muted')" title="ST 同向 FVG 累积计数">{{ r.fvg_cum_count == null ? '—' : 'FVG' + (r.fvg_last_dir === 1 ? '▲' : (r.fvg_last_dir === -1 ? '▼' : '')) + r.fvg_cum_count }}</span>
+                      <span class="screen-pm" title="盘前高/低（进攻区域指标）">{{ r.pmh != null ? r.pmh + '/' + r.pml : '' }}</span>
+                      <span v-if="newsHot[r.ticker]" class="news-badge" :title="newsHot[r.ticker]">新闻</span>
                       <span class="screen-atr pnl-neg" title="|EMA20 − EMA100| / ATR(10)">{{ r.divergence }}</span>
                     </div>
                     <div v-if="!sortedScreenShort.length" class="muted log-empty">暂无空头</div>
@@ -290,6 +475,7 @@
                     </span>
                     <span>发散度 <b>{{ p.divergence == null ? '—' : p.divergence }}</b></span>
                     <span>ST延续 <b>{{ p.st_duration_bars == null ? '—' : p.st_duration_bars + '根' }}</b> / 推进 <b>{{ p.st_push_count == null ? '—' : p.st_push_count + '次' }}</b></span>
+                    <span v-if="p.fvg_cum_count != null || p.fvg_last_dir != null">FVG <b :class="p.fvg_last_dir === 1 ? 'pnl-pos' : (p.fvg_last_dir === -1 ? 'pnl-neg' : '')">{{ (p.fvg_last_dir === 1 ? '▲' : (p.fvg_last_dir === -1 ? '▼' : '')) + (p.fvg_cum_count ?? '') }}{{ p.fvg_last_bottom != null && p.fvg_last_top != null ? ' ' + p.fvg_last_bottom.toFixed(2) + '~' + p.fvg_last_top.toFixed(2) : '' }}</b></span>
                     <span>入/损 <b>{{ p.limit_px }} / {{ p.stop_px }}</b></span>
                     <span>数量 <b>x{{ p.qty }}</b> / 风险 {{ fmtMoney(p.risk_usd) }}</span>
                     <span>市值 <b>{{ fmtMoney(p.amount) }}</b> / {{ p.position_pct == null ? '净值未知' : p.position_pct + '%' }}</span>
@@ -322,6 +508,7 @@
                 <div v-if="!auto.instances.length" class="muted log-empty">暂无策略实例（输入标的点启动；人工开仓会被自动收养管理）</div>
               </div>
             </el-tab-pane>
+            <!-- FVG 监控 tab -->
             <!-- 回测工作台 tab -->
             <el-tab-pane label="回测" name="backtest">
               <div class="perf-panel">
@@ -422,6 +609,10 @@
                     <div class="perf-stat"><span>平均浮盈MFE</span><b class="pnl-pos">{{ fmtMoney(performance.overall.avg_mfe) }}</b></div>
                     <div class="perf-stat"><span>目标RR</span><b>{{ performance.overall.avg_target_rr }}</b></div>
                     <div class="perf-stat"><span>实际RR</span><b :class="pnlClass(performance.overall.avg_actual_rr)">{{ performance.overall.avg_actual_rr }}</b></div>
+                    <div class="perf-stat"><span>保本达成率</span><b>{{ performance.overall.breakeven_rate }}%</b></div>
+                    <div class="perf-stat"><span>平均保本时长</span><b class="pnl-pos">{{ performance.overall.avg_breakeven_min }}分</b></div>
+                    <div class="perf-stat"><span>平均止损时长</span><b class="pnl-neg">{{ performance.overall.avg_stop_min }}分</b></div>
+                    <div class="perf-stat"><span>平均持仓时长</span><b>{{ performance.overall.avg_hold_min }}分</b></div>
                   </div>
                   <div class="perf-group">
                     <div class="perf-group-title">按信号类型</div>
@@ -461,7 +652,10 @@
                 </div>
                 <div class="events-list">
                   <div v-if="!filteredEvents.length" class="muted log-empty">暂无事件</div>
-                  <div v-for="(e, i) in filteredEvents" :key="i" class="event-row">
+                  <div v-for="(e, i) in filteredEvents" :key="i" class="event-row"
+                       :class="{ 'tv-link': !!(e.symbol || e.ticker) }"
+                       :title="(e.symbol || e.ticker) ? '点击切 TV 图表到该标的' : ''"
+                       @click="(e.symbol || e.ticker) && tvShow(e.symbol || e.ticker)">
                     <span class="event-time">{{ logTime(e.ts) }}</span>
                     <span class="event-type" :class="'evt-' + e.type">{{ eventTypeText(e.type) }}</span>
                     <span class="event-ticker">{{ (e.symbol || '').split(':').pop() || e.ticker || '—' }}</span>
@@ -470,11 +664,246 @@
                 </div>
               </div>
             </el-tab-pane>
+            <!-- 跟单管理 tab：copy_trader 服务器配置 + 运行状态 + 订单对照 + 失败重放（数据全来自 WS 快照 msg.copy） -->
+            <el-tab-pane label="跟单管理" name="copy">
+              <div v-if="copy" class="perf-panel">
+                <!-- 服务器配置表（启用开关即时生效，其余字段改完点「保存」统一提交） -->
+                <div class="perf-group">
+                  <div class="perf-group-title copy-head">
+                    <span>服务器配置</span>
+                    <el-button size="small" type="primary" @click="copyDialog = true">添加服务器</el-button>
+                  </div>
+                  <el-table :data="copy.servers || []" size="small" style="width:100%">
+                    <el-table-column label="启用" width="60">
+                      <template #default="{ row }">
+                        <el-switch :model-value="!!row.enabled" size="small" @change="v => copyToggleEnable(row, v)"></el-switch>
+                      </template>
+                    </el-table-column>
+                    <el-table-column prop="name" label="名称" width="90"></el-table-column>
+                    <el-table-column label="地址" width="140">
+                      <template #default="{ row }">{{ row.host }}:{{ row.port }}</template>
+                    </el-table-column>
+                    <el-table-column label="clientId" width="80">
+                      <template #default="{ row }">{{ row.client_id ?? '自动' }}</template>
+                    </el-table-column>
+                    <el-table-column label="股数模式" width="110">
+                      <template #default="{ row }">
+                        <el-select v-if="copyDraft[row.name]" v-model="copyDraft[row.name].size_mode" size="small">
+                          <el-option label="按风险" value="risk"></el-option>
+                          <el-option label="按系数" value="multiplier"></el-option>
+                          <el-option label="按余额" value="balance"></el-option>
+                        </el-select>
+                      </template>
+                    </el-table-column>
+                    <el-table-column label="参数" width="150">
+                      <template #default="{ row }">
+                        <template v-if="copyDraft[row.name]">
+                          <template v-if="copyDraft[row.name].size_mode === 'risk'">
+                            <el-input-number v-model="copyDraft[row.name].risk_usd" :min="10" :step="50" size="small" controls-position="right" style="width:105px"></el-input-number>
+                            <span class="muted"> $风险</span>
+                          </template>
+                          <span v-else class="muted">×{{ copyDraft[row.name].size_multiplier }} 系数</span>
+                        </template>
+                      </template>
+                    </el-table-column>
+                    <el-table-column label="放大系数" width="130">
+                      <template #default="{ row }">
+                        <span v-if="copyDraft[row.name]" title="调试 0.1 → 正常 1.0 → 稳定 1.5">
+                          <el-input-number v-model="copyDraft[row.name].size_multiplier" :min="0.05" :max="3" :step="0.05" size="small" controls-position="right" style="width:110px"></el-input-number>
+                        </span>
+                      </template>
+                    </el-table-column>
+                    <el-table-column label="回撤熔断%" width="120">
+                      <template #default="{ row }">
+                        <el-input-number v-if="copyDraft[row.name]" v-model="copyDraft[row.name].max_drawdown_pct" :min="0.5" :max="50" :step="0.5" size="small" controls-position="right" style="width:100px"></el-input-number>
+                      </template>
+                    </el-table-column>
+                    <el-table-column label="方向" width="100">
+                      <template #default="{ row }">
+                        <el-select v-if="copyDraft[row.name]" v-model="copyDraft[row.name].direction" size="small">
+                          <el-option label="双向" value="both"></el-option>
+                          <el-option label="仅多" value="long_only"></el-option>
+                        </el-select>
+                      </template>
+                    </el-table-column>
+                    <el-table-column label="操作" width="140">
+                      <template #default="{ row }">
+                        <el-button size="small" type="primary" @click="copySaveServer(row)">保存</el-button>
+                        <el-button size="small" type="danger" @click="copyDeleteServer(row)">删除</el-button>
+                      </template>
+                    </el-table-column>
+                  </el-table>
+                  <div v-if="!(copy.servers || []).length" class="muted log-empty">暂无跟单服务器，点「添加服务器」配置</div>
+                </div>
+
+                <!-- 状态卡行：每服务器一张（连接灯 + 净值 + 跟单计数 + 回撤/熔断） -->
+                <div v-if="(copy.servers || []).length" class="copy-cards">
+                  <div v-for="s in copy.servers" :key="s.name" class="copy-card">
+                    <span class="copy-dot" :class="copyDotClass(s)"></span>
+                    <b class="copy-name">{{ s.name }}</b>
+                    <span class="stat-item">净值 <b>{{ s.equity == null ? '—' : fmtMoney(s.equity) }}</b></span>
+                    <span class="stat-item">已跟 <b>{{ s.synced ?? '—' }}</b></span>
+                    <span class="stat-item">待跟 <b>{{ s.pending_map ?? '—' }}</b></span>
+                    <span class="stat-item">失败 <b :class="{ 'pnl-neg': (s.failed || 0) > 0 }">{{ s.failed ?? '—' }}</b></span>
+                    <span class="stat-item">回撤 <b :class="copyDdClass(s)">{{ s.drawdown_pct == null ? '—' : s.drawdown_pct + '%' }}</b></span>
+                    <el-tag v-if="s.halted" type="danger" effect="dark" size="small">已熔断</el-tag>
+                    <el-button v-if="s.halted" size="small" type="warning" @click="copyUnhalt(s)">解除熔断</el-button>
+                    <span v-if="s.last_error" class="copy-err muted" :title="s.last_error">{{ s.last_error }}</span>
+                  </div>
+                </div>
+
+                <!-- 跟踪订单对照表：各服务器 orders 聚合，follower 报错行红色 -->
+                <div class="perf-group">
+                  <div class="perf-group-title">跟踪订单对照（{{ copyOrders.length }}）</div>
+                  <el-table :data="copyOrders" size="small" style="width:100%" :row-class-name="copyOrderRowClass" max-height="260"
+                            class="tv-link-table" @row-click="row => row.symbol && tvShow(row.symbol)">
+                    <el-table-column prop="master_lot_id" label="批次" width="130" show-overflow-tooltip></el-table-column>
+                    <el-table-column label="标的" width="90">
+                      <template #default="{ row }"><span class="lot-symbol">{{ tickerOf(row.symbol) }}</span></template>
+                    </el-table-column>
+                    <el-table-column label="方向" width="70">
+                      <template #default="{ row }">
+                        <span :class="row.side === 'long' ? 'pnl-pos' : 'pnl-neg'">{{ row.side === 'long' ? '多' : '空' }}</span>
+                      </template>
+                    </el-table-column>
+                    <el-table-column label="master" width="100">
+                      <template #default="{ row }"><el-tag size="small" :type="stateTag(row.master_state)">{{ row.master_state }}</el-tag></template>
+                    </el-table-column>
+                    <el-table-column label="follower" width="100">
+                      <template #default="{ row }"><el-tag size="small" :type="stateTag(row.follower_state)">{{ row.follower_state }}</el-tag></template>
+                    </el-table-column>
+                    <el-table-column prop="qty" label="股数" width="75"></el-table-column>
+                    <el-table-column label="止损" width="90">
+                      <template #default="{ row }"><span class="lot-price">{{ row.stop_px > 0 ? row.stop_px.toFixed(2) : '—' }}</span></template>
+                    </el-table-column>
+                    <el-table-column prop="server" label="服务器" width="80"></el-table-column>
+                    <el-table-column prop="error" label="错误" min-width="120" show-overflow-tooltip>
+                      <template #default="{ row }"><span class="pnl-neg">{{ row.error || '' }}</span></template>
+                    </el-table-column>
+                  </el-table>
+                  <div v-if="!copyOrders.length" class="muted log-empty">暂无跟踪订单</div>
+                </div>
+
+                <!-- 失败订单表：各服务器 failures 聚合（过滤已忽略），支持重放 / 忽略 -->
+                <div class="perf-group">
+                  <div class="perf-group-title">失败订单（{{ copyFailures.length }}）</div>
+                  <el-table :data="copyFailures" size="small" style="width:100%" max-height="220">
+                    <el-table-column label="时间" width="90">
+                      <template #default="{ row }">{{ logTime(row.ts) }}</template>
+                    </el-table-column>
+                    <el-table-column prop="server" label="服务器" width="80"></el-table-column>
+                    <el-table-column prop="master_lot_id" label="批次" width="130" show-overflow-tooltip></el-table-column>
+                    <el-table-column prop="action" label="动作" width="80"></el-table-column>
+                    <el-table-column prop="error" label="原因" min-width="160" show-overflow-tooltip>
+                      <template #default="{ row }"><span class="pnl-neg">{{ row.error }}</span></template>
+                    </el-table-column>
+                    <el-table-column prop="retries" label="重试" width="60"></el-table-column>
+                    <el-table-column label="操作" width="140">
+                      <template #default="{ row }">
+                        <el-button size="small" type="primary" @click="copyRetry(row)">重放</el-button>
+                        <el-button size="small" @click="copyDismiss(row)">忽略</el-button>
+                      </template>
+                    </el-table-column>
+                  </el-table>
+                  <div v-if="!copyFailures.length" class="muted log-empty">暂无失败订单</div>
+                </div>
+
+                <!-- 添加服务器弹窗：clientId 由服务端自动分配，新增默认 enabled=false -->
+                <el-dialog v-model="copyDialog" title="添加跟单服务器" width="420px">
+                  <el-form label-width="90px" size="small">
+                    <el-form-item label="名称"><el-input v-model="copyForm.name" placeholder="如 A"></el-input></el-form-item>
+                    <el-form-item label="host"><el-input v-model="copyForm.host"></el-input></el-form-item>
+                    <el-form-item label="port"><el-input-number v-model="copyForm.port" :min="1" :max="65535" controls-position="right" style="width:140px"></el-input-number></el-form-item>
+                    <el-form-item label="FA组"><el-input v-model="copyForm.fa_group" placeholder="留空 = 普通账户"></el-input></el-form-item>
+                    <el-form-item label="clientId"><span class="muted">自动（服务端分配）</span></el-form-item>
+                    <el-form-item label="股数模式">
+                      <el-select v-model="copyForm.size_mode" style="width:140px">
+                        <el-option label="按风险" value="risk"></el-option>
+                        <el-option label="按系数" value="multiplier"></el-option>
+                        <el-option label="按余额" value="balance"></el-option>
+                      </el-select>
+                    </el-form-item>
+                    <el-form-item v-if="copyForm.size_mode === 'risk'" label="$风险">
+                      <el-input-number v-model="copyForm.risk_usd" :min="10" :step="50" controls-position="right" style="width:140px"></el-input-number>
+                    </el-form-item>
+                    <el-form-item v-else label="×系数">
+                      <el-input-number v-model="copyForm.size_multiplier" :min="0.05" :max="3" :step="0.05" controls-position="right" style="width:140px"></el-input-number>
+                    </el-form-item>
+                  </el-form>
+                  <template #footer>
+                    <el-button @click="copyDialog = false">取消</el-button>
+                    <el-button type="primary" :loading="copyBusy" @click="copyAddServer">添加</el-button>
+                  </template>
+                </el-dialog>
+              </div>
+              <div v-else class="perf-panel">
+                <div class="muted log-empty">后端未就绪（快照中无 copy 段，请升级后端后刷新）</div>
+              </div>
+            </el-tab-pane>
           </el-tabs>
         </div>
       </section>
       </div>
     </main>
+
+    <!-- 信号栏：右侧常驻（突破卡片固定最上，FVG 卡片 ATR 倍数降序，叉号逐条删除） -->
+    <div v-if="fvgFeed.length" class="fvg-feed" :class="{ collapsed: fvgFeedCollapsed }">
+      <div class="fvg-feed-head" @click="fvgFeedCollapsed = !fvgFeedCollapsed">
+        <span>⚡ 信号 <b class="fvg-feed-count">{{ fvgFeed.length }}</b></span>
+        <span class="fvg-feed-toggle">{{ fvgFeedCollapsed ? '展开 ▲' : '收起 ▼' }}</span>
+      </div>
+      <div v-show="!fvgFeedCollapsed" class="fvg-feed-body">
+        <div v-for="c in sortedFvgFeed" :key="c.id" class="fvg-feed-card tv-link" :class="[c.side, { warn: c.warn, breakout: c.kind === 'breakout' }]"
+             title="点击切 TV 图表到该标的" @click="c.symbol && tvShow(c.symbol)">
+          <button class="fvg-feed-x" title="删除（已处理）" @click.stop="dismissFvgFeed(c.id)">×</button>
+          <template v-if="c.kind === 'breakout'">
+            <div class="fvg-feed-line1">
+              <b class="dir">{{ c.side === 'short' ? '▼' : '▲' }}</b>
+              <b class="ticker">{{ c.ticker }}</b>
+              <span class="badge-breakout" :class="{ short: c.side === 'short' }">{{ c.side === 'short' ? '跌破' : '突破' }}</span>
+              <span class="ratio">{{ c.confirm_time }}</span>
+            </div>
+            <div class="fvg-feed-line2">
+              <span class="zone">盘前 {{ c.pml.toFixed(2) }} ~ {{ c.pmh.toFixed(2) }}（宽 {{ c.zone_width.toFixed(2) }}）</span>
+              <span v-if="newsHot[c.ticker]" class="news-badge" :title="newsHot[c.ticker]">新闻</span>
+              <span class="badge-conf">{{ c.triple ? (c.side === 'short' ? '三连阴' : '三连确认') : 'FVG确认' }}</span>
+              <span class="ago">{{ fvgAgo(c.confirm_epoch || c.ts) }}</span>
+            </div>
+          </template>
+          <template v-else>
+            <div class="fvg-feed-line1">
+              <b class="dir">{{ c.side === 'long' ? '▲' : '▼' }}</b>
+              <b class="ticker">{{ c.ticker }}</b>
+              <span class="ratio">{{ c.ratio == null ? '—' : c.ratio.toFixed(1) + '×' }}</span>
+            </div>
+            <div class="fvg-feed-line2">
+              <span class="zone">{{ c.bottom.toFixed(2) }} ~ {{ c.top.toFixed(2) }}</span>
+              <span v-if="newsHot[c.ticker]" class="news-badge" :title="newsHot[c.ticker]">新闻</span>
+              <span :class="c.warn ? 'badge-warn' : 'badge-conf'">{{ c.warn ? '形成中' : '已确认' }}</span>
+              <span class="ago">{{ fvgAgo(c.bar_time || c.ts) }}</span>
+            </div>
+          </template>
+        </div>
+      </div>
+    </div>
+
+    <!-- 身份遮罩：guest 登记 / trader 待确认时挡住全部交互（master 由服务端 self 判定，不会出现） -->
+    <div v-if="identity === 'register' || identity === 'pending'" class="identity-mask">
+      <div class="identity-card">
+        <div class="identity-logo">autotrade</div>
+        <template v-if="identity === 'register'">
+          <div class="identity-desc">局域网客户端需登记交易员身份后才能操作</div>
+          <div v-if="identityNotice" class="identity-notice">{{ identityNotice }}</div>
+          <el-input v-model="traderInputName" placeholder="交易员名称" maxlength="20" @keyup.enter="registerTrader"></el-input>
+          <el-button type="primary" class="identity-btn" :loading="registerBusy" :disabled="!traderInputName.trim()" @click="registerTrader">提交登记</el-button>
+        </template>
+        <template v-else>
+          <div class="identity-desc">已登记为「{{ traderInputName }}」，等待 master 确认…</div>
+          <div class="identity-waiting"><i></i><i></i><i></i></div>
+          <div class="identity-tip">请通知 master 在控制台顶栏下方点击「确认」；确认后本页面自动解锁</div>
+        </template>
+      </div>
+    </div>
   </div>
 
   <script src="https://unpkg.com/vue@3.5.13/dist/vue.global.prod.js"></script>

@@ -1,0 +1,57 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © wangweiweicdma
+// 智能止损线（smart_stop）：结构止损（K线极值）+ 波动率钳制（ATR 上下限）
+// 规则（2026-10-23 与用户定稿）：
+//   多头止损 = close − clamp(close − 最近N根最低点, 下限×ATR, 上限×ATR)
+//   空头止损 = close + clamp(最近N根最高点 − close, 下限×ATR, 上限×ATR)
+//   逻辑：止损不能太近（被波动扫掉）也不能太远（仓位上不去）；
+//   优先跟结构（跌破最近几根极值 = 逻辑失效），结构太远/太近时用 ATR 边界兜底。
+//   极值含当前未收盘 K 线（ta.lowest/ta.highest 默认含当根）。
+//
+// 输出：
+//   图上两条线——绿线 = 多头智能止损（价格下方），红线 = 空头智能止损（价格上方）
+//   数据窗口——Smart Stop Long / Smart Stop Short（控制台经 WS 订阅读取，
+//   键名 = 标题空格转下划线：Smart_Stop_Long / Smart_Stop_Short）
+//@version=6
+indicator("smart_stop（智能止损：结构极值 + ATR 钳制）", "smart_stop", overlay = true)
+
+// ==================== 输入参数 ====================
+grpStop = "智能止损"
+atrPeriod   = input.int(10, "ATR 周期", minval = 1, group = grpStop,
+                        tooltip = "与 trend_state 指标保持一致的 ATR(10)")
+stopLB      = input.int(3, "逻辑止损回看 K 线数", minval = 1, group = grpStop,
+                        tooltip = "最近 N 根 K 线的极值作为结构止损点（跌破/突破即逻辑失效）")
+stopMinMult = input.float(1.0, "止损下限 ×ATR", minval = 0.1, step = 0.1, group = grpStop,
+                          tooltip = "止损距离下限：结构点太近时按此兜底，防止被波动扫掉")
+stopMaxMult = input.float(2.0, "止损上限 ×ATR", minval = 0.2, step = 0.1, group = grpStop,
+                          tooltip = "止损距离上限：激烈连续行情（结构点太远）时按此封顶，保住仓位")
+
+// ==================== 计算 ====================
+atr = ta.atr(atrPeriod)
+
+lowN  = ta.lowest(low, stopLB)
+highN = ta.highest(high, stopLB)
+
+// 钳制：min(max(结构距离, 下限×ATR), 上限×ATR)；下限恒 ≤ 上限
+lo = stopMinMult * atr
+hi = math.max(stopMaxMult, stopMinMult) * atr
+
+longDist  = math.min(math.max(close - lowN,  lo), hi)   // 多头止损距离
+shortDist = math.min(math.max(highN - close, lo), hi)   // 空头止损距离
+
+smartStopLong  = close - longDist    // 价格下方的多头止损线
+smartStopShort = close + shortDist   // 价格上方的空头止损线
+
+// 数据未就绪（warmup 期 ATR 为 na）时输出 na，不画线
+smartStopLong  := na(atr) ? na : smartStopLong
+smartStopShort := na(atr) ? na : smartStopShort
+
+// ==================== 图上绘制 ====================
+plot(smartStopLong, "Smart Stop Long", color = color.green, linewidth = 2,
+     style = plot.style_linebr)
+plot(smartStopShort, "Smart Stop Short", color = color.red, linewidth = 2,
+     style = plot.style_linebr)
+
+// ==================== 数据窗口导出（控制台 WS 订阅读取） ====================
+plot(smartStopLong, "Smart Stop Long DW", display = display.data_window)
+plot(smartStopShort, "Smart Stop Short DW", display = display.data_window)

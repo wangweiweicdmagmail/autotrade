@@ -85,10 +85,12 @@ def compute_live_order(symbol_data: dict, equity: float, pct: float,
     从实时快照的单标的数据计算完整下单参数（方向/限价/止损/股数）。
     策略用确认值 ts_c（上一根已收盘），不用盘中实时值。
 
-    :param symbol_data: {bar:{...}, ts:{...}, ts_c:{...}}
+    :param symbol_data: {bar:{...}, bar_c2:{...}, ts:{...}, ts_c:{...}}
     :param equity:      账户净值
     :param pct:         仓位风险百分比（如 0.01）
-    :param limit_type:  'ema'（EMA 快线回踩）或 'channel'（通道边沿回踩）
+    :param limit_type:  'ema'（EMA 快线回踩）/ 'channel'（通道边沿回踩）/
+                        'retest'（上上根 K 线极值回踩，止损取 bar_c2 另一端极值，
+                        不依赖 ATR）
     :return: 完整下单参数或 None（数据不全/方向未定/震荡）
     """
     ts = symbol_data.get("ts_c") or symbol_data.get("ts") or {}
@@ -101,14 +103,24 @@ def compute_live_order(symbol_data: dict, equity: float, pct: float,
     side = p["side"]
     sign = 1 if side == "long" else -1
 
-    if limit_type == "channel":
-        limit_px = ts.get("channel_edge")
+    if limit_type == "retest":
+        bar2 = symbol_data.get("bar_c2") or {}
+        high2, low2 = bar2.get("high"), bar2.get("low")
+        if high2 is None or low2 is None:
+            return None
+        limit_px = round(high2 if side == "long" else low2, 2)
+        stop_px = round(low2 if side == "long" else high2, 2)
+        if limit_px <= 0 or stop_px <= 0 or stop_px == limit_px:
+            return None
     else:
-        limit_px = ts.get("ema_fast")
-    atr = ts.get("atr")
-    if limit_px is None or limit_px <= 0 or atr is None or atr <= 0:
-        return None
-    stop_px = round(limit_px - sign * atr, 2)
+        if limit_type == "channel":
+            limit_px = ts.get("channel_edge")
+        else:
+            limit_px = ts.get("ema_fast")
+        atr = ts.get("atr")
+        if limit_px is None or limit_px <= 0 or atr is None or atr <= 0:
+            return None
+        stop_px = round(limit_px - sign * atr, 2)
     if stop_px <= 0:
         return None
 

@@ -57,7 +57,7 @@ class EntryPlan:
     side: str             # long / short
     limit_px: float       # 限价（线值）
     stop_px: float        # 止损（限价 ∓ 1×ATR）
-    line: str             # 踩的线：ema / channel
+    line: str             # 踩的线：ema / channel / fvg
     reason: str = ""
 
 
@@ -72,6 +72,8 @@ class StrategyInstance:
     lot_id: Optional[str] = None
     entry_px: float = 0.0
     stop_px: float = 0.0
+    init_entry_px: float = 0.0      # 下单时计划限价（R 分母基准）
+    init_stop_px: float = 0.0       # 下单时计划止损（R 分母基准）
     r_dist: float = 0.0
     qty: int = 0
     line: str = ""
@@ -115,12 +117,16 @@ class AutoStrategy(ABC):
         "entry_start_hm": 9 * 60 + 45,   # 9:45 ET 前不开新仓（开盘前 15 分钟）
         "entry_end_hm": 15 * 60,     # 15:00 ET 后不开新仓（最后一小时）
         "max_entries_per_day": 2,    # 每标的每日进场上限
+        "use_fvg_line": True,        # FVG 区沿作为入场线（需求上沿 / 供应下沿）
+        "require_same_dir_fvg": False,  # 要求最近 FVG 方向与 ST 方向一致
+        "min_fvg_cum": 0,            # 同向 FVG 累积计数下限（0=不限制）
+        "stop_atr_mult": 1.0,        # 进场止损 ATR 倍数（控制台启动时注入全局值，--param 可覆盖）
     }
 
     @abstractmethod
     def entry_trigger(self, ctx: dict, symbol: str,
                       price: float) -> Optional[EntryPlan]:
-        """tick 级进场判断。ctx = {"ts_c":..., "bar_c":...}（确认值）。
+        """tick 级进场判断。ctx = {"ts_c":..., "bar_c":..., "fvg_c":...}（确认值）。
         price = 最新成交价。返回 EntryPlan 或 None。"""
 
     def on_trade_closed(self, inst: StrategyInstance, result: dict) -> None:
@@ -253,7 +259,8 @@ class LiveBroker:
             symbol=symbol, side=side, qty=qty,
             limit_px=limit_px, stop_px=stop_px,
             limit_type=limit_type, reason=reason,
-            signal_snapshot={"auto_strategy": True})
+            signal_snapshot={"auto_strategy": True},
+            trader="auto")   # 策略引擎下单归属标记（与人工单区分）
         if lot is None:
             raise RuntimeError(err)
         return lot
@@ -383,7 +390,9 @@ class StrategyEngine:
                 continue
             entry = d.get("avg_fill") or d["entry_px"]
             stop = d["stop_px"]
-            r_dist = abs(entry - stop)
+            init_entry = d.get("init_entry_px") or d["entry_px"]
+            init_stop = d.get("init_stop_px") or stop
+            r_dist = abs(init_entry - init_stop)
             if r_dist <= 0:
                 logger.warning("无法收养 %s lot %s：成交价与止损相同，缺少 R 风险基准",
                                sym, d["lot_id"])
@@ -396,6 +405,7 @@ class StrategyEngine:
                 inst_id=f"ai-{self._seq:04d}", symbol=sym,
                 strategy="adopted", state=ACTIVE, side=side,
                 lot_id=d["lot_id"], entry_px=entry, stop_px=stop,
+                init_entry_px=init_entry, init_stop_px=init_stop,
                 r_dist=r_dist, qty=d.get("filled_qty") or d["qty"],
                 adopted=True, breakeven_done=be_done)
             self._instances[sym] = inst
@@ -410,7 +420,8 @@ class StrategyEngine:
     # ---- tick 入口（进场触发；WATCHING 实例专用）----
 
     async def on_price(self, symbol: str, price: float, ts_c: dict,
-                       bar_c: dict, now_hm: int) -> None:
+                       bar_c: dict, now_hm: int,
+                       fvg_c: Optional[dict] = None) -> None:
         inst = self._instances.get(symbol)
         if inst is not None and inst.state == DONE:
             self._try_rearm(symbol, inst)
@@ -429,14 +440,28 @@ class StrategyEngine:
         if now_hm < strategy.params.get("entry_start_hm", 0) \
                 or now_hm >= strategy.params["entry_end_hm"]:
             return   # 时段闸：开盘前 15 分钟 / 最后一小时不开新仓
-        ctx = {"ts_c": ts_c, "bar_c": bar_c, "inst": inst}
+        ctx = {"ts_c": ts_c, "bar_c": bar_c, "inst": inst,
+               "fvg_c": fvg_c or {}}
         plan = strategy.entry_trigger(ctx, symbol, price)
         if plan is None:
             return
         if self._require_entry_confirmation:
-            await self._propose_entry(inst, plan, ts_c, bar_c)
+            await self._propose_entry(inst, plan, ts_c, bar_c, fvg_c=fvg_c)
         else:
             await self._open(inst, strategy, plan, bar_c)
+
+    async def on_price_extremes(self, symbol: str, low: float, high: float,
+                                ts_c: dict, bar_c: dict, now_hm: int,
+                                fvg_c: Optional[dict] = None) -> None:
+        """实时极值输入：按当前方向先喂有利极值，再喂不利极值。"""
+        inst = self._instances.get(symbol)
+        side = inst.side if inst and inst.side else (
+            "long" if ts_c.get("direction") == 1 else "short")
+        first, second = (high, low) if side == "long" else (low, high)
+        for price in (first, second):
+            if price and price > 0:
+                await self.on_price(symbol, price, ts_c, bar_c, now_hm,
+                                    fvg_c=fvg_c)
 
     async def _on_active_price(self, inst: StrategyInstance, price: float) -> None:
         """ACTIVE tick 更新 MFE；达到 breakeven_r 立即移动保本。"""
@@ -491,7 +516,8 @@ class StrategyEngine:
         }
 
     async def _propose_entry(self, inst: StrategyInstance, plan: EntryPlan,
-                             ts_c: dict, bar_c: dict) -> None:
+                             ts_c: dict, bar_c: dict,
+                             fvg_c: Optional[dict] = None) -> None:
         bt = bar_c.get("time") or 0
         inst.state = AWAITING_CONFIRM
         inst.entry_plan = plan
@@ -500,6 +526,7 @@ class StrategyEngine:
         details = await self._position_details(plan)
         if inst.state != AWAITING_CONFIRM:
             return
+        fvg_c = fvg_c or {}
         divergence = ts_c.get("divergence")
         if divergence is None:
             ema_f = ts_c.get("ema_fast")
@@ -527,6 +554,11 @@ class StrategyEngine:
                            if divergence is not None else None),
             "st_duration_bars": ts_c.get("st_duration_bars"),
             "st_push_count": ts_c.get("st_push_count"),
+            # FVG 快照（候选卡片人工比较用；缺失为 None）
+            "fvg_cum_count": fvg_c.get("fvg_cum_count"),
+            "fvg_last_dir": fvg_c.get("fvg_last_dir"),
+            "fvg_last_top": fvg_c.get("fvg_last_top"),
+            "fvg_last_bottom": fvg_c.get("fvg_last_bottom"),
             "qty": details["qty"],
             "risk_usd": details["risk_usd"],
             "amount": details["amount"],
@@ -650,6 +682,8 @@ class StrategyEngine:
         inst.lot_id = None
         inst.entry_px = 0.0
         inst.stop_px = 0.0
+        inst.init_entry_px = 0.0
+        inst.init_stop_px = 0.0
         inst.r_dist = 0.0
         inst.qty = 0
         inst.line = ""
@@ -687,6 +721,8 @@ class StrategyEngine:
         inst.lot_id = lot.lot_id
         inst.entry_px = plan.limit_px
         inst.stop_px = plan.stop_px
+        inst.init_entry_px = plan.limit_px
+        inst.init_stop_px = plan.stop_px
         inst.r_dist = abs(plan.limit_px - plan.stop_px)
         inst.qty = qty
         inst.line = plan.line
@@ -731,9 +767,14 @@ class StrategyEngine:
             # 成交检测（实盘 watcher 会置 ACTIVE；SimBroker on_price 已置）
             if lot is not None and lot.state == ACTIVE:
                 inst.state = ACTIVE
+                if inst.init_entry_px <= 0:
+                    inst.init_entry_px = inst.entry_px
+                if inst.init_stop_px <= 0:
+                    inst.init_stop_px = inst.stop_px
+                if inst.r_dist <= 0:
+                    inst.r_dist = abs(inst.init_entry_px - inst.init_stop_px)
                 avg = getattr(lot, "avg_fill", 0) or inst.entry_px
-                inst.entry_px = avg
-                inst.r_dist = abs(avg - inst.stop_px)
+                inst.entry_px = avg   # 实际成本用于保本/现价浮盈，r_dist 保持下单初始风险
                 self._emit("auto_filled", symbol=symbol, side=inst.side,
                            qty=inst.qty, avg_fill=avg, lot_id=inst.lot_id)
                 logger.info("策略成交 %s %s x%d @%.2f",
@@ -770,8 +811,15 @@ class StrategyEngine:
             inst.mfe_r = max(inst.mfe_r, inst.unrealized_r)
             await self._try_breakeven(inst)
 
-        # 保本后：ST 线跟踪（单向棘轮，1 美分防抖）
-        if inst.breakeven_done and close:
+        # ST 越过实际成本后即可跟踪；已保本后继续跟踪（单向棘轮，1 美分防抖）
+        trail_ready = inst.breakeven_done
+        if not trail_ready:
+            st_ready = ts_c.get("supertrend")
+            trail_ready = bool(
+                st_ready and st_ready > 0 and (
+                    (inst.side == "long" and st_ready > inst.entry_px + 0.01)
+                    or (inst.side == "short" and st_ready < inst.entry_px - 0.01)))
+        if trail_ready and close:
             st = ts_c.get("supertrend")
             if st and st > 0:
                 better = (st > inst.stop_px + 0.01) if inst.side == "long" \
@@ -811,7 +859,8 @@ class StrategyEngine:
     # ---- 回测专用：bar 极值模拟 tick（口径统一，见模块 docstring）----
 
     async def on_bar_extremes(self, symbol: str, bar: dict, ts_c_prev: dict,
-                              bar_c_prev: dict, now_hm: int) -> None:
+                              bar_c_prev: dict, now_hm: int,
+                              fvg_c: Optional[dict] = None) -> None:
         """回测 feed 用：bar 内 tick 路径不可知，用极值建模——
         多头看 low（触线/触止损），空头看 high。先推进 broker 成交与
         ACTIVE tick 保本，再交给随后的 on_bar 做跟踪/反向管理。"""
@@ -828,11 +877,13 @@ class StrategyEngine:
             for px in (first, second):
                 if px:
                     self._broker.on_price(symbol, px, ts=bt)
-                    await self.on_price(symbol, px, ts_c_prev, bar_c_prev, now_hm)
+                    await self.on_price(symbol, px, ts_c_prev, bar_c_prev, now_hm,
+                                        fvg_c=fvg_c)
         # 触发/成交用的极端价：多 low / 空 high
         touch = low if side_hint == "long" else high
         if touch:
-            await self.on_price(symbol, touch, ts_c_prev, bar_c_prev, now_hm)
+            await self.on_price(symbol, touch, ts_c_prev, bar_c_prev, now_hm,
+                                fvg_c=fvg_c)
             # 触发后补两次成交回填：第 1 次让新挂单当根成交（实盘 tick 语义），
             # 第 2 次让刚成交的仓位当根检查止损——同根既触线又穿止损时
             # 按保守口径算止损触发（bar 内时序不可知，宁取不利）

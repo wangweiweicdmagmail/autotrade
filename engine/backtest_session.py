@@ -127,7 +127,8 @@ class BacktestSession:
                         ("time", "open", "high", "low", "close", "volume")}
             prev_ts = self._prev_row.get("ts") or {}
             await self.engine.on_bar_extremes(self.symbol, bar, prev_ts,
-                                              prev_bar, hm)
+                                              prev_bar, hm,
+                                              fvg_c=self._prev_row.get("fvg"))
         await self.engine.on_bar(self.symbol, bar, ts)
         self._prev_row = row
         if self._cursor >= self.total_bars:
@@ -240,6 +241,7 @@ class BacktestSession:
                 "supertrend": ts.get("supertrend"),
                 "atr": ts.get("atr"),
                 "divergence": ts.get("divergence"),
+                "fvg": self._prev_row.get("fvg"),
             }
         return {
             "symbol": self.symbol, "day": self.day,

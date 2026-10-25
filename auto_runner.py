@@ -179,6 +179,7 @@ async def run(strategy_name: str, symbols: list, params: dict) -> None:
             for sym, data in market.items():
                 bar_c = data.get("bar_c") or {}
                 ts_c = data.get("ts_c") or data.get("ts") or {}
+                fvg_c = data.get("fvg_c") or data.get("fvg")
                 bt = bar_c.get("time") or 0
                 # bar 收盘推进 → 管理（PENDING/ACTIVE）
                 if bt and last_bar.get(sym) != bt:
@@ -187,13 +188,15 @@ async def run(strategy_name: str, symbols: list, params: dict) -> None:
                         await engine.on_bar(sym, bar_c, ts_c)
                     except Exception:
                         logger.exception("on_bar 异常 %s", sym)
-                # tick：WATCHING 产生候选；ACTIVE 达到 2R 立即保本
+                # tick：WATCHING 产生候选；ACTIVE 用当前 bar 极值达到 2R 立即保本
                 if trading:
-                    price = (data.get("bar") or {}).get("close")
-                    if price:
+                    bar = data.get("bar") or {}
+                    low, high = bar.get("low"), bar.get("high")
+                    if low or high:
                         try:
-                            await engine.on_price(sym, price, ts_c, bar_c,
-                                                  now_hm)
+                            await engine.on_price_extremes(
+                                sym, low, high, ts_c, bar_c, now_hm,
+                                fvg_c=fvg_c)
                         except Exception:
                             logger.exception("on_price 异常 %s", sym)
             # 收养人工仓（每 5s 扫一次）
@@ -201,8 +204,14 @@ async def run(strategy_name: str, symbols: list, params: dict) -> None:
             if adopt_tick >= 5:
                 adopt_tick = 0
                 try:
-                    await engine.adopt_manual_lots(
+                    adopted = await engine.adopt_manual_lots(
                         order_mgr.list_lots(active_only=True))
+                    for sym in adopted:
+                        data = market.get(sym) or {}
+                        bar_c = data.get("bar_c") or {}
+                        if bar_c:
+                            ts_c = data.get("ts_c") or data.get("ts") or {}
+                            await engine.on_bar(sym, bar_c, ts_c)
                 except Exception:
                     logger.exception("收养扫描异常")
             try:

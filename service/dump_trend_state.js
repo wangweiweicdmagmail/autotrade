@@ -13,7 +13,9 @@
  *     {"time":..., "open":..., "high":..., "low":..., "close":..., "volume":...,
  *      "ts": {"trend_state":1, "direction":1, "ema_fast":..., "ema_slow":...,
  *             "supertrend":..., "channel_edge":..., "atr":...,
- *             "st_duration_bars":..., "st_push_count":...}},
+ *             "st_duration_bars":..., "st_push_count":...},
+ *      "fvg": {"fvg_cum_count":..., "fvg_last_top":..., "fvg_last_bottom":...,
+ *              "fvg_event":..., "fvg_last_dir":...}},
  *     ...   // 按时间正序
  *   ]}
  *
@@ -28,6 +30,8 @@ const path = require('path');
 const TradingView = require('@mathieuc/tradingview');
 
 const TREND_STATE_ID = 'USER;e577100fe79942b4830783d1ceaad535';
+const FVG_ID = 'USER;5ec7d04179b3429ca9286db452352d85';
+const SMART_STOP_ID = 'USER;ca26e3ab587841e2adb38cfbfd0bec41';
 
 function parseArgs(argv) {
   const args = {
@@ -72,6 +76,36 @@ function tsFromPeriod(p) {
   };
 }
 
+// smart_stop 归一化（与 tv_cloud_daemon.js 相同）：合入 ts
+function ssFromPeriod(p) {
+  if (!p) return {};
+  return {
+    smart_stop_long: finite(p.Smart_Stop_Long),
+    smart_stop_short: finite(p.Smart_Stop_Short),
+  };
+}
+
+// 与 tv_cloud_daemon.js 相同的 FVG 归一化（键名映射见 daemon 文件头）。
+// fvg_last_dir：自 idx 向前扫描 periods 历史中最后一个非零 fvg_event。
+function fvgFromPeriod(p, periods, idx) {
+  if (!p) return {};
+  let lastDir = null;
+  if (periods) {
+    for (let i = idx; i < periods.length; i++) {
+      const ev = finite(periods[i] && periods[i].KFVG110);
+      if (ev !== null && ev !== 0) { lastDir = ev > 0 ? 1 : -1; break; }
+    }
+  }
+  return {
+    time: p.$time,   // 该值所属 bar 的时间戳（与 daemon 输出对齐）
+    fvg_cum_count: finite(p.STFVG),
+    fvg_last_top: finite(p.FVG),
+    fvg_last_bottom: finite(p.FVG_2),
+    fvg_event: finite(p.KFVG110),
+    fvg_last_dir: lastDir,
+  };
+}
+
 async function main() {
   const args = parseArgs(process.argv);
   if (!args.symbols.length) {
@@ -81,6 +115,10 @@ async function main() {
   const creds = JSON.parse(fs.readFileSync(args.creds, 'utf8'));
   const indic = await TradingView.getIndicator(
     TREND_STATE_ID, 'last', creds.sessionid, creds.sessionid_sign);
+  const fvgIndic = await TradingView.getIndicator(
+    FVG_ID, 'last', creds.sessionid, creds.sessionid_sign);
+  const ssIndic = await TradingView.getIndicator(
+    SMART_STOP_ID, 'last', creds.sessionid, creds.sessionid_sign);
   const client = new TradingView.Client({
     token: creds.sessionid,
     signature: creds.sessionid_sign,
@@ -97,22 +135,28 @@ async function main() {
     if (args.to > 0) opts.to = args.to;
     chart.setMarket(symbol, opts);
     const study = new chart.Study(indic);
+    const fvgStudy = new chart.Study(fvgIndic);
+    const ssStudy = new chart.Study(ssIndic);
     let done = false;
     const finish = () => {
       if (done) return;
       const bars = chart.periods;
       const tss = study.periods;
-      if (!bars || !bars.length || !tss || !tss.length) return;
+      const fss = fvgStudy.periods;
+      const sss = ssStudy.periods;
+      if (!bars || !bars.length || !tss || !tss.length || !fss || !fss.length
+          || !sss || !sss.length) return;
       done = true;
       // periods 均为倒序（[0] 最新），按索引对齐后转正序
       const rows = [];
-      const n = Math.min(bars.length, tss.length);
+      const n = Math.min(bars.length, tss.length, fss.length, sss.length);
       for (let i = n - 1; i >= 0; i--) {
         const b = bars[i];
         rows.push({
           time: b.time, open: b.open, high: b.max,
           low: b.min, close: b.close, volume: b.volume,
-          ts: tsFromPeriod(tss[i]),
+          ts: Object.assign(tsFromPeriod(tss[i]), ssFromPeriod(sss[i])),
+          fvg: fvgFromPeriod(fss[i], fss, i),
         });
       }
       result[symbol] = rows;
@@ -129,6 +173,8 @@ async function main() {
       }
     };
     study.onUpdate(() => setTimeout(finish, 500));   // 等 chart/study 都就绪
+    fvgStudy.onUpdate(() => setTimeout(finish, 500));
+    ssStudy.onUpdate(() => setTimeout(finish, 500));
     chart.onUpdate(() => setTimeout(finish, 500));
     chart.onError((...e) => {
       console.error(`[${symbol}] err:`, JSON.stringify(e).slice(0, 200));

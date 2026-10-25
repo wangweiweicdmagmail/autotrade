@@ -6,14 +6,15 @@
 提供给 Web 控制页（console/static）的 REST + WebSocket 接口：
 
 - REST：状态 / 下单（LMT + STP 括号单，双向）/ 订单列表 / 聚合仓位 /
-  改止损 / 撤单 / 平仓 / 选股 / 绩效 / 事件 / 刷新。
+  改止损 / 撤单 / 平仓 / 选股 / 绩效 / 事件 / 跟单服务器管理 / 刷新。
 - WebSocket /ws：每 1s 推送一次快照（状态 + 行情 + 仓位 + 全部 lot），
   前端据此实时刷新，无需轮询。
 
 策略体系（2026-10-17 v3）：5M 周期 + 单指标 trend_state。
 过滤 = ts_c.trend_state（1 单边多头 / -1 单边空头 / 0 震荡拦截）；
 下单方向 = ST 方向（无反向订单）；入场 = ema_fast / channel_edge 两条
-回踩限价线；止损 = 限价 ∓ 1×ATR（STP 子单，唯一止损形态）。
+回踩限价线；止损 = 锚定价 ∓ STOP_ATR_MULT×ATR（STP 子单，唯一止损形态；
+倍数为全局设置，运行时经 POST /api/settings 修改）。
 
 运行（默认 dry-run，不发真实订单）：:
 
@@ -26,22 +27,29 @@
 
 import asyncio
 import collections
+import json
 import logging
+import os
+import re
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import List, Optional, Set
 
 # 允许从项目根目录 import config / execution
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import config
 from engine.auto_engine import LiveBroker, StrategyEngine
+from engine.breakout_tracker import BreakoutTracker
+from engine import news_digest
+from engine.notifier import Notifier
 from engine.realtime_collector import RealtimeCollector
 from engine.shadow_tracker import ShadowTracker
 from engine.strategies import build_strategy
@@ -99,10 +107,502 @@ class LimitStopOrderRequest(BaseModel):
     qty: int = 0                      # 0 = 按净值自动算股数
     limit_px: float = Field(..., gt=0)
     stop_px: float = Field(..., gt=0)
-    limit_type: str = "ema"           # ema / channel / midpoint（5M 高低价中点）
+    limit_type: str = "ema"           # ema / channel / midpoint（5M 高低价中点）/ retest（上上根 K 线回踩）/ chase（FVG 追价）/ market（市价单）
     reason: str = ""
     risk_usd: float = 0               # 设定风险金额（风控偏差 10% 容差检查）
+    max_position_pct: float = 0       # 仓位上限%（0=不封顶；回踩改价股数封顶用）
     force: bool = False               # 执意开仓：二次确认后放行，跳过 trend_state 过滤拦截
+    twap_batches: int = 0             # TWAP 分批数（0/1=不分批；>1=分 N 批时间平均建仓）
+    twap_interval_s: int = 60         # TWAP 批次间隔秒（默认 60s，测试可传小值）
+
+
+class ClientRegisterRequest(BaseModel):
+    name: str = Field(..., description="交易员名称（1-20 字符，无特殊符号）")
+
+
+# ---------------------------------------------------------------------------
+# 局域网多客户端：注册 / 审批 / 交易员闸门
+# ---------------------------------------------------------------------------
+# 本机（回环地址）= master，免确认；非本机客户端首次访问须提交交易员名称注册，
+# master 在控制台审批后，客户端持 X-Trader-Token 头方可调用写操作端点。
+
+_LOCAL_ADDRS = ("127.0.0.1", "::1")
+# 名称：1-20 字符，字母/数字/中文/下划线/连字符（\w 在 str 模式下含中文）
+_CLIENT_NAME_RE = re.compile(r"^[\w\-]{1,20}$")
+_CLIENTS_PATH = Path(__file__).resolve().parent.parent / "logs" / "clients.json"
+# token 有效期：自审批时刻起，过期后须重新登记并重新走 master 审批
+_CLIENT_TOKEN_TTL_SECONDS = config.CLIENT_TOKEN_TTL_HOURS * 3600
+
+
+def _load_clients() -> dict:
+    """启动加载 clients.json（已审批 token 重启后保持有效）。"""
+    try:
+        payload = json.loads(_CLIENTS_PATH.read_text(encoding="utf-8"))
+        tokens = payload.get("tokens")
+        if isinstance(tokens, dict):
+            return {"tokens": tokens}
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, TypeError) as e:
+        logger.warning("clients.json 加载失败: %s", e)
+    return {"tokens": {}}
+
+
+def _save_clients() -> None:
+    """原子写落盘（tmp + os.replace，参照 lots_state.json 的落盘模式）。"""
+    try:
+        _CLIENTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _CLIENTS_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(_clients, ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+        os.replace(tmp, _CLIENTS_PATH)
+    except OSError:
+        logger.exception("clients.json 落盘失败")
+
+
+_clients: dict = _load_clients()
+
+
+# ---------------------------------------------------------------------------
+# 全局设置（logs/settings.json 持久化，运行时经 POST /api/settings 修改）
+# ---------------------------------------------------------------------------
+
+_SETTINGS_PATH = Path(__file__).resolve().parent.parent / "logs" / "settings.json"
+# 止损 ATR 倍数允许范围（越界 400）
+_STOP_ATR_MULT_MIN, _STOP_ATR_MULT_MAX = 0.2, 5.0
+
+
+def _load_settings() -> dict:
+    """启动加载 settings.json；缺文件/损坏返回空 dict（各键回退 config 默认）。"""
+    try:
+        payload = json.loads(_SETTINGS_PATH.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            return payload
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, TypeError) as e:
+        logger.warning("settings.json 加载失败: %s", e)
+    return {}
+
+
+def _save_settings() -> None:
+    """原子写落盘（tmp + os.replace，与 clients.json 落盘模式一致）。"""
+    try:
+        _SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _SETTINGS_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(_settings, ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+        os.replace(tmp, _SETTINGS_PATH)
+    except OSError:
+        logger.exception("settings.json 落盘失败")
+
+
+_settings: dict = _load_settings()
+
+
+def _stop_atr_mult() -> float:
+    """当前全局止损 ATR 倍数（settings.json 优先，缺省回退 config.STOP_ATR_MULT）。"""
+    try:
+        v = float(_settings.get("stop_atr_mult"))
+        if _STOP_ATR_MULT_MIN <= v <= _STOP_ATR_MULT_MAX:
+            return v
+    except (TypeError, ValueError):
+        pass
+    return config.STOP_ATR_MULT
+
+
+def _screen_premarket_filter() -> bool:
+    """选股盘前区间过滤开关（默认关：缺键/假值都不过滤）。"""
+    return bool(_settings.get("screen_premarket_filter"))
+
+
+def _fvg_premarket_filter() -> bool:
+    """FVG 监控盘前区间过滤开关（默认关）。"""
+    return bool(_settings.get("fvg_premarket_filter"))
+
+
+def _attack_zone(data: dict):
+    """快照里的进攻区域盘前区间（attack_c 确认值 pmh/pml）。
+    无数据（空 dict / null / 区间非法）返回 (None, None)——过滤时一律保留。"""
+    atk = data.get("attack_c") or {}
+    pmh, pml = atk.get("pmh"), atk.get("pml")
+    try:
+        if pmh is not None and pml is not None and float(pmh) > float(pml) > 0:
+            return float(pmh), float(pml)
+    except (TypeError, ValueError):
+        pass
+    return None, None
+
+
+def _premarket_pass(side: str, close, pmh, pml) -> bool:
+    """盘前区间过滤判定：多头要求现价 > pmh，空头要求现价 < pml；
+    区间或现价缺失一律保留（无法判断时不误杀）。"""
+    if pmh is None or pml is None or close is None:
+        return True
+    if side == "long":
+        return close > pmh
+    return close < pml
+
+
+def _token_valid(info: dict) -> bool:
+    """token 当前是否有效：已审批且未超过有效期（自审批时刻起算）。"""
+    if not info or not info.get("approved"):
+        return False
+    return (time.time() - info.get("approved_at", 0)) < _CLIENT_TOKEN_TTL_SECONDS
+
+
+def _is_local(request: Request) -> bool:
+    """是否本机请求（remote_addr 为回环地址）= master，免确认。"""
+    client = request.client
+    return bool(client) and client.host in _LOCAL_ADDRS
+
+
+async def require_trader(request: Request) -> str:
+    """交易员闸门（写操作统一依赖注入）：
+    本机放行（trader="master"）；非本机 token 有效（已审批且未过期）→ 放行
+    （trader=名称）；已过期 → 403「登录已过期」；否则 403「等待 master 审批」。"""
+    if _is_local(request):
+        return "master"
+    token = request.headers.get("X-Trader-Token", "")
+    info = _clients.get("tokens", {}).get(token)
+    if _token_valid(info):
+        return info["name"]
+    if info and info.get("approved"):
+        raise HTTPException(403, "登录已过期（token 超过有效期），请重新登记并经 master 审批")
+    raise HTTPException(403, "客户端未确认，等待 master 审批")
+
+
+def _clients_snapshot() -> dict:
+    """快照给前端的客户端列表（只给 token 前 6 位，不泄露完整 token；
+    approved 列只含未过期的）。"""
+    pending, approved = [], []
+    for token, info in _clients.get("tokens", {}).items():
+        row = {"name": info.get("name", ""), "token_prefix": token[:6]}
+        if _token_valid(info):
+            approved.append(row)
+        elif not info.get("approved"):
+            row["created_at"] = info.get("created_at", 0)
+            pending.append(row)
+        # 已过期的 approved token 两列都不显示（自然淘汰）
+    pending.sort(key=lambda r: r.get("created_at", 0))
+    approved.sort(key=lambda r: r["name"])
+    return {"pending": pending, "approved": approved}
+
+
+# ---------------------------------------------------------------------------
+# 跟单系统（master 侧）：服务器配置 + 进程监管 + 快照聚合
+# ---------------------------------------------------------------------------
+# master 拥有 logs/copy_servers.json；每台 enabled 服务器由 CopySupervisor
+# 常驻一个 `python3 copy_trader.py --name {name}` 子进程（EXECUTION_ENABLED=0
+# 时追加 --dry-run）。子进程每 2s 写 logs/copy-{name}-status.json（状态快照），
+# 并轮询 logs/copy-{name}-cmd.json（retry/dismiss/unhalt 人工指令）。
+# clientId 本机分配表：11=autotrade 主，12=临时测试，2/3/46=nautilus，
+# 跟单服务器从 13 起自动分配。
+
+_COPY_SERVERS_PATH = Path(__file__).resolve().parent.parent / "logs" / "copy_servers.json"
+_COPY_TRADER_PY = Path(__file__).resolve().parent.parent / "copy_trader.py"
+# 服务器名：1-10 字符，字母/数字/中文/下划线/连字符
+_COPY_SERVER_NAME_RE = re.compile(r"^[\w\-]{1,10}$")
+# 状态文件原样合入列表/快照的字段（copy_trader.py 每 2s 写一次）
+_COPY_STATUS_FIELDS = ("connected", "equity", "synced", "failed", "halted",
+                       "drawdown_pct", "last_sync_ts", "last_error",
+                       "orders", "failures")
+# 跟单 client_id 自动分配下限与本机保留号段（见上方分配表注释）
+_COPY_CLIENT_ID_MIN = 13
+_COPY_CLIENT_ID_RESERVED = (2, 3, 12, 46)
+
+
+def _load_copy_servers() -> list:
+    """加载 logs/copy_servers.json（master 拥有）；缺失/损坏返回空列表。"""
+    try:
+        payload = json.loads(_COPY_SERVERS_PATH.read_text(encoding="utf-8"))
+        servers = payload.get("servers")
+        if isinstance(servers, list):
+            return servers
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, TypeError) as e:
+        logger.warning("copy_servers.json 加载失败: %s", e)
+    return []
+
+
+def _save_copy_servers(servers: list) -> None:
+    """原子写落盘（tmp + os.replace，与 clients.json 落盘模式一致）。"""
+    try:
+        _COPY_SERVERS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _COPY_SERVERS_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"servers": servers}, ensure_ascii=False,
+                                  indent=2), encoding="utf-8")
+        os.replace(tmp, _COPY_SERVERS_PATH)
+    except OSError:
+        logger.exception("copy_servers.json 落盘失败")
+
+
+def _copy_status_path(name: str) -> Path:
+    return _COPY_SERVERS_PATH.parent / f"copy-{name}-status.json"
+
+
+def _copy_cmd_path(name: str) -> Path:
+    return _COPY_SERVERS_PATH.parent / f"copy-{name}-cmd.json"
+
+
+def _copy_status(name: str) -> Optional[dict]:
+    """读取跟单进程状态文件 logs/copy-{name}-status.json；缺失/损坏返回 None。"""
+    try:
+        payload = json.loads(_copy_status_path(name).read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            return payload
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, TypeError):
+        pass
+    return None
+
+
+def _alloc_copy_client_id(servers: list) -> int:
+    """自动分配 client_id：max(13, 现有最大+1)，避开主程序与本机保留号段。"""
+    used = {int(s["client_id"]) for s in servers if s.get("client_id")}
+    cid = max([_COPY_CLIENT_ID_MIN] + [c + 1 for c in used])
+    reserved = set(_COPY_CLIENT_ID_RESERVED) | {config.IBKR_CLIENT_ID}
+    while cid in used or cid in reserved:
+        cid += 1
+    return cid
+
+
+def _validate_copy_server(cfg: dict, others: list) -> Optional[str]:
+    """跟单服务器配置校验；返回错误信息（None=通过）。others=除自身外的服务器。"""
+    if cfg.get("size_mode") not in ("risk", "multiplier"):
+        return "size_mode 仅支持 risk / multiplier"
+    if cfg.get("direction") not in ("both", "long", "short"):
+        return "direction 仅支持 both / long / short"
+    if not (1 <= int(cfg.get("port") or 0) <= 65535):
+        return "port 非法（1-65535）"
+    if float(cfg.get("risk_usd") or 0) <= 0:
+        return "risk_usd 必须为正"
+    if float(cfg.get("size_multiplier") or 0) <= 0:
+        return "size_multiplier 必须为正"
+    if float(cfg.get("max_drawdown_pct") or 0) <= 0:
+        return "max_drawdown_pct 必须为正"
+    if not str(cfg.get("master_ws") or "").startswith(("ws://", "wss://")):
+        return "master_ws 必须是 ws:// 或 wss:// 地址"
+    cid = int(cfg.get("client_id") or 0)
+    if cid <= 0:
+        return "client_id 必须为正"
+    if cid == config.IBKR_CLIENT_ID:
+        return f"client_id 与主程序冲突（{cid}）"
+    if any(int(o.get("client_id") or 0) == cid for o in others):
+        return f"client_id 已被其他跟单服务器占用（{cid}）"
+    return None
+
+
+class CopySupervisor:
+    """跟单进程监管（参照 RealtimeCollector 的 subprocess 模式）：
+    每台 enabled 服务器常驻一个 copy_trader.py 子进程；崩溃自动重启
+    （指数退避，一小时内最多 10 次，超限放弃并告警）；CRUD 配置变更时
+    reload 增量比对——新增/参数变化的（重）启动，停用/删除的 terminate
+    （先 SIGTERM 等 5s 再 SIGKILL）。"""
+
+    def __init__(self) -> None:
+        self._procs: dict = {}            # name -> asyncio 子进程
+        self._configs: dict = {}          # name -> 最近一次生效的配置（reload 比对用）
+        self._restarts: dict = {}         # name -> 最近重启时间戳（限频用）
+        self._pending_restart: dict = {}  # name -> 退避到点的重启时刻
+        self._stopping: set = set()       # 主动停止中的 name（watchdog 不重启）
+        self._watchdog_task: Optional[asyncio.Task] = None
+        self._running = False
+
+    async def start(self, servers: list) -> None:
+        """启动监管：copy_trader.py 缺失只告警不阻塞（另一 agent 可能在写）。"""
+        self._configs = {s["name"]: s for s in servers if s.get("name")}
+        if not _COPY_TRADER_PY.exists():
+            logger.warning("copy_trader.py 不存在（%s），跟单监管未启动",
+                           _COPY_TRADER_PY)
+            return
+        self._running = True
+        for s in servers:
+            if s.get("enabled"):
+                await self._spawn(s)
+        self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+
+    async def stop_all(self) -> None:
+        """停止监管并 terminate 全部跟单进程。"""
+        self._running = False
+        if self._watchdog_task:
+            self._watchdog_task.cancel()
+            self._watchdog_task = None
+        for name in list(self._procs) + list(self._pending_restart):
+            await self.terminate(name)
+
+    async def reload(self, servers: list) -> None:
+        """配置变更增量比对：enabled 新增/参数变化 → （重）启动；
+        停用/删除 → terminate。监管未启动时只更新配置缓存。"""
+        all_new = {s["name"]: s for s in servers if s.get("name")}
+        if self._running:
+            enabled = {n: s for n, s in all_new.items() if s.get("enabled")}
+            # 停用/删除 → terminate
+            for name in list(self._procs) + list(self._pending_restart):
+                if name not in enabled:
+                    await self.terminate(name)
+            # 新增/参数变化 → （重）启动（无变化且存活则跳过）
+            for name, cfg in enabled.items():
+                if self.process_alive(name) and self._configs.get(name) == cfg:
+                    continue
+                await self.terminate(name)   # 无进程时为空操作
+                await self._spawn(cfg)
+        self._configs = all_new
+
+    async def _spawn(self, cfg: dict) -> None:
+        """启动一台服务器的跟单子进程（EXECUTION_ENABLED=0 时加 --dry-run）。"""
+        name = cfg["name"]
+        args = ["python3", str(_COPY_TRADER_PY), "--name", name]
+        if not config.EXECUTION_ENABLED:
+            args.append("--dry-run")
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            cwd=str(_COPY_TRADER_PY.parent),
+        )
+        self._procs[name] = proc
+        logger.info("跟单进程启动: %s (pid=%s, client_id=%s%s)", name,
+                    proc.pid, cfg.get("client_id"),
+                    ", dry-run" if not config.EXECUTION_ENABLED else "")
+
+    async def terminate(self, name: str) -> None:
+        """停止一台跟单进程：先 SIGTERM 等 5s，超时再 SIGKILL。"""
+        self._stopping.add(name)
+        self._pending_restart.pop(name, None)
+        proc = self._procs.pop(name, None)
+        try:
+            if proc is not None and proc.returncode is None:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                logger.info("跟单进程已停止: %s", name)
+        except ProcessLookupError:
+            pass
+        finally:
+            self._stopping.discard(name)
+
+    def process_alive(self, name: str) -> bool:
+        """该服务器的跟单进程是否存活。"""
+        proc = self._procs.get(name)
+        return bool(proc is not None and proc.returncode is None)
+
+    async def _watchdog_loop(self) -> None:
+        """守护：每 2s 检查进程存活，崩溃按指数退避重启（10 次/小时封顶）。"""
+        while True:
+            await asyncio.sleep(2.0)
+            try:
+                await self._check_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.exception("跟单监管循环异常: %s", e)
+
+    async def _check_once(self) -> None:
+        """单拍检查：收割已退出进程并按退避计划重启。"""
+        now = time.time()
+        for name, proc in list(self._procs.items()):
+            if proc.returncode is None or name in self._stopping:
+                continue
+            # 进程意外退出
+            self._procs.pop(name, None)
+            record_event("copy_process_died", name=name,
+                         returncode=proc.returncode)
+            logger.warning("跟单进程 %s 意外退出 (rc=%s)", name, proc.returncode)
+            cfg = self._configs.get(name)
+            if not cfg or not cfg.get("enabled"):
+                continue
+            # 限频：一小时内最多 10 次重启，超限放弃（人工排查后再 enable）
+            stamps = [t for t in self._restarts.get(name, []) if now - t < 3600]
+            self._restarts[name] = stamps
+            if len(stamps) >= 10:
+                logger.error("跟单进程 %s 一小时内重启已达 10 次，停止自动重启",
+                             name)
+                record_event("copy_process_died", name=name, gave_up=True)
+                continue
+            # 指数退避：1/2/4/8... 封顶 60s
+            self._pending_restart[name] = now + min(2 ** len(stamps), 60)
+        for name, at in list(self._pending_restart.items()):
+            if now < at or name in self._stopping:
+                continue
+            self._pending_restart.pop(name, None)
+            cfg = self._configs.get(name)
+            if not cfg or not cfg.get("enabled") or not self._running:
+                continue
+            self._restarts.setdefault(name, []).append(now)
+            try:
+                await self._spawn(cfg)
+            except Exception as e:
+                logger.warning("跟单进程 %s 重启失败（5s 后重试）: %s", name, e)
+                self._pending_restart[name] = now + 5
+
+
+# 跟单进程监管实例（startup 启动，shutdown 全部 terminate）
+copy_supervisor: CopySupervisor = CopySupervisor()
+
+
+def _copy_server_row(cfg: dict) -> dict:
+    """单台服务器合并行：配置字段 + 状态文件（无文件时状态字段为 null）
+    + process_alive（监管进程存活）。"""
+    status = _copy_status(cfg.get("name", "")) or {}
+    row = dict(cfg)
+    for k in _COPY_STATUS_FIELDS:
+        row[k] = status.get(k)
+    # 状态文件的 master_ws(bool) 与配置的 master_ws(URL) 撞名：别名导出连接状态
+    row["master_ws_connected"] = status.get("master_ws")
+    row["process_alive"] = copy_supervisor.process_alive(cfg.get("name", ""))
+    return row
+
+
+def _copy_snapshot() -> dict:
+    """快照 copy 段：每台服务器的 配置 + 状态文件原样合入 + 进程存活。"""
+    return {"servers": [_copy_server_row(c) for c in _load_copy_servers()]}
+
+
+class CopyServerCreateRequest(BaseModel):
+    """新增跟单服务器（client_id=0 = 自动分配，13 起）。"""
+    name: str = Field(..., description="服务器名（1-10 字符，唯一）")
+    master_ws: str = "ws://127.0.0.1:8000/ws"
+    host: str = "127.0.0.1"
+    port: int = 7497
+    client_id: int = 0                # 0 = 自动分配
+    account_id: str = ""
+    fa_group: str = ""
+    enabled: bool = False             # 新增默认停用，确认参数后再 enable
+    size_mode: str = "risk"           # risk=按风险金额 / multiplier=按倍数
+    risk_usd: float = 300
+    size_multiplier: float = 0.1
+    max_drawdown_pct: float = 3.0
+    direction: str = "both"           # both / long / short
+    copy_existing_on_start: bool = False
+
+
+class CopyServerUpdateRequest(BaseModel):
+    """改参数：只更新显式传入的字段（None = 不动）；name/enabled 走专用端点。"""
+    master_ws: Optional[str] = None
+    host: Optional[str] = None
+    port: Optional[int] = None
+    client_id: Optional[int] = None
+    account_id: Optional[str] = None
+    fa_group: Optional[str] = None
+    size_mode: Optional[str] = None
+    risk_usd: Optional[float] = None
+    size_multiplier: Optional[float] = None
+    max_drawdown_pct: Optional[float] = None
+    direction: Optional[str] = None
+    copy_existing_on_start: Optional[bool] = None
+
+
+class CopyCmdRequest(BaseModel):
+    """人工指令（合并进 logs/copy-{name}-cmd.json，不覆盖已有指令）。"""
+    retry: List[str] = Field(default_factory=list)    # 重试的失败单号
+    dismiss: List[str] = Field(default_factory=list)  # 忽略的失败单号
+    unhalt: bool = False                              # 解除熔断
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +615,7 @@ risk_gate: RiskGate = RiskGate(RiskConfig(
     per_trade_usd=config.RISK_PER_TRADE_USD,
     max_order_qty=config.RISK_MAX_ORDER_QTY,
     max_open_positions=config.RISK_MAX_OPEN_POSITIONS,
+    max_total_risk_usd=config.RISK_MAX_TOTAL_RISK_USD,
     daily_loss_limit_usd=config.RISK_DAILY_LOSS_LIMIT_USD,
 ))
 order_mgr: OrderManager = OrderManager(gateway, risk_gate)
@@ -127,8 +628,9 @@ _broadcast_task: Optional[asyncio.Task] = None
 _eod_task: Optional[asyncio.Task] = None
 _reconcile_task: Optional[asyncio.Task] = None
 _midpoint_reprice_task: Optional[asyncio.Task] = None
+_retest_reprice_task: Optional[asyncio.Task] = None
 _external_cleanup_task: Optional[asyncio.Task] = None
-_midpoint_data_warned: set = set()
+_midpoint_escalate_attempted: set = set()  # (lot_id, bar_time) 突破升级每 bar 只尝试一次
 
 # TV 实时订阅采集器（5M K线 + trend_state 单指标）
 collector: RealtimeCollector = RealtimeCollector(config.WATCHLIST)
@@ -143,6 +645,13 @@ _scan_task: Optional[asyncio.Task] = None
 # 止损单守卫状态（持仓缺少 STP 保护单 → 每分钟提醒）
 _stop_alerts: dict = {}   # ticker -> 裸仓提醒
 _stop_guard_task: Optional[asyncio.Task] = None
+
+# 未快速突破提醒（开仓超过 SLOW_BREAK_SECONDS 仍未保本 → 语音提醒减仓）
+_slow_break_alerts: dict = {}   # lot_id -> 提醒
+_slow_break_task: Optional[asyncio.Task] = None
+
+# 自动 2R 保本（浮盈 ≥ 2R 自动止损移成本）
+_auto_breakeven_task: Optional[asyncio.Task] = None
 
 # 趋势反向自动平仓记录（前端语音/通知用，ticker -> 最近一次自动平仓）
 _auto_close_notices: dict = {}
@@ -161,6 +670,32 @@ _auto_enabled: bool = False        # /api/auto/start 开启，stop 关闭
 _auto_task: Optional[asyncio.Task] = None
 _auto_last_bar: dict = {}          # symbol -> 已处理的 bar_c.time
 _auto_strategy_name: str = ""
+
+# FVG 事件环形缓冲（保留最近 4 小时；指标只导出最后一个 FVG 边沿，
+# 事件当根必须在服务端固化快照，否则同标的再出新缺口旧边沿即被覆盖）
+FVG_EVENT_TTL_SECONDS = 4 * 3600
+_fvg_events: "collections.deque" = collections.deque()
+# FVG 首次回踩事件环形缓冲（同 4h TTL）：一个 FVG 终身只报一次回踩，
+# 触发即把边沿快照固化进此缓冲（避免旧事件被淘汰后回踩记录丢失）
+_fvg_retests: "collections.deque" = collections.deque()
+_fvg_last_bar: dict = {}           # symbol -> 已扫描的最大 bar_c.time
+_fvg_pending: dict = {}            # symbol -> (bar_time, 剩余重试拍数)：daemon 的
+                                   # chart 与 FVG study 回调跨 1s 推送边界时 fvg_c
+                                   # 还是旧 bar 的值，挂起等它追上（防事件永久丢失）
+_fvg_warnings: "collections.deque" = collections.deque()  # FVG 预警（形成中，同 4h TTL）
+_fvg_warned: dict = {}             # warn_key -> 记录时间戳：每 bar 每方向只预警一次
+_fvg_task: Optional[asyncio.Task] = None
+
+# 盘前突破+FVG确认 流式信号（engine.breakout_tracker，口径=research_breakout.py）
+breakout_tracker: BreakoutTracker = BreakoutTracker()
+_breakout_last_bar: dict = {}      # symbol -> 已喂入的 bar_c.time
+_breakout_pending: dict = {}       # symbol -> (bar_time, bar, 剩余重试拍数)：
+                                   # 同 FVG 固化，fvg_c 未追上 bar_c 时挂起等齐
+_breakout_signals: "collections.deque" = collections.deque()  # 当日已出信号（4h TTL）
+_breakout_injected: dict = {}    # symbol -> 已注入盘前区间的 ET 交易日（每天一次）
+_breakout_task: Optional[asyncio.Task] = None
+_naked_position_task: Optional[asyncio.Task] = None   # 裸仓巡检（STP 缺失自动补挂）
+_health_watch_task: Optional[asyncio.Task] = None     # 健康巡检（TWS 断线/数据陈旧）
 
 
 # ---------------------------------------------------------------------------
@@ -193,8 +728,48 @@ def _ts_c(data: dict) -> dict:
     return data.get("ts_c") or data.get("ts") or {}
 
 
+def _smart_stop_dist(data: dict, side: str, ref_px: float, atr: float) -> float:
+    """智能止损距离（优先读 smart_stop 指标 plot，所见即所得；缺失回退本地计算）。
+    指标口径（smart_stop.pine）：距离 = close − Smart_Stop_Long（多）/
+    Smart_Stop_Short − close（空），内部已是「3 根极值 + ATR 钳制」。
+    本地回退：同样的逻辑止损点（最近三根 K 线极值，含当前 bar）+
+    ATR 钳制 [1×ATR, 上限×ATR]（上限 = 全局 stop_atr_mult）。"""
+    dist = _smart_stop_dist_from_indicator(data, side)
+    if dist is not None:
+        return dist
+    lows, highs = [], []
+    for key in ("bar", "bar_c", "bar_c2"):
+        b = data.get(key) or {}
+        lo, hi = b.get("low"), b.get("high")
+        if lo is not None and hi is not None:
+            lows.append(lo)
+            highs.append(hi)
+    if side == "long":
+        logical = ref_px - min(lows) if lows else 0.0
+    else:
+        logical = max(highs) - ref_px if highs else 0.0
+    lo, hi = atr, max(_stop_atr_mult(), 1.0) * atr
+    return min(max(logical, lo), hi)
+
+
+def _smart_stop_dist_from_indicator(data: dict, side: str):
+    """读 smart_stop 指标的止损距离（ts_c 确认值，对应 bar_c 的 close）。
+    缺失/非法返回 None（调用方回退本地计算）。"""
+    ts = _ts_c(data)
+    close = (data.get("bar_c") or {}).get("close")
+    ssl = ts.get("smart_stop_long") if side == "long" else ts.get("smart_stop_short")
+    if ssl is None or close is None:
+        return None
+    dist = (close - ssl) if side == "long" else (ssl - close)
+    return dist if dist > 0 else None
+
+
 def _midpoint_prices(data: dict, side: str):
-    """由上一根已收盘 5M bar 计算中点限价与 1×ATR 止损。"""
+    """由上一根已收盘 5M bar 计算中点限价、ATR 止损与突破触发价。
+
+    突破触发价：多单 = bar 高点 + 0.01，空单 = bar 低点 - 0.01，
+    供 OCA 突破腿（STP stop-market）使用；止损 = 中点限价 ∓ 智能距离
+    （最近三根 K 线极值逻辑止损，钳制在 1×ATR ~ 上限×ATR，上限=全局倍数）。"""
     bar = data.get("bar_c") or {}
     ts = _ts_c(data)
     high, low = bar.get("high"), bar.get("low")
@@ -206,21 +781,112 @@ def _midpoint_prices(data: dict, side: str):
     if not atr or atr <= 0:
         raise ValueError("ATR 数据缺失，无法计算中点单止损")
     limit = round((high + low) / 2, 2)
-    stop = round(limit + (-1 if side == "long" else 1) * atr, 2)
-    if limit <= 0 or stop <= 0:
-        raise ValueError("中点限价/止损必须为正")
+    stop = round(limit + (-1 if side == "long" else 1)
+                 * _smart_stop_dist(data, side, limit, atr), 2)
+    breakout = round(high + 0.01 if side == "long" else low - 0.01, 2)
+    if limit <= 0 or stop <= 0 or breakout <= 0:
+        raise ValueError("中点限价/止损/突破价必须为正")
     if side == "long" and stop >= limit:
         raise ValueError("多仓止损必须低于中点限价")
     if side == "short" and stop <= limit:
         raise ValueError("空仓止损必须高于中点限价")
-    return limit, stop, bar, float(atr)
+    return limit, stop, breakout, bar, float(atr)
+
+
+def _retest_prices(data: dict, side: str):
+    """由上上根已收盘 5M bar（bar_c2，periods[2]）计算回踩限价与逻辑止损。
+
+    多头：限价 = bar_c2.high（等回踩成交，不回踩形成 gap 不成交），
+    止损 = bar_c2.low；空头镜像（限价 = bar_c2.low，止损 = bar_c2.high）。
+    止损取 K 线极值，不依赖 ATR（与中点单的 ∓N×ATR 不同，N = 全局止损倍数）。"""
+    bar = data.get("bar_c2") or {}
+    high, low = bar.get("high"), bar.get("low")
+    if high is None or low is None or not bar.get("time"):
+        raise ValueError("缺少上上根已收盘 5M K 线（bar_c2），无法计算回踩限价")
+    if high < low:
+        raise ValueError("5M K 线 high/low 数据非法")
+    limit = round(high if side == "long" else low, 2)
+    stop = round(low if side == "long" else high, 2)
+    if limit <= 0 or stop <= 0:
+        raise ValueError("回踩限价/止损必须为正")
+    if side == "long" and stop >= limit:
+        raise ValueError("多仓止损必须低于回踩限价")
+    if side == "short" and stop <= limit:
+        raise ValueError("空仓止损必须高于回踩限价")
+    return limit, stop, bar
+
+
+def _fvg_chase_prices(data: dict, side: str, symbol: str):
+    """FVG 追价定价（服务端，不信浏览器价）：
+    以该 symbol + 方向在 4h 缓冲内的最新 FVG 事件边沿为锚（多=top / 空=bottom），
+    现价距边沿 ≤ FVG_CHASE_MAX_ATR_RATIO × ATR 才允许追价；
+    限价 = 实时 close × (1 ± ENTRY_LIMIT_PREMIUM_PCT/100)（marketable 限价，
+    与系统不用裸 MARKET 的惯例一致），止损 = 现价 ∓ N×ATR（N = 全局止损倍数）。"""
+    bar = data.get("bar") or {}
+    ts = _ts_c(data)
+    close = bar.get("close")
+    atr = ts.get("atr")
+    if close is None or close <= 0:
+        raise ValueError("缺少实时价格，无法追价")
+    if not atr or atr <= 0:
+        raise ValueError("ATR 数据缺失，无法计算追价止损")
+    # 4h 缓冲内该 symbol + 方向的最新 FVG 事件（deque 按 bar_time 递增，
+    # 反向取第一个匹配即最新）
+    latest = None
+    for ev in reversed(_fvg_events):
+        if ev["symbol"] == symbol and ev["side"] == side:
+            latest = ev
+            break
+    if latest is None:
+        raise ValueError("无可用 FVG 事件，不可追价")
+    edge = latest["top"] if side == "long" else latest["bottom"]
+    dist_ratio = abs(close - edge) / atr
+    max_ratio = config.FVG_CHASE_MAX_ATR_RATIO
+    if dist_ratio > max_ratio:
+        raise ValueError(f"价格已偏离 FVG 边沿过远"
+                         f"（{dist_ratio:.2f}×ATR > {max_ratio}×ATR），不可追价")
+    premium = config.ENTRY_LIMIT_PREMIUM_PCT / 100
+    limit = round(close * (1 + premium if side == "long" else 1 - premium), 2)
+    # 止损锚定实时价（≈预期成交价），不锚定含溢价的限价：
+    # 溢价 0.5%×close > ATR 时按限价锚定会把止损挂到现价错误一侧，立即触发；
+    # 距离 = 智能止损（最近三根 K 线极值逻辑点，钳制 1×ATR ~ 上限×ATR）
+    stop = round(close + (-1 if side == "long" else 1)
+                 * _smart_stop_dist(data, side, close, atr), 2)
+    if limit <= 0 or stop <= 0:
+        raise ValueError("追价限价/止损必须为正")
+    return limit, stop
+
+
+def _market_prices(data: dict, side: str):
+    """市价单定价（服务端，不信浏览器价）：marketable 限价 =
+    实时 close × (1 ± ENTRY_LIMIT_PREMIUM_PCT/100)（不用裸 MARKET：延迟行情
+    会被券商拒单 error 10349），止损 = 现价 ∓ N×ATR（ts_c 确认值，
+    N = 全局止损倍数 _stop_atr_mult()，默认 1.0）。"""
+    bar = data.get("bar") or {}
+    ts = _ts_c(data)
+    close = bar.get("close")
+    atr = ts.get("atr")
+    if close is None or close <= 0:
+        raise ValueError("缺少实时价格，无法下市价单")
+    if not atr or atr <= 0:
+        raise ValueError("ATR 数据缺失，无法计算市价单止损")
+    premium = config.ENTRY_LIMIT_PREMIUM_PCT / 100
+    limit = round(close * (1 + premium if side == "long" else 1 - premium), 2)
+    # 止损锚定实时价（≈预期成交价），不锚定含溢价的限价（原因同追价：
+    # GOOGL/NOW 两单曾因按限价锚定，止损落在现价错误一侧秒触发）；
+    # 距离 = 智能止损（最近三根 K 线极值逻辑点，钳制 1×ATR ~ 上限×ATR）
+    stop = round(close + (-1 if side == "long" else 1)
+                 * _smart_stop_dist(data, side, close, atr), 2)
+    if limit <= 0 or stop <= 0:
+        raise ValueError("市价单限价/止损必须为正")
+    return limit, stop
 
 
 def _check_trend_filter(symbol: str, side: str,
                         force: bool = False, reason: str = "") -> None:
-    """trend_state 过滤闸门（下单拦截）：
-    做多需 ts_c.trend_state == 1，做空需 == -1，震荡(0)/无数据拦截；
-    side 必须与 trend_state 同向（下单方向 = ST 方向，无反向订单）。
+    """SuperTrend 方向闸门（下单拦截）：
+    做多需 ts_c.direction == 1（SuperTrend 多头），做空需 == -1；
+    震荡（trend_state=0）但 ST 方向正确也放行。side 必须与 ST 方向同向。
     force=执意开仓放行（需填原因，记 WARN 日志）。"""
     if force:
         logger.warning("执意开仓放行（force）: %s %s 原因: %s",
@@ -228,18 +894,18 @@ def _check_trend_filter(symbol: str, side: str,
         return
     snap = (collector.latest() or {}).get(symbol, {})
     ts = _ts_c(snap)
-    state = ts.get("trend_state")
+    direction = ts.get("direction")
     if ts.get("atr") is None:
         raise HTTPException(400, f"{symbol} ATR 数据缺失，"
                                  "请检查图表上的 trend_state 指标（Atr Value plot）")
-    if side == "long" and state != 1:
+    if side == "long" and direction != 1:
         raise HTTPException(400, {"code": "not_long_candidate",
                                   "msg": f"{symbol} 不在多头列表"
-                                         f"（trend_state={state}）"})
-    if side == "short" and state != -1:
+                                         f"（ST方向={direction}）"})
+    if side == "short" and direction != -1:
         raise HTTPException(400, {"code": "not_long_candidate",
                                   "msg": f"{symbol} 不在空头列表"
-                                         f"（trend_state={state}）"})
+                                         f"（ST方向={direction}）"})
 
 
 async def _close_on_flip(ticker: str, sym: str, pos: float,
@@ -262,6 +928,8 @@ async def _close_on_flip(ticker: str, sym: str, pos: float,
 
 
 _external_cleanup_inflight: dict = {}
+_external_alerts: list = []          # 告警模式下的外部订单/持仓检测快照（每秒快照广播）
+_external_alert_last: dict = {}      # (kind, ticker) -> 上次事件时间（60s 节流）
 
 
 def _legacy_tool_order_ids() -> set:
@@ -304,11 +972,14 @@ async def _wait_trade_terminal(trade, timeout: float = 8.0) -> bool:
 
 
 async def _external_cleanup_once() -> dict:
-    """清理所有号段外订单/持仓；快照不完整时禁止任何写操作。"""
+    """外部（号段外/非工具白名单）订单与持仓的处理。
+    EXTERNAL_ORDER_CLEANUP_ENABLED=1：自动撤挂单 + 市价平残余持仓（原行为）；
+    =0（默认）：只检测不动作——写 `_external_alerts` 快照 + 节流事件，
+    前端弹框/语音提醒人工处理（IBKR 手动单绝不自动市价平仓）；
+    快照不完整时禁止任何写操作。"""
     stats = {"cancelled": 0, "closed": 0, "pending": 0,
              "failed": 0, "skipped": 0}
-    if not (config.EXTERNAL_ORDER_CLEANUP_ENABLED
-            and gateway.enabled and gateway._connected):
+    if not (gateway.enabled and gateway._connected):
         return stats
     positions, trades = await gateway.positions(), await gateway.trade_map()
     if positions is None or trades is None:
@@ -317,6 +988,40 @@ async def _external_cleanup_once() -> dict:
         return stats
     accounts = set(await gateway.fa_accounts())
     legacy_ids = _legacy_tool_order_ids()
+
+    if not config.EXTERNAL_ORDER_CLEANUP_ENABLED:
+        # 告警模式：检测号段外挂单 + 外部残余持仓，只提醒不动单
+        global _external_alerts
+        alerts = []
+        for trade in list(trades.values()):
+            if trade.isDone():
+                continue
+            order = trade.order
+            order_id = int(order.orderId)
+            if gateway.is_tool_order_id(order_id) or order_id in legacy_ids:
+                continue
+            if not _external_account_ok(order, accounts):
+                continue
+            alerts.append({"kind": "order", "ticker": trade.contract.symbol,
+                           "side": order.action, "qty": float(order.totalQuantity or 0),
+                           "order_type": order.orderType, "ts": time.time()})
+        tool_qty = {g["symbol"]: g["net_qty"] for g in order_mgr.aggregate()}
+        for ticker in sorted(set(positions) | set(tool_qty)):
+            residual = positions.get(ticker, 0) - tool_qty.get(ticker, 0)
+            if abs(residual) < 1:
+                continue
+            alerts.append({"kind": "position", "ticker": ticker,
+                           "side": "long" if residual > 0 else "short",
+                           "qty": abs(int(residual)), "ts": time.time()})
+        _external_alerts = alerts
+        # 事件节流：同标的同类型 60s 内只记一次
+        for a in alerts:
+            key = (a["kind"], a["ticker"])
+            if time.time() - _external_alert_last.get(key, 0) < 60:
+                continue
+            _external_alert_last[key] = time.time()
+            record_event("external_position_alert", **{k: v for k, v in a.items() if k != "ts"})
+        return stats
 
     for trade in list(trades.values()):
         if trade.isDone():
@@ -328,6 +1033,16 @@ async def _external_cleanup_once() -> dict:
         if not _external_account_ok(order, accounts):
             stats["skipped"] += 1
             logger.warning("外部挂单账户无法确认，跳过 orderId=%s", order_id)
+            continue
+        if order_id == 0:
+            # TWS 手动单：API 侧 orderId=0 无法定位撤单（与 SKHY/META 手动
+            # 止损单同款限制），白试永远失败——只告警一次跳过，等 TWS 自终结
+            stats["skipped"] += 1
+            key = ("manual_order", trade.contract.symbol)
+            if time.time() - _external_alert_last.get(key, 0) >= 300:
+                _external_alert_last[key] = time.time()
+                logger.warning("TWS 手动单 %s（orderId=0）API 不可撤，"
+                               "请在 TWS 手动处理或等其终结", trade.contract.symbol)
             continue
         ok = gateway.cancel_order(trade)
         if not ok:
@@ -376,11 +1091,12 @@ async def _external_cleanup_once() -> dict:
             continue
         side = "long" if residual > 0 else "short"
         qty = abs(int(residual))
-        ref_px = await gateway.last_price(symbol)
+        # 参考价只取 TV（唯一价格源）：collector 实时 close，不用 TWS 行情
+        ref_px = _tv_last_price(symbol)
         if ref_px is None:
             stats["failed"] += 1
             record_event("external_position_close_failed", symbol=symbol,
-                         qty=qty, error="无法获取现价")
+                         qty=qty, error="TV 现价不可用")
             continue
         result = await gateway.place_close(symbol, side, qty, ref_px,
                                            order_ref="external_cleanup")
@@ -545,6 +1261,238 @@ async def _stop_guard_loop() -> None:
             logger.exception("止损单守卫异常: %s", e)
 
 
+def _lot_protection_alive(lot, trades: Optional[dict]) -> bool:
+    """ACTIVE lot 的 STP 保护单是否在 IBKR 侧存活：内存句柄未终结，或
+    快照里 trail_order_id 对应订单未终结（重启后句柄丢失靠快照认回）。
+    trades=None（快照不完整）时调用方应整拍跳过，不得据此告警。"""
+    t = getattr(lot, "trail_trade", None)
+    if t is not None and not t.isDone():
+        return True
+    oid = getattr(lot, "trail_order_id", None)
+    if oid and trades:
+        tr = trades.get(oid)
+        if tr is not None and not tr.isDone():
+            return True
+    return False
+
+
+async def _naked_position_check_once(fails: dict) -> None:
+    """裸仓巡检单拍（每 10s 由循环调用）：
+    ACTIVE lot 的 STP 保护单缺失 → critical 告警 + 自动补挂（价格
+    lot.stop_px，走 OrderManager._restore_protection——含幻影守卫与快照
+    完整性检查，重建后认回句柄）；连续 3 次补挂失败 → 升级市价平仓 +
+    最高级别告警。只补止损，绝不影响正常仓位；dry-run/未连接整拍跳过。"""
+    if not (gateway.enabled and gateway._connected):
+        return
+    actives = [l for l in order_mgr.list_lots(active_only=True)
+               if l["state"] == "ACTIVE" and (l.get("filled_qty") or 0) > 0]
+    if not actives:
+        return
+    trades = await gateway.trade_map()
+    if trades is None:
+        logger.warning("裸仓巡检跳过：IBKR 订单快照不完整")
+        return
+    for d in actives:
+        lot = order_mgr.get(d["lot_id"])
+        if lot is None or lot.state != "ACTIVE":
+            continue
+        key = f"naked:{lot.lot_id}"
+        if _lot_protection_alive(lot, trades):
+            fails.pop(lot.lot_id, None)
+            await notifier.recover(key, "STP 保护单已恢复存活")
+            continue
+        await notifier.notify(key, "critical", "裸仓告警",
+                              f"{lot.symbol} ACTIVE 仓 {lot.filled_qty} 股 "
+                              f"STP 保护单缺失，自动补挂中 @ {lot.stop_px}")
+        logger.warning("裸仓巡检: %s STP 缺失，自动补挂 @%.2f",
+                       lot.symbol, lot.stop_px)
+        ok = await order_mgr._restore_protection(lot)
+        if ok:
+            fails.pop(lot.lot_id, None)
+            await notifier.recover(key, f"已自动补挂 STP @ {lot.stop_px}")
+            continue
+        fails[lot.lot_id] = fails.get(lot.lot_id, 0) + 1
+        logger.error("裸仓巡检: %s 补挂失败（连续 %d 次）",
+                     lot.lot_id, fails[lot.lot_id])
+        if fails[lot.lot_id] >= 3:
+            ref_px = (_tv_last_price(lot.symbol) or lot.last_px
+                      or lot.avg_fill or lot.entry_px)
+            ok2, err = await order_mgr.close_lot(
+                lot.lot_id, ref_px=ref_px, exit_reason="naked_guard")
+            await notifier.notify(
+                key + ":force_closed", "critical", "裸仓强平",
+                f"{lot.symbol} 补挂 STP 连续 3 次失败，"
+                + ("已提交市价平仓，请核查成交" if ok2
+                   else f"平仓也失败（{err}），请立即人工处理"))
+            fails.pop(lot.lot_id, None)
+
+
+async def _naked_position_loop() -> None:
+    """裸仓巡检循环（每 10s，单拍见 _naked_position_check_once）。"""
+    fails: dict = {}
+    while True:
+        await asyncio.sleep(10.0)
+        try:
+            await _naked_position_check_once(fails)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("裸仓巡检异常: %s", e)
+
+
+async def _health_check_once(was_connected: Optional[bool]) -> bool:
+    """健康检查单拍（TWS 断线 + 数据陈旧），返回本轮 connected 状态。
+
+    - TWS 断线：connected 跳变 False → critical「TWS 已断线，请人工重启
+      7496」；恢复 → 解除通知。首轮只建基线不告警（启动瞬间未连接不报）。
+    - 数据陈旧：交易时段（ET 工作日 09:30–16:00）且 latest_bar_time 超过
+      600s 未前进 → warning；恢复自动解除并通知；非交易时段/周末静默
+      （挂着的话静默摘除，不发恢复通知）。"""
+    connected = bool(gateway._connected)
+    if was_connected is not None:
+        if was_connected and not connected:
+            await notifier.notify("tws_down", "critical", "TWS 断线",
+                                  "TWS 已断线，请人工重启 7496")
+        elif not was_connected and connected:
+            await notifier.recover("tws_down", "TWS 已恢复连接")
+    if _is_trading_hours():
+        bt = collector.latest_bar_time or 0
+        age = (time.time() - bt) if bt else float("inf")
+        if age > 600:
+            await notifier.notify(
+                "data_stale", "warning", "行情数据陈旧",
+                f"TV 数据 {int(age)}s 未更新（>600s），请检查 daemon/网络")
+        else:
+            await notifier.recover("data_stale", "行情数据已恢复更新")
+    else:
+        notifier.clear("data_stale")   # 非交易时段/周末静默
+    return connected
+
+
+async def _health_watch_loop() -> None:
+    """健康巡检循环（每 5s，单拍见 _health_check_once）。"""
+    was_connected: Optional[bool] = None
+    while True:
+        await asyncio.sleep(5.0)
+        try:
+            was_connected = await _health_check_once(was_connected)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("健康巡检异常: %s", e)
+
+
+async def _slow_break_loop() -> None:
+    """未快速突破提醒（每分钟）：ACTIVE 持仓开仓超过 SLOW_BREAK_SECONDS 仍未保本
+    → 记录提醒，前端语音播报「未快速突破，是否减仓」。每个 lot 只提醒一次。"""
+    while True:
+        await asyncio.sleep(60.0)
+        try:
+            if not _is_trading_hours():
+                continue
+            now = time.time()
+            active = order_mgr.list_lots(active_only=True)
+            active_ids = set()
+            for lot in active:
+                lot_id = lot.get("lot_id")
+                if not lot_id:
+                    continue
+                active_ids.add(lot_id)
+                if lot.get("breakeven_reached"):
+                    continue   # 已保本，不提醒
+                entry_time = lot.get("entry_time") or 0
+                if entry_time <= 0:
+                    continue   # 无实际成交时间，不提醒
+                elapsed = now - entry_time
+                if elapsed < config.SLOW_BREAK_SECONDS:
+                    continue   # 未到阈值
+                if lot_id not in _slow_break_alerts:
+                    _slow_break_alerts[lot_id] = {
+                        "lot_id": lot_id,
+                        "symbol": lot.get("symbol"),
+                        "ticker": (lot.get("symbol") or "").split(":")[-1],
+                        "qty": lot.get("filled_qty") or lot.get("qty"),
+                        "elapsed_seconds": round(elapsed, 1),
+                        "alerted_at": now,
+                    }
+                    logger.warning("未快速突破提醒: %s 开仓 %.0f 分钟未保本，提示是否减仓",
+                                   lot_id, elapsed / 60)
+                    record_event("slow_break_alert", lot_id=lot_id,
+                                 symbol=lot.get("symbol"),
+                                 elapsed_seconds=round(elapsed, 1))
+            # 已平仓/已保本的 lot 移出提醒
+            for lid in list(_slow_break_alerts):
+                if lid not in active_ids:
+                    _slow_break_alerts.pop(lid, None)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("未快速突破提醒异常: %s", e)
+
+
+async def _auto_breakeven_loop() -> None:
+    """自动 2R 保本（每秒检查）：ACTIVE 持仓浮盈 ≥ AUTO_BREAKEVEN_R×初始风险
+    → 自动把止损移到实际入场成本。覆盖所有本地工具 ACTIVE lot。"""
+    scan_tick = 0
+    last_error: dict = {}
+    last_attempt: dict = {}
+    while True:
+        await asyncio.sleep(1.0)
+        try:
+            if not _is_trading_hours() or not gateway._connected:
+                continue
+            scan_tick += 1
+            active = order_mgr.list_lots(active_only=True)
+            if scan_tick % 30 == 0:
+                logger.info("自动保本循环扫描: %d 个活跃 lot", len(active))
+            now = time.time()
+            for lot in active:
+                lot_id = lot.get("lot_id")
+                if lot.get("state") != "ACTIVE" or lot.get("breakeven_reached"):
+                    continue
+                side = lot.get("side")
+                avg_fill = lot.get("avg_fill") or lot.get("entry_px")
+                init_entry = lot.get("init_entry_px") or lot.get("entry_px")
+                init_stop = lot.get("init_stop_px") or lot.get("stop_px")
+                filled = lot.get("filled_qty") or lot.get("qty")
+                if not avg_fill or not init_entry or not init_stop or filled <= 0:
+                    continue
+                risk = abs(init_entry - init_stop)
+                if risk <= 0:
+                    continue
+                # 用 TV 当前 bar 极值：多仓看 high、空仓看 low，避免盘中越过 2R 后回落漏保
+                _snap = (collector.latest() or {}).get(lot.get("symbol"), {})
+                _bar = _snap.get("bar") or {}
+                price = _bar.get("high") if side == "long" else _bar.get("low")
+                if not price or price <= 0:
+                    continue
+                profit = (price - avg_fill) if side == "long" else (avg_fill - price)
+                rr = profit / risk
+                if rr < config.AUTO_BREAKEVEN_R:
+                    continue
+                # 每 lot 5s 调用节流（与策略引擎 breakeven_attempt_at 一致）：
+                # breakeven 内部有 placeOrder + 2.5s 确认/全量订单快照，不能每秒打
+                if now - last_attempt.get(lot_id, 0) < 5.0:
+                    continue
+                last_attempt[lot_id] = now
+                ok, err = await order_mgr.breakeven(lot_id)
+                if ok:
+                    logger.warning("自动保本 %s %s 浮盈 %.2fR，止损移成本 %.2f",
+                                   lot.get("symbol"), side, rr, avg_fill)
+                    record_event("auto_breakeven", lot_id=lot_id,
+                                 symbol=lot.get("symbol"), side=side,
+                                 unrealized_r=round(rr, 2), new_stop=round(avg_fill, 2))
+                    last_error.pop(lot_id, None)
+                elif now - last_error.get(lot_id, 0) >= 30:
+                    last_error[lot_id] = now
+                    logger.warning("自动保本失败 %s %s: %s",
+                                   lot.get("symbol"), side, err)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("自动保本循环异常: %s", e)
+
+
 # ---------------------------------------------------------------------------
 # 事件记录与快照辅助
 # ---------------------------------------------------------------------------
@@ -576,8 +1524,292 @@ async def _shadow_loop() -> None:
             logger.exception("影子回测循环异常: %s", e)
 
 
+def _fvg_record_event(sym: str, bt: float, data: dict) -> bool:
+    """固化一根确认 bar 的 FVG 事件（如有）。返回是否有事件被固化。"""
+    fvg_c = data.get("fvg_c") or {}
+    event = fvg_c.get("fvg_event")
+    if event not in (1, -1):
+        return False
+    top = fvg_c.get("fvg_last_top")
+    bottom = fvg_c.get("fvg_last_bottom")
+    if top is None or bottom is None:
+        return False   # 边沿缺失无法固化，跳过
+    ts_c = data.get("ts_c") or data.get("ts") or {}
+    atr = ts_c.get("atr")
+    height = round(top - bottom, 4)
+    ratio = round(height / atr, 2) if atr and atr > 0 else None
+    side = "long" if event == 1 else "short"
+    _fvg_events.append({
+        "id": f"{sym}:{bt}:{side}",   # symbol+bar+方向，天然去重
+        "symbol": sym,
+        "ticker": sym.split(":")[-1],
+        "side": side,
+        "bar_time": bt,
+        "top": top,
+        "bottom": bottom,
+        "height": height,
+        "atr": round(atr, 4) if atr else None,
+        "ratio": ratio,
+    })
+    logger.info("FVG 事件固化: %s %s %.2f~%.2f 高 %.2f ratio %s",
+                sym, side, bottom, top, height, ratio)
+    return True
+
+
+async def _fvg_monitor_loop() -> None:
+    """FVG 事件固化循环（每 1s）：某 symbol 的 bar_c.time 前进（= 新 5M bar
+    收盘确认）时读 fvg_c.fvg_event，±1 即固化缺口边沿快照进环形缓冲。
+    daemon 的 K线回调与 FVG Study 回调是独立通道，同拍可能读到旧 fvg_c：
+    用 fvg_c.time == bar_c.time 校验对齐，不齐则挂起下一拍重试（最多 5 拍）。"""
+    while True:
+        await asyncio.sleep(1.0)
+        try:
+            market = collector.latest()
+            if not market:
+                continue
+            for sym, data in market.items():
+                bar_c = data.get("bar_c") or {}
+                bt = bar_c.get("time") or 0
+                if not bt:
+                    continue
+                # ---- FVG 预警（实时通道）：指标在第三根 K 线形成过程中就实时
+                # 计算缺口条件（fvg = periods[0]）。等收盘确认会晚一根大 K，
+                # 这里在条件成立的第一拍预警一次（每 bar 每方向仅一次）；
+                # 盘中回补（event 翻回 0）不影响——预警本来就是提前量。
+                bar_rt = data.get("bar") or {}
+                fvg_rt = data.get("fvg") or {}
+                b_rt = bar_rt.get("time") or 0
+                if (b_rt and fvg_rt.get("time") == b_rt
+                        and fvg_rt.get("fvg_event") in (1, -1)):
+                    side_rt = "long" if fvg_rt["fvg_event"] == 1 else "short"
+                    warn_key = f"{sym}:{b_rt}:{side_rt}"
+                    if warn_key not in _fvg_warned:
+                        _fvg_warned[warn_key] = time.time()
+                        top = fvg_rt.get("fvg_last_top")
+                        bottom = fvg_rt.get("fvg_last_bottom")
+                        ts_rt = data.get("ts") or data.get("ts_c") or {}
+                        atr = ts_rt.get("atr")
+                        height = (round(top - bottom, 4)
+                                  if top is not None and bottom is not None else None)
+                        ratio = (round(height / atr, 2)
+                                 if height and atr and atr > 0 else None)
+                        w = {
+                            "id": warn_key + ":warn",
+                            "symbol": sym,
+                            "ticker": sym.split(":")[-1],
+                            "side": side_rt,
+                            "bar_time": b_rt,
+                            "top": top,
+                            "bottom": bottom,
+                            "height": height,
+                            "atr": round(atr, 4) if atr else None,
+                            "ratio": ratio,
+                            "warn_time": time.time(),
+                        }
+                        _fvg_warnings.append(w)
+                        record_event("fvg_warn", **{k: w[k] for k in (
+                            "symbol", "ticker", "side", "bar_time", "top",
+                            "bottom", "height", "atr", "ratio")})
+                        logger.info("FVG 预警: %s %s 缺口形成中 %.2f~%.2f ratio %s",
+                                    sym, side_rt, bottom or 0, top or 0, ratio)
+                # ---- 确认值通道（收盘固化） ----
+                # 先冲刷挂起的待固化 bar（等 daemon 的 FVG study 追上 K线）
+                pend = _fvg_pending.get(sym)
+                if pend is not None:
+                    p_bt, retries = pend
+                    fvg_c = data.get("fvg_c") or {}
+                    if fvg_c.get("time") == p_bt:
+                        _fvg_pending.pop(sym, None)
+                        _fvg_record_event(sym, p_bt, data)
+                    elif retries <= 0:
+                        _fvg_pending.pop(sym, None)
+                        logger.warning("FVG 事件固化超时放弃: %s bar_time=%s"
+                                       "（fvg_c 始终未对齐，事件丢失）", sym, p_bt)
+                    else:
+                        _fvg_pending[sym] = (p_bt, retries - 1)
+                prev = _fvg_last_bar.get(sym)
+                if prev is None:
+                    _fvg_last_bar[sym] = bt   # 首次见仅建基线，不补录历史事件
+                    continue
+                if bt <= prev:
+                    continue
+                _fvg_last_bar[sym] = bt
+                fvg_c = data.get("fvg_c") or {}
+                fvg_t = fvg_c.get("time")
+                if fvg_t is not None and fvg_t != bt:
+                    # fvg_c 还是旧 bar 的值（study 回调未追上）：挂起重试
+                    _fvg_pending[sym] = (bt, 5)
+                    continue
+                _fvg_record_event(sym, bt, data)
+            # 首次回踩检测：用该 symbol 的实时 bar（未收盘）判首次触区——
+            # 多 bar.low <= top / 空 bar.high >= bottom；触发即标记并固化
+            # 回踩快照进 _fvg_retests，一个 FVG 终身只报一次
+            for sym, data in market.items():
+                bar = data.get("bar") or {}
+                low, high = bar.get("low"), bar.get("high")
+                rt = bar.get("time") or 0
+                if low is None or high is None or not rt:
+                    continue
+                for ev in _fvg_events:
+                    if ev["symbol"] != sym or ev.get("retested"):
+                        continue
+                    if ev["side"] == "long" and low <= ev["top"]:
+                        retest_px = low
+                    elif ev["side"] == "short" and high >= ev["bottom"]:
+                        retest_px = high
+                    else:
+                        continue
+                    ev["retested"] = True
+                    _fvg_retests.append({
+                        "id": f"{ev['id']}:rt",
+                        "symbol": sym,
+                        "ticker": ev["ticker"],
+                        "side": ev["side"],
+                        "bar_time": ev["bar_time"],
+                        "top": ev["top"],
+                        "bottom": ev["bottom"],
+                        "height": ev["height"],
+                        "atr": ev["atr"],
+                        "ratio": ev["ratio"],
+                        "retest_time": rt,       # 当前实时 bar 时间
+                        "retest_px": retest_px,  # 触发价（多=low / 空=high）
+                    })
+                    logger.info("FVG 首次回踩: %s %s %.2f~%.2f 触价 %.2f",
+                                sym, ev["side"], ev["bottom"], ev["top"],
+                                retest_px)
+            # 清理 4 小时前的旧事件（deque 按时间递增，头部弹出即可）
+            cutoff = time.time() - FVG_EVENT_TTL_SECONDS
+            while _fvg_events and _fvg_events[0]["bar_time"] < cutoff:
+                _fvg_events.popleft()
+            while _fvg_warnings and _fvg_warnings[0]["warn_time"] < cutoff:
+                _fvg_warnings.popleft()
+            for k in [k for k, ts in _fvg_warned.items() if ts < cutoff]:
+                del _fvg_warned[k]
+            while _fvg_retests and _fvg_retests[0]["bar_time"] < cutoff:
+                _fvg_retests.popleft()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("FVG 监控循环异常: %s", e)
+
+
+def _feed_breakout(sym: str, bar_c: dict, data: dict, fed_times: set) -> None:
+    """把一根已确认 bar（带对齐的 fvg_c.fvg_event）喂给突破跟踪器。"""
+    fvg_c = data.get("fvg_c") or {}
+    bar = {
+        "time": bar_c.get("time"),
+        "open": bar_c.get("open"), "high": bar_c.get("high"),
+        "low": bar_c.get("low"), "close": bar_c.get("close"),
+        "fvg_event": fvg_c.get("fvg_event") or 0,
+    }
+    fed_times.add(bar["time"])
+    sig = breakout_tracker.on_bar(sym, bar)
+    if sig:
+        _emit_breakout(sig)
+
+
+def _emit_breakout(sig: dict) -> None:
+    """突破信号出口：固化进缓冲（前端快照下发）+ 写当日事件流。"""
+    sig = dict(sig)
+    sig["id"] = f"{sig['symbol']}:{sig['confirm_epoch']}:breakout"
+    sig["ts"] = time.time()
+    _breakout_signals.append(sig)
+    record_event("breakout_signal", **{k: sig[k] for k in (
+        "symbol", "ticker", "side", "confirm_hm", "confirm_time",
+        "break_time", "close", "premarket_high", "premarket_low",
+        "zone_width", "crowd", "triple")})
+    logger.warning("盘前突破信号: %s %s 确认 %s 突破 %s 收盘 %.2f 盘前 %.2f~%.2f"
+                   "（拥挤 %d%s）", sig["symbol"], sig["side"],
+                   sig["confirm_time"], sig["break_time"], sig["close"],
+                   sig["premarket_low"], sig["premarket_high"], sig["crowd"],
+                   "，三连确认" if sig["triple"] else "")
+
+
+async def _breakout_loop() -> None:
+    """盘前突破+FVG确认 流式信号（每 1s）：某 symbol 的 bar_c.time 前进
+    （= 新 5M bar 收盘确认）时把这根已确认 bar 喂给 BreakoutTracker；
+    fvg_c 与 bar_c 的 time 对齐校验同 FVG 固化（不齐挂起最多 5 拍）。
+    同一拍全部 symbol 喂完后按 bar 时间调 flush 做拥挤终判出信号。
+    盘前区间优先用「5M 进攻区域」指标（attack_c 与 bar_c 的 time 对齐
+    且 pmh/pml 有效时注入，每天一次；不对齐本拍跳过下拍自然重试；
+    门控 bar 时间 hm>=570——指标盘前输出是累积中的半成品，09:30 首根
+    常规K线才锁定终值，盘前启动时提前注入会把半成品区间锁死一整天）——
+    指标在 TV 侧自算盘前区间，盘中重启控制台也能拿到正确区间。"""
+    from zoneinfo import ZoneInfo
+    import datetime as _dt
+    et = ZoneInfo("America/New_York")
+    while True:
+        await asyncio.sleep(1.0)
+        try:
+            market = collector.latest()
+            if not market:
+                continue
+            fed_times: set = set()
+            for sym, data in market.items():
+                bar_c = data.get("bar_c") or {}
+                bt = bar_c.get("time") or 0
+                if not bt:
+                    continue
+                # ---- 进攻区域指标盘前区间注入（权威来源） ----
+                # 指标的 premarketHigh/Low 在盘前时段是【累积中的半成品】
+                # （实测 pml 一路下探，09:30 第一根常规K线才锁定终值），
+                # 因此注入门控在 hm >= 570：盘前启动 → 09:30 首根才注；
+                # 开盘后启动 → 第一拍即注。否则盘前启动会把半成品区间
+                # 注进去且一天不再更新，全天区间错误。
+                atk = data.get("attack_c") or {}
+                pmh, pml = atk.get("pmh"), atk.get("pml")
+                dt_et = _dt.datetime.fromtimestamp(bt, et)
+                if (atk.get("time") == bt and pmh is not None
+                        and pml is not None and pmh > pml > 0
+                        and dt_et.hour * 60 + dt_et.minute >= 570):
+                    day = dt_et.strftime("%Y-%m-%d")
+                    if _breakout_injected.get(sym) != day:
+                        if breakout_tracker.set_premarket(sym, pmh, pml, day):
+                            _breakout_injected[sym] = day
+                            logger.info("盘前区间注入（进攻区域指标）: %s %.2f~%.2f",
+                                        sym, pml, pmh)
+                # 先冲刷挂起的待喂 bar（等 daemon 的 FVG study 追上 K线）
+                pend = _breakout_pending.get(sym)
+                if pend is not None:
+                    p_bt, p_bar, retries = pend
+                    fvg_c = data.get("fvg_c") or {}
+                    if fvg_c.get("time") == p_bt:
+                        _breakout_pending.pop(sym, None)
+                        _feed_breakout(sym, p_bar, data, fed_times)
+                    elif retries <= 0:
+                        _breakout_pending.pop(sym, None)
+                        logger.warning("突破信号喂入超时放弃: %s bar_time=%s"
+                                       "（fvg_c 始终未对齐）", sym, p_bt)
+                    else:
+                        _breakout_pending[sym] = (p_bt, p_bar, retries - 1)
+                prev = _breakout_last_bar.get(sym)
+                if prev is None:
+                    _breakout_last_bar[sym] = bt   # 首次见仅建基线，不补录历史
+                    continue
+                if bt <= prev:
+                    continue
+                _breakout_last_bar[sym] = bt
+                fvg_c = data.get("fvg_c") or {}
+                fvg_t = fvg_c.get("time")
+                if fvg_t is not None and fvg_t != bt:
+                    _breakout_pending[sym] = (bt, dict(bar_c), 5)
+                    continue
+                _feed_breakout(sym, bar_c, data, fed_times)
+            for t in sorted(fed_times):
+                for sig in breakout_tracker.flush(t):
+                    _emit_breakout(sig)
+            # 清理 4 小时前的旧信号（与 FVG 事件缓冲同 TTL）
+            cutoff = time.time() - FVG_EVENT_TTL_SECONDS
+            while _breakout_signals and _breakout_signals[0]["ts"] < cutoff:
+                _breakout_signals.popleft()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("盘前突破监控循环异常: %s", e)
+
+
 async def _auto_loop() -> None:
-    """策略分发循环（每 1s）：
+    """策略分发循环（每 1s；自动策略停止时仍管理已收养的本地 ACTIVE lot）：
     - bar 收盘推进 → engine.on_bar（候选过期 + 跟踪/反向等持仓管理）
     - tick 价 → engine.on_price（WATCHING 产生候选；ACTIVE 达到 2R 立即保本）
     - 每 5s 收养人工 ACTIVE 仓（同一套保本/跟踪逻辑）
@@ -589,8 +1821,6 @@ async def _auto_loop() -> None:
     while True:
         await asyncio.sleep(1.0)
         try:
-            if not _auto_enabled:
-                continue
             market = collector.latest()
             if not market:
                 continue
@@ -600,6 +1830,7 @@ async def _auto_loop() -> None:
             for sym, data in market.items():
                 bar_c = data.get("bar_c") or {}
                 ts_c = data.get("ts_c") or data.get("ts") or {}
+                fvg_c = data.get("fvg_c") or data.get("fvg")
                 bt = bar_c.get("time") or 0
                 if bt and _auto_last_bar.get(sym) != bt:
                     _auto_last_bar[sym] = bt
@@ -608,19 +1839,27 @@ async def _auto_loop() -> None:
                     except Exception:
                         logger.exception("auto on_bar 异常 %s", sym)
                 if trading:
-                    price = (data.get("bar") or {}).get("close")
-                    if price:
+                    bar = data.get("bar") or {}
+                    low, high = bar.get("low"), bar.get("high")
+                    if low or high:
                         try:
-                            await auto_engine.on_price(sym, price, ts_c,
-                                                       bar_c, now_hm)
+                            await auto_engine.on_price_extremes(
+                                sym, low, high, ts_c, bar_c, now_hm,
+                                fvg_c=fvg_c)
                         except Exception:
                             logger.exception("auto on_price 异常 %s", sym)
             adopt_tick += 1
             if adopt_tick >= 5:
                 adopt_tick = 0
                 try:
-                    await auto_engine.adopt_manual_lots(
+                    adopted = await auto_engine.adopt_manual_lots(
                         order_mgr.list_lots(active_only=True))
+                    for sym in adopted:
+                        data = market.get(sym) or {}
+                        bar_c = data.get("bar_c") or {}
+                        if bar_c:
+                            ts_c = data.get("ts_c") or data.get("ts") or {}
+                            await auto_engine.on_bar(sym, bar_c, ts_c)
                 except Exception:
                     logger.exception("auto 收养扫描异常")
         except asyncio.CancelledError:
@@ -630,51 +1869,136 @@ async def _auto_loop() -> None:
 
 
 async def _midpoint_limit_reprice_loop() -> None:
-    """手动中点限价单：每根新确认 5M bar 同步修改 LMT 父单与 STP 子单。"""
+    """中点限价单监控循环（每秒）。
+
+    2026-10-20 起中点单一次定价不再逐 bar 改价：OCA 双腿（LMT 中点 +
+    STP 突破）挂出后价格固定，直到成交/撤单/收盘。本循环仅为旧式
+    单腿中点单（无突破腿）保留"突破升级市价"的兜底。"""
     while True:
         await asyncio.sleep(1.0)
         try:
             pending = [l for l in order_mgr.list_lots(active_only=True)
                        if l["state"] == "PENDING"
-                       and l.get("limit_type") == "midpoint"]
+                       and l.get("limit_type") == "midpoint"
+                       and not l.get("breakout_escalated")
+                       and not l.get("breakout_order_id")]
             if not pending:
                 continue
             market = collector.latest() or {}
             for lot in pending:
                 data = market.get(lot["symbol"]) or {}
                 bar = data.get("bar_c") or {}
-                bt = bar.get("time") or 0
-                if not bt or bt <= (lot.get("reprice_bar_time") or 0):
-                    continue
-                attempt_key = (lot["lot_id"], bt)
-                if attempt_key in _midpoint_data_warned:
-                    continue
-                try:
-                    limit, stop, bar, atr = _midpoint_prices(data, lot["side"])
-                except ValueError as e:
-                    _midpoint_data_warned.add(attempt_key)
-                    logger.warning("%s 中点改价数据缺失: %s", lot["symbol"], e)
-                    record_event("midpoint_limit_reprice_failed",
-                                 lot_id=lot["lot_id"], symbol=lot["symbol"],
-                                 bar_time=bt, error=str(e))
-                    continue
-                old_limit, old_stop = lot["entry_px"], lot["stop_px"]
-                ok, error = await order_mgr.reprice_midpoint_lot(
-                    lot["lot_id"], limit, stop, bt)
-                event_type = ("midpoint_limit_repriced" if ok
-                              else "midpoint_limit_reprice_failed")
-                record_event(event_type, lot_id=lot["lot_id"],
-                             symbol=lot["symbol"], side=lot["side"],
-                             old_limit_px=old_limit, limit_px=limit,
-                             old_stop_px=old_stop, stop_px=stop,
-                             atr=atr, bar_time=bt, error=error)
-                if not ok:
-                    _midpoint_data_warned.add(attempt_key)
-                    logger.warning("%s 中点改价失败: %s", lot["symbol"], error)
+                # 旧式单腿中点单的突破升级兜底；OCA 双腿单由券商端
+                # STP 突破腿原生处理，不走这里。
+                cur = data.get("bar") or {}
+                high, low = bar.get("high"), bar.get("low")
+                cur_high, cur_low = cur.get("high"), cur.get("low")
+                triggered = False
+                if high is not None and low is not None:
+                    if (lot["side"] == "long" and cur_high is not None
+                            and cur_high > high):
+                        triggered = True
+                    elif (lot["side"] == "short" and cur_low is not None
+                            and cur_low < low):
+                        triggered = True
+                if triggered:
+                    bt0 = bar.get("time") or 0
+                    esc_key = (lot["lot_id"], bt0)
+                    if esc_key not in _midpoint_escalate_attempted:
+                        _midpoint_escalate_attempted.add(esc_key)
+                        ok, error = await order_mgr.escalate_midpoint_to_market(
+                            lot["lot_id"])
+                        record_event(
+                            "midpoint_breakout_escalated" if ok
+                            else "midpoint_breakout_escalate_failed",
+                            lot_id=lot["lot_id"], symbol=lot["symbol"],
+                            side=lot["side"], trigger_high=high,
+                            trigger_low=low, cur_high=cur_high,
+                            cur_low=cur_low, bar_time=bt0, error=error)
+                        if ok:
+                            logger.warning(
+                                "%s 中点单未等到回调，价格突破上根K线%s，"
+                                "已升级为市价单", lot["symbol"],
+                                "高点" if lot["side"] == "long" else "低点")
+                        else:
+                            logger.warning("%s 中点单突破升级失败: %s",
+                                           lot["symbol"], error)
         except asyncio.CancelledError:
             raise
         except Exception as e:
             logger.exception("中点限价单改价循环异常: %s", e)
+
+
+async def _retest_limit_reprice_loop() -> None:
+    """回踩限价单逐 bar 改价循环（每秒检查）。
+
+    每根新确认 5M bar 收盘后 bar_c2 随之前移，对 PENDING 的回踩 lot
+    用新 bar_c2 重算限价/止损（多 limit=bar_c2.high / stop=bar_c2.low，
+    空头镜像），并按固定风险预算（lot.init_risk_usd，下单时的计划风险
+    金额，含仓位%封顶效果，作为锚点不动）以新止损距离重新以损定量：
+    qty_new = floor(init_risk_usd / |new_limit − new_stop|)，封顶
+    RISK_MAX_ORDER_QTY；仅 filled_qty == 0 时改股数（部分成交后只改价）。
+    仅 PENDING、每 bar 每 lot 最多一次（reprice_bar_time 幂等）、
+    失败保留原单下根重试，ACTIVE 后自动停止。"""
+    while True:
+        await asyncio.sleep(1.0)
+        try:
+            pending = [l for l in order_mgr.list_lots(active_only=True)
+                       if l["state"] == "PENDING"
+                       and l.get("limit_type") == "retest"]
+            if not pending:
+                continue
+            market = collector.latest() or {}
+            for lot in pending:
+                data = market.get(lot["symbol"]) or {}
+                bar2 = data.get("bar_c2") or {}
+                bt = bar2.get("time") or 0
+                # bar_c2 未前移（无新确认 bar）或本 bar 已尝试过改价 → 跳过
+                if not bt or bt <= (lot.get("reprice_bar_time") or 0):
+                    continue
+                try:
+                    new_limit, new_stop, _ = _retest_prices(data, lot["side"])
+                except ValueError as e:
+                    logger.warning("%s 回踩单改价跳过: %s", lot["symbol"], e)
+                    continue
+                # 固定风险预算重新以损定量（部分成交后不改股数，传 0）
+                qty_new = 0
+                if not lot.get("filled_qty"):
+                    init_risk = lot.get("init_risk_usd") or 0
+                    dist = abs(new_limit - new_stop)
+                    if init_risk > 0 and dist > 0:
+                        qty_new = int(init_risk / dist)
+                        if config.RISK_MAX_ORDER_QTY > 0:
+                            qty_new = min(qty_new, config.RISK_MAX_ORDER_QTY)
+                        # 净值占比封顶（下单时的 max_position_pct；止损距离收窄
+                        # 时防止名义市值超出下单口径）
+                        max_pct = lot.get("max_position_pct") or 0
+                        equity = (_equity_cache.get("equity") or 0)
+                        if max_pct > 0 and equity > 0 and new_limit > 0:
+                            qty_new = min(qty_new,
+                                          int(equity * max_pct / 100 / new_limit))
+                    else:
+                        qty_new = lot["qty"]   # 无风险锚点（历史单）：股数不动
+                ok, error = await order_mgr.reprice_retest_lot(
+                    lot["lot_id"], new_limit, new_stop, bt, new_qty=qty_new)
+                if ok and error == "unchanged":
+                    continue   # 价格股数均未变，未发起修改，不记事件
+                cur = order_mgr.get(lot["lot_id"])
+                record_event(
+                    "retest_limit_repriced" if ok
+                    else "retest_limit_reprice_failed",
+                    lot_id=lot["lot_id"], symbol=lot["symbol"],
+                    side=lot["side"], limit_px=new_limit, stop_px=new_stop,
+                    qty=(cur.qty if cur is not None else lot["qty"]),
+                    bar_time=bt, error=error)
+                if not ok:
+                    logger.warning(
+                        "%s 回踩单改价失败（保留原挂单，下根 bar 重试）: %s",
+                        lot["symbol"], error)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("回踩限价单改价循环异常: %s", e)
 
 
 def record_event(event_type: str, **data) -> None:
@@ -691,6 +2015,13 @@ def record_event(event_type: str, **data) -> None:
         logger.warning("事件记录失败: %s", e)
 
 
+# 统一告警出口（engine/notifier.py）：record_event 延迟绑定（调用时才解析
+# 模块函数，测试可 monkeypatch）；iMessage 收件人读全局设置，未配置跳过
+notifier: Notifier = Notifier(
+    record_event=lambda t, **d: record_event(t, **d),
+    imessage_recipient=lambda: str(_settings.get("imessage_recipient") or ""))
+
+
 def _snapshot_for(symbol: str) -> dict:
     """下单时抓取该标的的 trend_state 快照（复盘用）。"""
     snap = (collector.latest() or {}).get(symbol, {})
@@ -702,39 +2033,150 @@ def _snapshot_for(symbol: str) -> dict:
 
 
 def compute_screen() -> dict:
-    """横截面选股（双向）：trend_state==1 进多头列、==-1 进空头列（0 震荡不列）。
-    趋势判断只有 trend_state（指标值，所见即所得）；发散度仅作列内
-    强→弱排序展示，由指标 plot 值（ema_fast/ema_slow/atr）换算，不做判断。"""
+    """横截面选股（双向）：SuperTrend 方向（ts_c.direction）1 进多头列、-1 进空头列；
+    震荡（trend_state=0）但 ST 方向明确也列入。发散度仅作列内强→弱排序展示。
+    盘前区间过滤（settings.screen_premarket_filter，默认关）：多头候选现价
+    <= attack_c.pmh 剔除、空头候选现价 >= attack_c.pml 剔除；无 attack 数据
+    的标的一律保留（不误杀）。现价 = collector 实时 bar close。"""
     market = collector.latest()
+    pm_filter = _screen_premarket_filter()
     long_rows, short_rows = [], []
     for symbol, data in market.items():
         # 策略用「确认值」（上一根已收盘），稳定不抖
         ts = _ts_c(data)
-        trend = ts.get("trend_state")
+        direction = ts.get("direction")
         close = (data.get("bar") or {}).get("close")
-        if trend not in (1, -1) or close is None:
+        if direction not in (1, -1) or close is None:
+            continue
+        pmh, pml = _attack_zone(data)
+        if pm_filter and not _premarket_pass(
+                "long" if direction == 1 else "short", close, pmh, pml):
             continue
         divergence = ts.get("divergence")
         if divergence is None:
             ema_f, ema_s, atr = ts.get("ema_fast"), ts.get("ema_slow"), ts.get("atr")
             if ema_f is not None and ema_s is not None and atr and atr > 0:
                 divergence = abs(ema_f - ema_s) / atr
+        # FVG 同 ts 回退：确认值优先，缺失为 None
+        fvg = data.get("fvg_c") or data.get("fvg") or {}
         row = {
             "symbol": symbol,
             "ticker": symbol.split(":")[-1],
-            "side": "long" if trend == 1 else "short",
-            "trend_state": trend,
+            "side": "long" if direction == 1 else "short",
+            "trend_state": ts.get("trend_state"),
             "divergence": (round(abs(divergence), 2)
                            if divergence is not None else None),
             "st_duration_bars": ts.get("st_duration_bars"),
             "st_push_count": ts.get("st_push_count"),
+            "fvg_cum_count": fvg.get("fvg_cum_count"),
+            "fvg_last_dir": fvg.get("fvg_last_dir"),
+            "fvg_event": fvg.get("fvg_event"),
             "close": round(close, 2),
-            "qualified": True,     # 已过 trend_state 过滤（前端兼容字段）
+            "pmh": round(pmh, 2) if pmh is not None else None,   # 盘前高（进攻区域）
+            "pml": round(pml, 2) if pml is not None else None,   # 盘前低
+            "qualified": True,     # 已过 ST 方向过滤（前端兼容字段）
         }
-        (long_rows if trend == 1 else short_rows).append(row)
+        (long_rows if direction == 1 else short_rows).append(row)
     long_rows.sort(key=lambda x: -(x["divergence"] or 0))
     short_rows.sort(key=lambda x: -(x["divergence"] or 0))
     return {"long": long_rows, "short": short_rows}
+
+
+def _fvg_event_state(side: str, close: Optional[float],
+                     top: float, bottom: float) -> str:
+    """由现价实时计算缺口状态：open=未回踩 / retest=回踩中 / filled=已回补。
+    多头：现价 ≤ top 回踩中，≤ bottom 已回补；空头镜像。"""
+    if close is None:
+        return "open"
+    if side == "long":
+        if close <= bottom:
+            return "filled"
+        if close <= top:
+            return "retest"
+        return "open"
+    if close >= top:
+        return "filled"
+    if close >= bottom:
+        return "retest"
+    return "open"
+
+
+def _fvg_monitor_snapshot() -> dict:
+    """FVG 监控快照：以全部 symbol 的最大 bar_c.time 为锚，向前按 300s 步进
+    生成最近 12 个 bar 槽位（60 分钟），缓冲内事件实时计算回踩状态后入槽。
+    盘前区间过滤（settings.fvg_premarket_filter，默认关）：多头事件现价
+    <= attack_c.pmh 剔除、空头事件现价 >= attack_c.pml 剔除（槽位事件、
+    首次回踩、预警同口径）；无 attack 数据的一律保留。现价=实时 bar close。"""
+    market = collector.latest() or {}
+    pm_filter = _fvg_premarket_filter()
+    anchor = 0
+    closes: dict = {}
+    zones: dict = {}
+    for sym, data in market.items():
+        bt = (data.get("bar_c") or {}).get("time") or 0
+        if bt > anchor:
+            anchor = bt
+        closes[sym] = (data.get("bar") or {}).get("close")
+        zones[sym] = _attack_zone(data)
+    if not anchor:
+        return {"slots": [], "retests": [], "warnings": []}
+
+    def _pm_ok(side: str, sym: str) -> bool:
+        if not pm_filter:
+            return True
+        pmh, pml = zones.get(sym, (None, None))
+        return _premarket_pass(side, closes.get(sym), pmh, pml)
+
+    slot_map = {anchor - i * 300: {"bar_time": anchor - i * 300,
+                                   "long": [], "short": []}
+                for i in range(12)}
+    oldest = anchor - 11 * 300
+    for ev in _fvg_events:
+        bt = ev["bar_time"]
+        if bt < oldest or bt > anchor:
+            continue
+        # atr / 边沿缺失的事件跳过不入槽
+        if ev.get("atr") is None or ev.get("top") is None \
+                or ev.get("bottom") is None:
+            continue
+        if not _pm_ok(ev["side"], ev["symbol"]):
+            continue
+        slot = slot_map.get(bt)
+        if slot is None:
+            continue
+        item = dict(ev)
+        item["state"] = _fvg_event_state(ev["side"], closes.get(ev["symbol"]),
+                                         ev["top"], ev["bottom"])
+        item["retested"] = bool(ev.get("retested"))   # 前端标记「已回踩」用
+        slot[ev["side"]].append(item)
+    slots = sorted(slot_map.values(), key=lambda s: -s["bar_time"])
+    # 首次回踩记录按回踩时间倒序（最新在前），最多 50 条
+    retests = sorted((r for r in _fvg_retests if _pm_ok(r["side"], r["symbol"])),
+                     key=lambda r: r.get("retest_time") or 0,
+                     reverse=True)[:50]
+    # 预警（形成中）按预警时间倒序，最多 20 条（前端去重弹窗用）
+    warnings = sorted((w for w in _fvg_warnings if _pm_ok(w["side"], w["symbol"])),
+                      key=lambda w: w.get("warn_time") or 0,
+                      reverse=True)[:20]
+    return {"slots": slots, "retests": retests, "warnings": warnings}
+
+
+def _total_position_pct(equity) -> Optional[float]:
+    """全部开放 lot 市值合计 ÷ 净值 ×100；净值为空返回 None。
+
+    市值口径：PENDING 用 qty×entry_px（计划值）；ACTIVE/CLOSING 用
+    filled_qty×last_px（last_px≤0 时回退 avg_fill/entry_px）。
+    """
+    if not equity or equity <= 0:
+        return None
+    amount = 0.0
+    for lot in order_mgr.list_lots(active_only=True):
+        if lot["state"] == "PENDING":
+            amount += lot["qty"] * lot["entry_px"]
+        else:
+            px = lot["last_px"] or lot["avg_fill"] or lot["entry_px"]
+            amount += lot["filled_qty"] * px
+    return round(amount / equity * 100, 1)
 
 
 async def build_snapshot() -> dict:
@@ -751,8 +2193,17 @@ async def build_snapshot() -> dict:
             "daily_pnl": status["daily_pnl"],
             "halted": risk_gate.is_halted(),
             "open_symbols": open_symbols,
+            "total_risk_usd": order_mgr.risk_exposure()["total"],  # 总风险敞口（顶栏「风险 $X/预算」）
+            "max_total_risk_usd": config.RISK_MAX_TOTAL_RISK_USD,  # 总风险敞口预算（0=不限制）
+            "total_position_pct": _total_position_pct(status["equity"]),  # 全部持仓市值 ÷ 净值 %
             "max_order_qty": config.RISK_MAX_ORDER_QTY,  # 单笔股数硬顶（前端封顶用）
             "allow_short": config.ALLOW_SHORT,  # 是否允许做空
+            "fvg_chase_max_ratio": config.FVG_CHASE_MAX_ATR_RATIO,  # 追价最大偏离（×ATR）
+            "stop_atr_mult": _stop_atr_mult(),  # 全局止损 ATR 倍数（前端预览/下单同口径）
+            "screen_premarket_filter": _screen_premarket_filter(),  # 选股盘前过滤开关
+            "fvg_premarket_filter": _fvg_premarket_filter(),  # FVG 监控盘前过滤开关
+            "news": _news_status(),  # 盘前新闻小摘要（徽标联动 hot ticker→gist）
+            "imessage_recipient": str(_settings.get("imessage_recipient") or ""),  # iMessage 告警收件人（未配置跳过）
             "market_age": (None if collector._last_update == 0
                            else round(collector.age(), 1)),
             "market_running": collector.running,
@@ -770,20 +2221,51 @@ async def build_snapshot() -> dict:
                               key=lambda x: x.get("scanned_at", 0), reverse=True),
         "stop_alerts": sorted(_stop_alerts.values(),
                               key=lambda x: x.get("checked_at", 0), reverse=True),
+        # 外部（IBKR 手动）订单/持仓检测告警（清理循环告警模式；自动清理开启时为空）
+        "external_alerts": list(_external_alerts),
+        "slow_break_alerts": sorted(_slow_break_alerts.values(),
+                                    key=lambda x: x.get("alerted_at", 0), reverse=True),
         "auto_close_notices": sorted(_auto_close_notices.values(),
                                      key=lambda x: x.get("closed_at", 0), reverse=True),
         "shadow": {"stats": shadow_tracker.stats(),
                    "events": shadow_tracker.events(100)},
+        "fvg_monitor": _fvg_monitor_snapshot(),
+        "breakout_signals": list(_breakout_signals),   # 盘前突破信号（前端信号栏）
+        "alerts": notifier.active_alerts(),            # 活跃告警（前端横幅+声音）
         "auto": {"enabled": _auto_enabled, "strategy": _auto_strategy_name,
                  "instances": auto_engine.instances(),
                  "proposals": auto_engine.proposals()},
+        "clients": _clients_snapshot(),
+        "copy": _copy_snapshot(),
     }
+
+
+def _tv_last_price(symbol: str) -> Optional[float]:
+    """TV 现价（唯一价格源）：collector 实时 bar close；不可用返回 None。
+    全系统统一用 TV，不依赖 TWS 行情权限（10089 延时通道）。"""
+    data = (collector.latest() or {}).get(symbol) or {}
+    close = (data.get("bar") or {}).get("close")
+    return close if close and close > 0 else None
+
+
+def _refresh_marks_from_tv() -> None:
+    """用 TV 实时价刷新 ACTIVE lot 的 mark 价/PnL/MAE/MFE（每秒调用，不落盘）。
+    替代昂贵的 IBKR last_price 轮询——collector 里本来就有全标的实时收盘价。"""
+    prices: dict = {}
+    for sym, data in collector.latest().items():
+        bar = data.get("bar") or {}
+        close = bar.get("close")
+        if close and close > 0:
+            prices[sym] = close
+    if prices:
+        order_mgr.apply_marks(prices, save=False)
 
 
 async def _broadcast_loop() -> None:
     """每 1s 广播一次快照（含 TV 实时数据）。"""
     while True:
         try:
+            _refresh_marks_from_tv()
             snapshot = await build_snapshot()
             dead = []
             for ws in list(_ws_clients):
@@ -861,10 +2343,19 @@ def _on_lot_closed(d: dict) -> None:
         "exit_reason", "limit_type", "entry_time", "closed_at", "reason")})
 
 
+def _on_lot_revived(d: dict) -> None:
+    """OCA 竞态漏单后的对账复活：落事件流，供审计回溯。"""
+    record_event("lot_revived", **{k: d.get(k) for k in (
+        "lot_id", "symbol", "side", "qty", "filled_qty", "avg_fill",
+        "stop_px", "limit_type", "note")})
+
+
 @app.on_event("startup")
 async def on_startup() -> None:
     global _broadcast_task, _eod_task, _scan_task, _stop_guard_task, _reconcile_task
     global _shadow_task, _auto_task, _midpoint_reprice_task, _external_cleanup_task
+    global _slow_break_task, _auto_breakeven_task, _fvg_task, _retest_reprice_task
+    global _breakout_task, _naked_position_task, _health_watch_task
     config.validate_config()
     if not acquire_writer_lock("logs/autotrade_writer.lock"):
         raise RuntimeError("另一个 autotrade 执行写进程正在运行，禁止重复管理订单")
@@ -874,27 +2365,41 @@ async def on_startup() -> None:
     elif not connected:
         logger.info("IBKR 未连接，运行于纯 dry-run（虚拟成交）")
     order_mgr.on_lot_closed = _on_lot_closed
+    order_mgr.on_lot_revived = _on_lot_revived
+    order_mgr.price_provider = _tv_last_price   # 平仓参考价统一用 TV（唯一价格源）
     if connected:
         await order_mgr.reconcile()
     await collector.start()
+    await copy_supervisor.start(_load_copy_servers())
     _broadcast_task = asyncio.create_task(_broadcast_loop())
     _eod_task = asyncio.create_task(_eod_force_close_loop())
     _scan_task = asyncio.create_task(_position_scan_loop())
     _stop_guard_task = asyncio.create_task(_stop_guard_loop())
+    _slow_break_task = asyncio.create_task(_slow_break_loop())
+    _auto_breakeven_task = asyncio.create_task(_auto_breakeven_loop())
     _reconcile_task = asyncio.create_task(_reconcile_loop())
     _shadow_task = asyncio.create_task(_shadow_loop())
     _auto_task = asyncio.create_task(_auto_loop())
     _midpoint_reprice_task = asyncio.create_task(_midpoint_limit_reprice_loop())
+    _retest_reprice_task = asyncio.create_task(_retest_limit_reprice_loop())
     _external_cleanup_task = asyncio.create_task(_external_cleanup_loop())
+    _fvg_task = asyncio.create_task(_fvg_monitor_loop())
+    _breakout_task = asyncio.create_task(_breakout_loop())
+    _naked_position_task = asyncio.create_task(_naked_position_loop())
+    _health_watch_task = asyncio.create_task(_health_watch_loop())
 
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
     for t in (_broadcast_task, _eod_task, _scan_task,
               _stop_guard_task, _reconcile_task, _shadow_task, _auto_task,
-              _midpoint_reprice_task, _external_cleanup_task):
+              _midpoint_reprice_task, _retest_reprice_task,
+              _external_cleanup_task, _slow_break_task,
+              _auto_breakeven_task, _fvg_task, _breakout_task,
+              _naked_position_task, _health_watch_task):
         if t:
             t.cancel()
+    await copy_supervisor.stop_all()
     await collector.stop()
     await gateway.disconnect()
 
@@ -902,6 +2407,553 @@ async def on_shutdown() -> None:
 # ---------------------------------------------------------------------------
 # REST 接口
 # ---------------------------------------------------------------------------
+
+@app.get("/api/clients/self")
+async def api_clients_self(request: Request) -> dict:
+    """当前客户端身份：本机=master（免确认）；非本机按 X-Trader-Token 解析。"""
+    if _is_local(request):
+        return {"role": "master", "name": "master", "approved": True}
+    token = request.headers.get("X-Trader-Token", "")
+    info = _clients.get("tokens", {}).get(token)
+    if info:
+        expired = bool(info.get("approved")) and not _token_valid(info)
+        return {"role": "trader", "name": info.get("name", ""),
+                "approved": _token_valid(info), "expired": expired,
+                "ttl_hours": config.CLIENT_TOKEN_TTL_HOURS}
+    return {"role": "guest", "approved": False}
+
+
+@app.post("/api/clients/register")
+async def api_clients_register(req: ClientRegisterRequest,
+                               request: Request) -> dict:
+    """非本机客户端注册交易员名称 → 签发 token（pending，等 master 审批）。
+    同名 pending 返回原 token（幂等）；名称已被已审批 token 占用 → 409。"""
+    if _is_local(request):
+        raise HTTPException(400, "本机即 master，无需注册")
+    name = req.name.strip()
+    if not name or not _CLIENT_NAME_RE.match(name):
+        raise HTTPException(400, "名称非法（1-20 字符，仅允许中英文/数字/_/-）")
+    if name.lower() == "master":
+        raise HTTPException(400, "master 为保留名称")
+    tokens = _clients.setdefault("tokens", {})
+    # 同名查找：pending → 幂等返回原 token；已过期 approved → 作废旧 token
+    # 换新重走审批；有效 approved → 409 占用
+    for old_token, info in list(tokens.items()):
+        if info.get("name") == name:
+            if _token_valid(info):
+                raise HTTPException(409, "名称已被使用")
+            if info.get("approved"):
+                del tokens[old_token]   # 已过期：允许重新登记（需重新审批）
+                logger.info("客户端 %s 旧 token 已过期，重新登记", name)
+                break
+            return {"token": old_token, "name": name, "approved": False}
+    token = uuid.uuid4().hex
+    tokens[token] = {"name": name, "approved": False,
+                     "created_at": time.time(), "approved_at": 0}
+    _save_clients()
+    record_event("client_registered", name=name, token_prefix=token[:6])
+    logger.info("客户端注册: %s（token %s…），等待 master 审批", name, token[:6])
+    return {"token": token, "name": name, "approved": False}
+
+
+def _resolve_client_token(token_or_prefix: str):
+    """按完整 token 或前缀解析客户端 token（快照只暴露前 6 位，
+    审批端点须同时支持两种入参）。返回 (token, info) 或 (None, None)。"""
+    tokens = _clients.get("tokens", {})
+    info = tokens.get(token_or_prefix)
+    if info is not None:
+        return token_or_prefix, info
+    matches = [(t, i) for t, i in tokens.items()
+               if t.startswith(token_or_prefix)]
+    if len(matches) == 1:
+        return matches[0]
+    return None, None
+
+
+@app.post("/api/clients/{token}/approve")
+async def api_clients_approve(token: str, request: Request) -> dict:
+    """master 审批客户端 token（仅本机可调用，支持 token 前缀）。"""
+    if not _is_local(request):
+        raise HTTPException(403, "仅本机（master）可审批客户端")
+    full, info = _resolve_client_token(token)
+    if info is None:
+        raise HTTPException(404, "token 不存在或前缀不唯一")
+    info["approved"] = True
+    info["approved_at"] = time.time()
+    _save_clients()
+    record_event("client_approved", name=info.get("name", ""),
+                 token_prefix=full[:6])
+    logger.info("客户端已审批: %s（token %s…）", info.get("name"), full[:6])
+    return {"ok": True, "name": info.get("name", ""), "approved": True}
+
+
+@app.post("/api/clients/{token}/reject")
+async def api_clients_reject(token: str, request: Request) -> dict:
+    """master 拒绝客户端 token：直接删除（仅本机可调用，支持 token 前缀）。"""
+    if not _is_local(request):
+        raise HTTPException(403, "仅本机（master）可拒绝客户端")
+    full, info = _resolve_client_token(token)
+    if info is None:
+        raise HTTPException(404, "token 不存在或前缀不唯一")
+    del _clients["tokens"][full]
+    _save_clients()
+    record_event("client_rejected", name=info.get("name", ""),
+                 token_prefix=full[:6])
+    logger.info("客户端已拒绝并删除: %s（token %s…）",
+                info.get("name"), full[:6])
+    return {"ok": True, "name": info.get("name", ""), "approved": False}
+
+
+# ---------------------------------------------------------------------------
+# 跟单服务器管理（CRUD 全套 require_trader 闸门，仅已审批客户端可改）
+# ---------------------------------------------------------------------------
+
+@app.get("/api/copy/servers")
+async def api_copy_servers(trader: str = Depends(require_trader)) -> dict:
+    """跟单服务器列表：配置 + 状态文件合并（无状态文件时状态字段为 null）。"""
+    return {"servers": [_copy_server_row(c) for c in _load_copy_servers()]}
+
+
+@app.post("/api/copy/servers")
+async def api_copy_server_add(req: CopyServerCreateRequest,
+                              trader: str = Depends(require_trader)) -> dict:
+    """新增跟单服务器：name 唯一、client_id 缺省自动分配（13 起），
+    落盘后触发监管 reload。"""
+    name = req.name.strip()
+    if not _COPY_SERVER_NAME_RE.match(name):
+        raise HTTPException(400, "名称非法（1-10 字符，仅允许中英文/数字/_/-）")
+    servers = _load_copy_servers()
+    if any(s.get("name") == name for s in servers):
+        raise HTTPException(409, "名称已存在")
+    cfg = req.dict()
+    cfg["name"] = name
+    if not cfg.get("client_id"):
+        cfg["client_id"] = _alloc_copy_client_id(servers)
+    err = _validate_copy_server(cfg, servers)
+    if err:
+        raise HTTPException(400, err)
+    servers.append(cfg)
+    _save_copy_servers(servers)
+    await copy_supervisor.reload(servers)
+    record_event("copy_server_added", name=name, client_id=cfg["client_id"],
+                 enabled=cfg["enabled"], trader=trader)
+    logger.info("跟单服务器新增: %s (client_id=%s, enabled=%s, by %s)",
+                name, cfg["client_id"], cfg["enabled"], trader)
+    return {"ok": True, "server": _copy_server_row(cfg)}
+
+
+@app.post("/api/copy/servers/{name}/update")
+async def api_copy_server_update(name: str, req: CopyServerUpdateRequest,
+                                 trader: str = Depends(require_trader)) -> dict:
+    """改参数（name/enabled 不可在此改）；落盘后触发监管 reload。"""
+    servers = _load_copy_servers()
+    cfg = next((s for s in servers if s.get("name") == name), None)
+    if cfg is None:
+        raise HTTPException(404, "服务器不存在")
+    updates = {k: v for k, v in req.dict().items() if v is not None}
+    if not updates:
+        raise HTTPException(400, "无可更新字段")
+    merged = {**cfg, **updates}
+    err = _validate_copy_server(merged, [s for s in servers if s is not cfg])
+    if err:
+        raise HTTPException(400, err)
+    cfg.update(updates)
+    _save_copy_servers(servers)
+    await copy_supervisor.reload(servers)
+    record_event("copy_server_updated", name=name,
+                 changed=sorted(updates), trader=trader)
+    logger.info("跟单服务器改参: %s %s (by %s)", name, sorted(updates), trader)
+    return {"ok": True, "server": _copy_server_row(cfg)}
+
+
+@app.post("/api/copy/servers/{name}/delete")
+async def api_copy_server_delete(name: str,
+                                 trader: str = Depends(require_trader)) -> dict:
+    """删除跟单服务器：先停进程，再落盘并触发监管 reload。"""
+    servers = _load_copy_servers()
+    if not any(s.get("name") == name for s in servers):
+        raise HTTPException(404, "服务器不存在")
+    await copy_supervisor.terminate(name)
+    servers = [s for s in servers if s.get("name") != name]
+    _save_copy_servers(servers)
+    await copy_supervisor.reload(servers)
+    record_event("copy_server_deleted", name=name, trader=trader)
+    logger.info("跟单服务器删除: %s (by %s)", name, trader)
+    return {"ok": True, "name": name}
+
+
+async def _copy_set_enabled(name: str, enabled: bool, trader: str) -> dict:
+    """enable/disable 公共逻辑：落盘 + 监管 reload（启用 spawn / 停用 terminate）。"""
+    servers = _load_copy_servers()
+    cfg = next((s for s in servers if s.get("name") == name), None)
+    if cfg is None:
+        raise HTTPException(404, "服务器不存在")
+    cfg["enabled"] = enabled
+    _save_copy_servers(servers)
+    await copy_supervisor.reload(servers)
+    record_event("copy_server_enabled" if enabled else "copy_server_disabled",
+                 name=name, trader=trader)
+    logger.info("跟单服务器%s: %s (by %s)",
+                "启用" if enabled else "停用", name, trader)
+    return {"ok": True, "server": _copy_server_row(cfg)}
+
+
+@app.post("/api/copy/servers/{name}/enable")
+async def api_copy_server_enable(name: str,
+                                 trader: str = Depends(require_trader)) -> dict:
+    """启用跟单服务器（监管 spawn 子进程）。"""
+    return await _copy_set_enabled(name, True, trader)
+
+
+@app.post("/api/copy/servers/{name}/disable")
+async def api_copy_server_disable(name: str,
+                                  trader: str = Depends(require_trader)) -> dict:
+    """停用跟单服务器（监管 terminate 子进程）。"""
+    return await _copy_set_enabled(name, False, trader)
+
+
+@app.post("/api/copy/servers/{name}/cmd")
+async def api_copy_server_cmd(name: str, req: CopyCmdRequest,
+                              trader: str = Depends(require_trader)) -> dict:
+    """人工指令：合并写入 logs/copy-{name}-cmd.json（不覆盖已有指令——
+    retry/dismiss 列表去重追加，unhalt 只置位不清除）。"""
+    servers = _load_copy_servers()
+    if not any(s.get("name") == name for s in servers):
+        raise HTTPException(404, "服务器不存在")
+    if not req.retry and not req.dismiss and not req.unhalt:
+        raise HTTPException(400, "空指令（retry/dismiss/unhalt 至少一项）")
+    cmd = {"retry": [], "dismiss": [], "unhalt": False}
+    try:
+        old = json.loads(_copy_cmd_path(name).read_text(encoding="utf-8"))
+        if isinstance(old, dict):
+            cmd["retry"] = list(old.get("retry") or [])
+            cmd["dismiss"] = list(old.get("dismiss") or [])
+            cmd["unhalt"] = bool(old.get("unhalt"))
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, TypeError):
+        logger.warning("copy-%s-cmd.json 损坏，按空指令合并", name)
+    for key, new_items in (("retry", req.retry), ("dismiss", req.dismiss)):
+        for item in new_items:
+            if item not in cmd[key]:
+                cmd[key].append(item)
+    cmd["unhalt"] = cmd["unhalt"] or req.unhalt
+    path = _copy_cmd_path(name)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(cmd, ensure_ascii=False, indent=2),
+                   encoding="utf-8")
+    os.replace(tmp, path)
+    record_event("copy_server_cmd", name=name, retry=req.retry,
+                 dismiss=req.dismiss, unhalt=req.unhalt, trader=trader)
+    logger.info("跟单人工指令: %s retry=%s dismiss=%s unhalt=%s (by %s)",
+                name, req.retry, req.dismiss, req.unhalt, trader)
+    return {"ok": True, "cmd": cmd}
+
+
+class SettingsRequest(BaseModel):
+    stop_atr_mult: Optional[float] = Field(None, description="止损 ATR 倍数（0.2~5.0）")
+    screen_premarket_filter: Optional[bool] = Field(None, description="选股盘前区间过滤开关")
+    fvg_premarket_filter: Optional[bool] = Field(None, description="FVG 监控盘前区间过滤开关")
+    imessage_recipient: Optional[str] = Field(None, description="iMessage 告警收件人（空串=清除，未配置跳过该通道）")
+
+
+def _settings_payload() -> dict:
+    """全局设置当前值（GET /api/settings 与 POST 响应共用）。"""
+    return {
+        "stop_atr_mult": _stop_atr_mult(),
+        "screen_premarket_filter": _screen_premarket_filter(),
+        "fvg_premarket_filter": _fvg_premarket_filter(),
+        "imessage_recipient": str(_settings.get("imessage_recipient") or ""),
+    }
+
+
+@app.get("/api/settings")
+async def api_get_settings() -> dict:
+    """全局设置（所有客户端共享，快照 status 同步下发）。"""
+    return _settings_payload()
+
+
+# ---------------------------------------------------------------------------
+# CDP 联动：选股点选 → 本机 TV 桌面端第一个 pane 切到该标的
+# ---------------------------------------------------------------------------
+
+class TvShowRequest(BaseModel):
+    symbol: str = Field(..., description="如 NASDAQ:AAPL")
+
+
+# 切视觉左上角第一个可见 pane 到目标标的并读回校验（API 层即时生效）。
+# widget 集合两条路径：TradingViewApi._chartWidgetCollection.getAll() 优先，
+# 回退 _exposed_chartWidgetCollection._chartWidgetsDefs。视觉行优先排序用
+# tv_control.js 的 COLLECT_SRC 口径：cw._mainDiv.getBoundingClientRect()
+# 直接量每个 widget 的 DOM rect（回退 def width/height 匹配容器），
+# 过滤不可见 pane（布局切换后残留 widget rect=0x0），按 (y, x) 行优先排序。
+# 交易所前缀归一化（NASDAQ:QQQ→BATS:QQQ）只比 ticker。
+_TV_SHOW_JS = r"""
+(async () => {
+  const prim = v => (typeof v === 'function') ? v() : v;
+  const readSym = cw => {
+    try { const s = cw.symbol();
+      return String((s && typeof s.value === 'function') ? s.value() : s);
+    } catch (e) {}
+    try { return String(cw.model().mainSeries().symbol()); } catch (e) {}
+    return 'ERR';
+  };
+  const rectOf = cw => {
+    try {
+      if (cw._mainDiv && cw._mainDiv.getBoundingClientRect) {
+        const b = cw._mainDiv.getBoundingClientRect();
+        return { x: b.x, y: b.y, w: b.width, h: b.height };
+      }
+    } catch (e) {}
+    return null;
+  };
+  // 收集 widget（TradingViewApi 优先，_exposed 回退）
+  let cws = [];
+  const api = window.TradingViewApi && window.TradingViewApi._chartWidgetCollection;
+  if (api && typeof api.getAll === 'function') cws = api.getAll() || [];
+  if (!cws.length) {
+    const col = window._exposed_chartWidgetCollection;
+    if (col && col._chartWidgetsDefs) {
+      cws = col._chartWidgetsDefs.map(d => d.chartWidget);
+    }
+  }
+  if (!cws.length) return JSON.stringify({fatal: 'no chart widget collection'});
+  // 过滤不可见 pane（rect 缺失或 0x0），按 (y, x) 视觉行优先排序
+  const panes = cws.map(cw => ({ cw, rect: rectOf(cw) }))
+    .filter(p => p.rect && p.rect.w > 50 && p.rect.h > 50)
+    .sort((a, b) => (a.rect.y - b.rect.y) || (a.rect.x - b.rect.x));
+  if (!panes.length) {
+    // 单图/无法取 rect：退回集合顺序第一个
+    panes.push({ cw: cws[0], rect: null });
+  }
+  const first = panes[0].cw;
+  const before = readSym(first);
+  const target = %SYMBOL%;
+  if (typeof first.setSymbol === 'function') first.setSymbol(target);
+  else if (first.model && first.model().mainSeries) {
+    first.model().mainSeries().setSymbol(target);
+  } else return JSON.stringify({fatal: 'widget 无 setSymbol', before});
+  await new Promise(r => setTimeout(r, 300));
+  const after = readSym(first);
+  const ticker = String(target).split(':').pop().toUpperCase();
+  const got = String(after).split(':').pop().toUpperCase();
+  return JSON.stringify({before, after, ok: got === ticker, ticker,
+                         panes: panes.length});
+})()
+"""
+
+
+async def _tv_activate_window() -> None:
+    """把 TV 窗口拉到前台（用户点选选股后希望立刻看到图表）。
+    两步 best-effort：① CDP /json/activate 把图表标签页提到浏览器内部最前；
+    ② 找到 9222 监听进程所属 .app，open -a 把整个应用窗口置前。
+    全部失败静默（不影响切标的本身）。"""
+    try:
+        from controller import tv_cdp as _cdp_mod
+        endpoint = _cdp_mod.config.CDP_HTTP_ENDPOINT  # 如 http://localhost:9222
+
+        def _activate() -> None:
+            import urllib.request
+            with urllib.request.urlopen(f"{endpoint}/json", timeout=3) as r:
+                targets = json.loads(r.read())
+            page = next((t for t in targets
+                         if t.get("type") == "page"
+                         and "tradingview.com/chart" in t.get("url", "")), None)
+            if page:
+                with urllib.request.urlopen(
+                        f"{endpoint}/json/activate/{page['id']}", timeout=3) as r:
+                    r.read()
+
+        await asyncio.to_thread(_activate)
+        # 置前整个应用：9222 监听进程 → .app 路径 → open -a
+        proc = await asyncio.create_subprocess_exec(
+            "bash", "-c",
+            "ps -o comm= -p $(lsof -nP -iTCP:9222 -sTCP:LISTEN -t | head -1) 2>/dev/null",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await proc.communicate()
+        comm = out.decode().strip()
+        if ".app/" in comm:
+            app = comm.split(".app/")[0] + ".app"
+            await asyncio.create_subprocess_exec(
+                "open", "-a", app,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+    except Exception as e:
+        logger.info("TV 窗口置前失败（静默）: %s", e)
+
+
+_TV_CHART_URL = "https://cn.tradingview.com/chart/I2KwX1s0/"  # auto_trade 保存布局
+
+
+async def _cdp_alive() -> bool:
+    """9222 调试端口是否有可控浏览器（快速探测）。"""
+    from controller import tv_cdp as _cdp_mod
+    endpoint = _cdp_mod.config.CDP_HTTP_ENDPOINT
+
+    def _probe() -> bool:
+        import urllib.request
+        try:
+            with urllib.request.urlopen(f"{endpoint}/json/version",
+                                        timeout=2) as r:
+                return r.status == 200
+        except Exception:
+            return False
+
+    return await asyncio.to_thread(_probe)
+
+
+async def _tv_ensure_browser() -> Optional[str]:
+    """确保可控浏览器存在。返回 None = 就绪；否则返回失败原因。
+    三种情况：① 9222 不通 → 启动 Chrome（带调试端口 + TV 图表页）；
+    ② 端口活但图表页被关了（macOS 关窗不退进程，target 列表为空）
+    → /json/new 新开一个图表标签页；③ 图表页在 → 直接就绪。"""
+    from controller import tv_cdp as _cdp_mod
+    from controller.tv_cdp import TradingViewCDPController
+    endpoint = _cdp_mod.config.CDP_HTTP_ENDPOINT
+
+    def _chart_page_up() -> bool:
+        import urllib.request
+        try:
+            with urllib.request.urlopen(f"{endpoint}/json", timeout=2) as r:
+                return any(t.get("type") == "page"
+                           and "tradingview.com/chart" in t.get("url", "")
+                           for t in json.loads(r.read()))
+        except Exception:
+            return False
+
+    def _open_chart_tab() -> None:
+        import urllib.request
+        req = urllib.request.Request(
+            f"{endpoint}/json/new?{_TV_CHART_URL}", method="PUT")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            r.read()
+
+    if await _cdp_alive():
+        if await asyncio.to_thread(_chart_page_up):
+            return None
+        logger.info("CDP 在线但无图表页，新开 TradingView 标签页 ...")
+        try:
+            await asyncio.to_thread(_open_chart_tab)
+        except Exception as e:
+            return f"新开图表标签页失败: {e}"
+    else:
+        logger.info("CDP 离线，启动浏览器打开 TradingView ...")
+        await asyncio.create_subprocess_exec(
+            "open", "-na", "Google Chrome", "--args",
+            "--remote-debugging-port=9222", _TV_CHART_URL,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        # 等调试端口起来（Chrome 冷启动）
+        for _ in range(15):
+            await asyncio.sleep(2)
+            if await _cdp_alive():
+                break
+        else:
+            return ("Chrome 未以可控模式启动（若 Chrome 已在运行但没开调试端口，"
+                    "单例机制会吞掉参数——请完全退出 Chrome 后再点一次，"
+                    "我会以可控模式重新打开）")
+    # 等图表页 target 出现
+    for _ in range(15):
+        if await asyncio.to_thread(_chart_page_up):
+            break
+        await asyncio.sleep(2)
+    else:
+        return "浏览器已启动但图表页未加载出来"
+    # 等 chart widget 就绪（TV 页面重，指标/布局初始化慢）
+    ready_js = ("!!(((window.TradingViewApi||{})._chartWidgetCollection"
+                "||{getAll:()=>[]}).getAll().length"
+                "|| (((window._exposed_chartWidgetCollection||{})"
+                "._chartWidgetsDefs)||[]).length)")
+    try:
+        for _ in range(30):
+            async with TradingViewCDPController() as tv:
+                if await asyncio.wait_for(tv.evaluate(ready_js), timeout=5):
+                    logger.info("浏览器已就绪（TV 图表页 + widget 加载完成）")
+                    return None
+            await asyncio.sleep(2)
+        return "图表页已打开但 widget 未就绪（页面可能未登录或加载过慢）"
+    except Exception as e:
+        return f"浏览器就绪检查异常: {e}"
+
+
+async def _tv_show_symbol(symbol: str) -> dict:
+    """切第一个 pane 到该标的 + 读回校验 + 窗口置前。
+    前置：CDP 不在线先启动浏览器并定位到 TradingView（_tv_ensure_browser）。"""
+    from controller.tv_cdp import TradingViewCDPController
+    not_ready = await _tv_ensure_browser()
+    if not_ready:
+        logger.warning("TV 不可用: %s", not_ready)
+        return {"ok": False, "reason": not_ready}
+    # 冷启动竞态：新开页的 widget 集合先于图表布局恢复就绪，setSymbol 会被
+    # 布局恢复覆盖（实测首开页切 AMD 读回 NFLX，页面热身后即正常）→ 重试
+    report = {}
+    for attempt in range(3):
+        try:
+            async with TradingViewCDPController() as tv:
+                report = json.loads(await asyncio.wait_for(
+                    tv.evaluate(_TV_SHOW_JS.replace("%SYMBOL%", json.dumps(symbol))),
+                    timeout=10))
+        except Exception as e:
+            logger.info("TV 切标的不可用（静默降级）: %s", e)
+            return {"ok": False, "reason": str(e)}
+        if report.get("fatal") or report.get("ok"):
+            break
+        if attempt < 2:
+            await asyncio.sleep(2)
+    if report.get("fatal"):
+        logger.info("TV 切标的失败: %s", report["fatal"])
+        return {"ok": False, "reason": report["fatal"]}
+    if report.get("ok"):
+        logger.info("TV 第一个 pane 已切到 %s（%s → %s）",
+                    symbol, report.get("before"), report.get("after"))
+        await _tv_activate_window()
+        return {"ok": True, "shown": report.get("after")}
+    logger.warning("TV 切标的读回不一致: 目标 %s 读回 %s",
+                   symbol, report.get("after"))
+    return {"ok": False, "reason": f"读回不一致: {report.get('after')}",
+            "shown": report.get("after")}
+
+
+@app.post("/api/tv/show")
+async def api_tv_show(req: TvShowRequest,
+                      trader: str = Depends(require_trader)) -> dict:
+    """选股点选联动：本机 TV 桌面端视觉左上角第一个 pane 切到该标的。
+    幂等快速（多客户端同时点各自切同一台 TV，单机单屏本质）；失败静默。"""
+    symbol = req.symbol.strip()
+    if not symbol:
+        raise HTTPException(400, "symbol 不能为空")
+    return await _tv_show_symbol(symbol)
+
+
+@app.post("/api/settings")
+async def api_update_settings(req: SettingsRequest,
+                              trader: str = Depends(require_trader)) -> dict:
+    """修改全局设置并落盘 settings.json（重启后保持）。
+    只更新显式传入的字段（None = 不动），至少传一个。"""
+    changed = {}
+    if req.stop_atr_mult is not None:
+        if not (_STOP_ATR_MULT_MIN <= req.stop_atr_mult <= _STOP_ATR_MULT_MAX):
+            raise HTTPException(400, f"stop_atr_mult 超出允许范围"
+                                     f"（{_STOP_ATR_MULT_MIN}~{_STOP_ATR_MULT_MAX}）")
+        _settings["stop_atr_mult"] = round(float(req.stop_atr_mult), 2)
+        changed["stop_atr_mult"] = _settings["stop_atr_mult"]
+    for key in ("screen_premarket_filter", "fvg_premarket_filter"):
+        val = getattr(req, key)
+        if val is not None:
+            _settings[key] = bool(val)
+            changed[key] = _settings[key]
+    if req.imessage_recipient is not None:
+        v = req.imessage_recipient.strip()
+        if v:
+            _settings["imessage_recipient"] = v
+        else:
+            _settings.pop("imessage_recipient", None)   # 空串 = 清除（跳过通道）
+        changed["imessage_recipient"] = v
+    if not changed:
+        raise HTTPException(400, "未传入任何设置字段")
+    _save_settings()
+    record_event("settings_updated", trader=trader, **changed)
+    logger.info("全局设置已更新 %s（by %s）", changed, trader)
+    return {"ok": True, **_settings_payload()}
+
 
 @app.get("/api/status")
 async def api_status() -> dict:
@@ -917,10 +2969,11 @@ async def api_logs(limit: int = 200) -> list:
 
 @app.get("/api/market")
 async def api_market() -> dict:
-    """TV 实时数据快照（5M K线 + trend_state）。"""
+    """TV 实时数据快照（5M K线 + trend_state）+ FVG 监控槽位（前端首屏用）。"""
     return {"symbols": collector.latest(),
             "age": None if collector._last_update == 0 else round(collector.age(), 1),
-            "running": collector.running}
+            "running": collector.running,
+            "fvg_monitor": _fvg_monitor_snapshot()}
 
 
 @app.get("/api/screen")
@@ -944,7 +2997,8 @@ class AutoStartRequest(BaseModel):
 
 
 @app.post("/api/auto/start")
-async def api_auto_start(req: AutoStartRequest) -> dict:
+async def api_auto_start(req: AutoStartRequest,
+                         trader: str = Depends(require_trader)) -> dict:
     """启动策略实例（≤ AUTO_MAX_INSTANCES）：tick 产生候选，人工确认开仓，
     bar 收盘自动管理（保本/ST 跟踪/反向）。"""
     global _auto_enabled, _auto_strategy_name, _auto_last_bar
@@ -960,7 +3014,10 @@ async def api_auto_start(req: AutoStartRequest) -> dict:
         else:
             fixed.append(s)
     try:
-        strategy = build_strategy(req.strategy, **req.params)
+        # 默认把当前全局止损 ATR 倍数传入策略（req.params 可显式覆盖）
+        strategy = build_strategy(req.strategy,
+                                  **{"stop_atr_mult": _stop_atr_mult(),
+                                     **req.params})
     except ValueError as e:
         raise HTTPException(400, str(e))
     started = auto_engine.start(strategy, fixed)
@@ -975,7 +3032,8 @@ async def api_auto_start(req: AutoStartRequest) -> dict:
 
 
 @app.post("/api/auto/stop")
-async def api_auto_stop(close_positions: bool = False) -> dict:
+async def api_auto_stop(close_positions: bool = False,
+                        trader: str = Depends(require_trader)) -> dict:
     """停止全自动策略：不再开新仓；存量实例默认继续管理（可选全部平仓）。"""
     global _auto_enabled
     _auto_enabled = False
@@ -1001,7 +3059,9 @@ async def api_auto_status() -> dict:
 
 
 @app.post("/api/auto/proposals/{proposal_id}/approve")
-async def api_auto_proposal_approve(proposal_id: str) -> dict:
+async def api_auto_proposal_approve(
+        proposal_id: str,
+        trader: str = Depends(require_trader)) -> dict:
     """批准服务端保存的开仓候选，价格与方向不接受浏览器覆盖。"""
     if not _auto_enabled:
         raise HTTPException(409, "策略已停止，候选不可批准")
@@ -1023,8 +3083,10 @@ class AutoRejectRequest(BaseModel):
 
 
 @app.post("/api/auto/proposals/{proposal_id}/reject")
-async def api_auto_proposal_reject(proposal_id: str,
-                                   req: Optional[AutoRejectRequest] = None) -> dict:
+async def api_auto_proposal_reject(
+        proposal_id: str,
+        req: Optional[AutoRejectRequest] = None,
+        trader: str = Depends(require_trader)) -> dict:
     """忽略开仓候选，同一 bar 不重复提醒。"""
     result, error = await auto_engine.reject_entry(
         proposal_id, reason=(req.reason if req else ""))
@@ -1141,7 +3203,9 @@ async def api_performance() -> dict:
             return {"count": 0, "win_rate": 0, "avg_win": 0, "avg_loss": 0,
                     "profit_factor": None, "total_pnl": 0,
                     "avg_mae": 0, "avg_mfe": 0, "avg_target_rr": 0,
-                    "avg_actual_rr": 0, "expectancy": 0}
+                    "avg_actual_rr": 0, "expectancy": 0,
+                    "breakeven_rate": 0, "avg_breakeven_min": 0,
+                    "avg_stop_min": 0, "avg_hold_min": 0}
         wins = [r for r in rows if r.get("realized_pnl", 0) > 0]
         losses = [r for r in rows if r.get("realized_pnl", 0) <= 0]
         total = sum(r.get("realized_pnl", 0) for r in rows)
@@ -1152,6 +3216,16 @@ async def api_performance() -> dict:
         avg_mfe = sum(r.get("mfe", 0) for r in rows) / len(rows)
         avg_target_rr = sum(r.get("target_rr", 0) for r in rows) / len(rows)
         avg_actual_rr = sum(r.get("actual_rr", 0) for r in rows) / len(rows)
+        # 时间维度复盘：保本达成率 / 平均保本时长 / 平均止损时长 / 平均持仓时长
+        be_rows = [r for r in rows if r.get("breakeven_reached")]
+        be_rate = len(be_rows) / len(rows) * 100 if rows else 0.0
+        avg_be_sec = (sum(r.get("breakeven_seconds", 0) for r in be_rows)
+                      / len(be_rows)) if be_rows else 0.0
+        stop_rows = [r for r in rows if r.get("stop_seconds", 0) > 0]
+        avg_stop_sec = (sum(r.get("stop_seconds", 0) for r in stop_rows)
+                        / len(stop_rows)) if stop_rows else 0.0
+        avg_exit_sec = (sum(r.get("exit_seconds", 0) for r in rows)
+                        / len(rows)) if rows else 0.0
         return {
             "count": len(rows),
             "win_rate": round(len(wins) / len(rows) * 100, 1),
@@ -1164,6 +3238,10 @@ async def api_performance() -> dict:
             "avg_mfe": round(avg_mfe, 2),                    # 平均最大浮盈
             "avg_target_rr": round(avg_target_rr, 2),        # 平均目标 RR
             "avg_actual_rr": round(avg_actual_rr, 2),        # 平均真实 RR
+            "breakeven_rate": round(be_rate, 1),             # 保本达成率 %
+            "avg_breakeven_min": round(avg_be_sec / 60, 1),  # 平均保本时长（分钟）
+            "avg_stop_min": round(avg_stop_sec / 60, 1),     # 平均止损时长（分钟）
+            "avg_hold_min": round(avg_exit_sec / 60, 1),     # 平均持仓时长（分钟）
         }
 
     def _group(key) -> dict:
@@ -1217,13 +3295,14 @@ async def api_positions() -> List[dict]:
 
 
 @app.post("/api/lots/limit-stop")
-async def api_place_limit_stop(req: LimitStopOrderRequest) -> dict:
-    """LMT 父单 + STP 子单下单；midpoint 由服务端按已收盘 bar 中点定价。
-    方向必须与 ts_c.trend_state 同向（1 多 / -1 空），震荡拦截；
+async def api_place_limit_stop(req: LimitStopOrderRequest,
+                               trader: str = Depends(require_trader)) -> dict:
+    """LMT 父单 + STP 子单下单；midpoint/retest 由服务端按已收盘 bar 定价。
+    方向必须与 ts_c.direction（SuperTrend 方向）同向（1 多 / -1 空），震荡可开；
     force=执意开仓放行（需原因）。"""
     if req.side not in ("long", "short"):
         raise HTTPException(400, f"方向非法: {req.side}")
-    if req.limit_type not in ("ema", "channel", "midpoint"):
+    if req.limit_type not in ("ema", "channel", "midpoint", "retest", "chase", "market"):
         raise HTTPException(400, f"不支持的限价类型: {req.limit_type}")
     if not config.ALLOW_SHORT and req.side == "short":
         raise HTTPException(400, "当前仅允许做多（空头已屏蔽）")
@@ -1231,14 +3310,58 @@ async def api_place_limit_stop(req: LimitStopOrderRequest) -> dict:
     _check_trend_filter(req.symbol, req.side, req.force, req.reason)
     limit_px, stop_px = req.limit_px, req.stop_px
     reprice_bar_time = 0.0
+    breakout_px = 0.0
     if req.limit_type == "midpoint":
         data = (collector.latest() or {}).get(req.symbol, {})
         try:
-            limit_px, stop_px, bar, _ = _midpoint_prices(data, req.side)
+            limit_px, stop_px, breakout_px, bar, _ = _midpoint_prices(
+                data, req.side)
         except ValueError as e:
             raise HTTPException(400, str(e))
         reprice_bar_time = bar["time"]
+    elif req.limit_type == "retest":
+        # 服务端按 bar_c2 定价（不信浏览器价）：多 limit=bar_c2.high /
+        # stop=bar_c2.low，空头镜像；bar_c2 缺失直接拒绝，不静默算错。
+        data = (collector.latest() or {}).get(req.symbol, {})
+        try:
+            limit_px, stop_px, bar = _retest_prices(data, req.side)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        reprice_bar_time = bar["time"]
+    elif req.limit_type == "chase":
+        # FVG 追价：服务端按最新 FVG 事件边沿 + 实时价定价（不信浏览器价）；
+        # 偏离边沿过远 / 无 FVG 事件 / ATR 缺失直接拒绝。reprice_bar_time 与
+        # breakout_px 保持 0（一次定价，不参与逐 bar 改价与突破腿）。
+        data = (collector.latest() or {}).get(req.symbol, {})
+        try:
+            limit_px, stop_px = _fvg_chase_prices(data, req.side, req.symbol)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+    elif req.limit_type == "market":
+        # 市价单：服务端按实时价 ×(1±0.5%) 定价（不信浏览器价），
+        # 止损 = 现价 ∓ N×ATR（N = 全局止损倍数）；一次定价，不改价不突破腿。
+        data = (collector.latest() or {}).get(req.symbol, {})
+        try:
+            limit_px, stop_px = _market_prices(data, req.side)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
     qty = req.qty
+    risk_ref_px = 0.0
+    if req.limit_type in ("market", "chase"):
+        # marketable 单（market/chase）：服务端以损定量拥有股数——
+        # 溢价限价只做券商成交保护，风险/股数口径用预期成交价（现价）。
+        #（BA 实锤：0.5% 溢价 ≈ 止损距离，按限价计风险被风控 10% 容差误杀）
+        data2 = (collector.latest() or {}).get(req.symbol, {})
+        risk_ref_px = (data2.get("bar") or {}).get("close") or 0
+        dist = abs(risk_ref_px - stop_px) if risk_ref_px > 0 else 0
+        if dist <= 0:
+            raise HTTPException(400, "风险距离无效（现价/止损缺失），拒绝下单")
+        equity = _equity_cache.get("equity") or 0
+        risk_budget = req.risk_usd or config.RISK_PER_TRADE_USD
+        q_risk = int(risk_budget / dist)
+        q_pct = (int(equity * req.max_position_pct / 100 / limit_px)
+                 if equity > 0 and req.max_position_pct > 0 else q_risk)
+        qty = max(0, min(q_risk, q_pct, config.RISK_MAX_ORDER_QTY))
     if qty == 0:
         equity = await gateway.net_liquidation()
         qty = risk_gate.size_position(limit_px, stop_px, equity)
@@ -1251,18 +3374,25 @@ async def api_place_limit_stop(req: LimitStopOrderRequest) -> dict:
         limit_type=req.limit_type, reason=req.reason,
         risk_usd=req.risk_usd,
         signal_snapshot=_snapshot_for(symbol=req.symbol),
-        reprice_bar_time=reprice_bar_time)
+        reprice_bar_time=reprice_bar_time,
+        breakout_px=breakout_px,
+        max_position_pct=req.max_position_pct,
+        atr_mult=_stop_atr_mult(),   # 下单时全局止损倍数（lot 存续期内口径一致）
+        trader=trader,
+        risk_ref_px=risk_ref_px)
     if lot is None:
         raise HTTPException(400, err)
     record_event("order_placed", lot_id=lot.lot_id, symbol=req.symbol,
                  side=req.side, qty=qty, limit_px=limit_px,
                  stop_px=stop_px, limit_type=req.limit_type,
+                 breakout_px=breakout_px, trader=trader,
                  risk_usd=req.risk_usd, force=req.force, reason=req.reason)
     return {"ok": True, "lot": lot.to_dict()}
 
 
 @app.post("/api/lots/{lot_id}/trail")
-async def api_update_trail(lot_id: str, req: UpdateTrailRequest) -> dict:
+async def api_update_trail(lot_id: str, req: UpdateTrailRequest,
+                           trader: str = Depends(require_trader)) -> dict:
     ok, err = await order_mgr.update_trail(lot_id, req.stop_px)
     if not ok:
         raise HTTPException(400, err)
@@ -1270,7 +3400,8 @@ async def api_update_trail(lot_id: str, req: UpdateTrailRequest) -> dict:
 
 
 @app.post("/api/lots/{lot_id}/cancel")
-async def api_cancel_lot(lot_id: str) -> dict:
+async def api_cancel_lot(lot_id: str,
+                         trader: str = Depends(require_trader)) -> dict:
     ok, err = await order_mgr.cancel_lot(lot_id)
     record_event("order_cancelled" if ok else "order_cancel_failed",
                  lot_id=lot_id, error=(err if not ok else ""))
@@ -1280,7 +3411,8 @@ async def api_cancel_lot(lot_id: str) -> dict:
 
 
 @app.post("/api/lots/{lot_id}/close")
-async def api_close_lot(lot_id: str) -> dict:
+async def api_close_lot(lot_id: str,
+                        trader: str = Depends(require_trader)) -> dict:
     """提交平仓并进入 CLOSING；实际成交由 close watcher 记录。"""
     ok, err = await order_mgr.close_lot(lot_id)
     record_event("order_close_requested" if ok else "order_close_failed",
@@ -1290,8 +3422,32 @@ async def api_close_lot(lot_id: str) -> dict:
     return {"ok": True}
 
 
+@app.post("/api/lots/{lot_id}/breakeven")
+async def api_breakeven_lot(lot_id: str,
+                            trader: str = Depends(require_trader)) -> dict:
+    """手动保本：止损移到实际成本价（与自动 2R 保本同一逻辑）。"""
+    ok, err = await order_mgr.breakeven(lot_id)
+    record_event("manual_breakeven" if ok else "manual_breakeven_failed",
+                 lot_id=lot_id, error=(err if not ok else ""))
+    if not ok:
+        raise HTTPException(400, err)
+    return {"ok": True}
+
+
+@app.post("/api/lots/{lot_id}/close-half")
+async def api_close_half(lot_id: str, trader: str = Depends(require_trader)) -> dict:
+    """平仓一半：收缩 STOP 保护单到剩余量 + marketable 平一半；lot 保持 ACTIVE。"""
+    ok, err = await order_mgr.close_half(lot_id)
+    record_event("order_close_half" if ok else "order_close_half_failed",
+                 lot_id=lot_id, error=(err if not ok else ""))
+    if not ok:
+        raise HTTPException(400, err)
+    return {"ok": True}
+
+
 @app.post("/api/positions/{symbol}/close")
-async def api_close_position(symbol: str) -> dict:
+async def api_close_position(symbol: str,
+                             trader: str = Depends(require_trader)) -> dict:
     """按 symbol 处理本工具 lot；外部持仓仅由外部清理循环处理。"""
     ticker = symbol.split(":")[-1]
     lots = order_mgr.list_lots(active_only=True, symbol=symbol)
@@ -1326,7 +3482,7 @@ async def api_close_position(symbol: str) -> dict:
 
 @app.post("/api/refresh")
 async def api_refresh() -> dict:
-    await order_mgr.refresh_marks()
+    _refresh_marks_from_tv()   # mark 价一律用 TV（不用 TWS 行情）
     return await build_snapshot()
 
 
@@ -1370,3 +3526,132 @@ async def _no_cache_static(request, call_next):
     if request.url.path.startswith("/static"):
         response.headers["Cache-Control"] = "no-cache"
     return response
+
+
+# ---------------------------------------------------------------------------
+# 盘前新闻摘要（engine/news_digest.py：RSS 采集 + LLM 主题归纳 + 自选股热点）
+# 每天 07:30 ET 自动生成一次；手动刷新冷却 10 分钟。独立 startup 注册，
+# 不侵入既有函数体。
+# ---------------------------------------------------------------------------
+import datetime as _dt
+from zoneinfo import ZoneInfo as _ZoneInfo
+
+_ZI_ET = _ZoneInfo("America/New_York")
+
+_news_task: Optional[asyncio.Task] = None
+_news_cache: dict = {}              # ET 日期串(YYYYMMDD) -> payload（含落盘文件懒加载）
+_news_last_manual: float = 0.0      # 手动刷新冷却起点
+NEWS_REFRESH_COOLDOWN_S = 600       # 手动刷新冷却 10 分钟
+NEWS_AUTO_HM = 7 * 60 + 30          # 自动生成时刻 07:30 ET
+
+
+def _news_tickers() -> List[str]:
+    """watchlist 去重 ticker（剔除期货/CFD 前缀——个股新闻查股票）。"""
+    return sorted({s.split(":")[-1] for s in config.WATCHLIST
+                   if not s.startswith(("BLACKBULL:", "CAPITALCOM:"))})
+
+
+def _news_today() -> Optional[dict]:
+    """今日（ET）摘要：内存缓存优先，未命中懒加载落盘文件并缓存。"""
+    day = _dt.datetime.now(_ZI_ET).strftime("%Y%m%d")
+    if day not in _news_cache:
+        _news_cache[day] = news_digest.load_digest(day)
+    return _news_cache[day]
+
+
+def _news_status() -> dict:
+    """快照 status.news 小摘要：徽标联动只需要 hot 的 ticker→gist。"""
+    p = _news_today()
+    if not p:
+        return {"generated_at": None, "theme_count": 0, "hot_count": 0,
+                "hot": {}}
+    summary = p.get("summary") or {}
+    hot = {k: (v.get("gist") or "") if isinstance(v, dict) else ""
+           for k, v in (summary.get("hot_symbols") or {}).items()}
+    themes = summary.get("themes") or []
+    return {"generated_at": p.get("generated_at"),
+            "generated_at_et": p.get("generated_at_et"),
+            "theme_count": len(themes), "hot_count": len(hot),
+            "hot": hot, "degraded": summary == {} and not p.get("summary")}
+
+
+async def _news_generate(reason: str) -> Optional[dict]:
+    """在线程池跑完整采集+摘要（阻塞 IO 不进事件循环），落盘并更新缓存。"""
+    tickers = _news_tickers()
+    try:
+        payload = await asyncio.to_thread(news_digest.generate, tickers)
+        await asyncio.to_thread(news_digest.save_digest, payload)
+    except Exception as e:
+        logger.exception("盘前新闻生成失败（%s）: %s", reason, e)
+        record_event("news_digest_failed", reason=reason, error=str(e))
+        return None
+    day = _dt.datetime.fromtimestamp(payload["generated_at"],
+                                     _ZI_ET).strftime("%Y%m%d")
+    _news_cache[day] = payload
+    summary = payload.get("summary") or {}
+    meta = payload.get("summary_meta") or {}
+    logger.warning("盘前新闻已生成（%s）：主题 %d 热点 %d，LLM=%s，耗时 %ss",
+                   reason, len(summary.get("themes") or []),
+                   len(summary.get("hot_symbols") or {}),
+                   meta.get("model") or "降级", payload.get("elapsed_s"))
+    record_event("news_digest", reason=reason,
+                 generated_at=payload["generated_at"],
+                 theme_count=len(summary.get("themes") or []),
+                 hot_count=len(summary.get("hot_symbols") or {}),
+                 hot=sorted((summary.get("hot_symbols") or {}).keys()),
+                 model=meta.get("model"), degraded=not payload.get("summary"),
+                 elapsed_s=payload.get("elapsed_s"))
+    return payload
+
+
+async def _news_loop() -> None:
+    """盘前新闻自动生成（每 60s 检查）：07:30 ET 后当天无摘要 → 生成一次。"""
+    while True:
+        await asyncio.sleep(60.0)
+        try:
+            now = _dt.datetime.now(_ZI_ET)
+            if now.hour * 60 + now.minute < NEWS_AUTO_HM:
+                continue
+            if _news_today() is not None:
+                continue
+            await _news_generate("auto_0730")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("盘前新闻循环异常: %s", e)
+
+
+@app.on_event("startup")
+async def _news_startup() -> None:
+    global _news_task
+    _news_task = asyncio.create_task(_news_loop())
+
+
+@app.on_event("shutdown")
+async def _news_shutdown() -> None:
+    if _news_task:
+        _news_task.cancel()
+
+
+@app.get("/api/news")
+async def api_news() -> dict:
+    """今日盘前新闻摘要；无数据返回空态。"""
+    payload = _news_today()
+    if not payload:
+        return {"empty": True}
+    return payload
+
+
+@app.post("/api/news/refresh")
+async def api_news_refresh(trader: str = Depends(require_trader)) -> dict:
+    """手动刷新（冷却 10 分钟，全客户端共享）。"""
+    global _news_last_manual
+    wait = NEWS_REFRESH_COOLDOWN_S - (time.time() - _news_last_manual)
+    if wait > 0:
+        raise HTTPException(429, f"刷新冷却中，{int(wait)}s 后再试")
+    _news_last_manual = time.time()
+    payload = await _news_generate(f"manual_by_{trader}")
+    if payload is None:
+        raise HTTPException(500, "生成失败（详见日志）")
+    return {"ok": True, "generated_at": payload["generated_at"],
+            "generated_at_et": payload["generated_at_et"]}

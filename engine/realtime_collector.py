@@ -10,9 +10,10 @@ TradingView 实时订阅采集器 (RealtimeCollector)
 数据流：
     node tv_cloud_daemon.js --symbols ...（常驻，每 1s 输出 tick）
       -> Python asyncio subprocess stdout 逐行解析
-        -> self._snapshot: {symbol: {bar, bar_c, ts, ts_c}}
+        -> self._snapshot: {symbol: {bar, bar_c, bar_c2, ts, ts_c, fvg, fvg_c}}
 
-5M K线 + trend_state 单指标（ts=实时值，ts_c=上一根已收盘确认值）。
+5M K线 + trend_state / FVG 指标（ts/fvg=实时值，ts_c/fvg_c=上一根已收盘确认值；
+bar_c=上一根已收盘，bar_c2=上上根已收盘，回踩单定价基准）。
 """
 
 import asyncio
@@ -36,6 +37,7 @@ class RealtimeCollector:
         self.symbols = [s.strip() for s in symbols if s.strip()]
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._reader_task: Optional[asyncio.Task] = None
+        self._drain_task: Optional[asyncio.Task] = None
         self._watchdog_task: Optional[asyncio.Task] = None
         self._snapshot: Dict[str, dict] = {}
         self._last_update: float = 0.0
@@ -53,14 +55,35 @@ class RealtimeCollector:
         self._watchdog_task = asyncio.create_task(self._watchdog_loop())
 
     async def _launch(self) -> None:
-        """启动 daemon 子进程。"""
+        """启动 daemon 子进程，并起 stderr 排空任务（每次 launch 一个，
+        随进程 EOF 自然结束，不泄漏累积）。"""
         self._proc = await asyncio.create_subprocess_exec(
             "node", str(TV_DAEMON_JS), "--symbols", ",".join(self.symbols),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(SERVICE_DIR),
+            # tick JSON 单行 = 全部标的快照，54 标的实测 71KB > asyncio 默认
+            # 64KB 流上限（readline 抛 ValueError 静默断流）；放宽到 4MB
+            limit=4 * 1024 * 1024,
         )
         logger.info("TV 订阅采集器启动: %d 个标的", len(self.symbols))
+        self._drain_task = asyncio.create_task(self._stderr_drain(self._proc))
+
+    async def _stderr_drain(self, proc: asyncio.subprocess.Process) -> None:
+        """逐行排空 daemon stderr 写日志（[tv_cloud] 前缀，warning 级别）。
+        stderr 接了 PIPE 却从不读取，daemon 的 console.error 写满 64KB
+        管道缓冲后会永久阻塞（实测死锁）；进程退出 EOF 后本任务自然结束。"""
+        assert proc.stderr
+        while True:
+            try:
+                line = await proc.stderr.readline()
+            except (asyncio.CancelledError, Exception):
+                break
+            if not line:
+                break
+            msg = line.decode("utf-8", "replace").rstrip()
+            if msg:
+                logger.warning("[tv_cloud] %s", msg)
 
     async def _reader_loop(self) -> None:
         """逐行读取 daemon 输出，更新快照；daemon 退出则本循环自然结束。"""
@@ -68,7 +91,11 @@ class RealtimeCollector:
         while True:
             try:
                 line = await self._proc.stdout.readline()
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # 读流异常（如超长行）不再静默断流：记日志后退出，交 watchdog
+                logger.exception("daemon stdout 读取异常，采集循环退出: %s", e)
                 break
             if not line:
                 # daemon 退出（stdout EOF），交给 watchdog 重启
@@ -115,7 +142,7 @@ class RealtimeCollector:
                 logger.warning("daemon 重启失败（5s 后重试）: %s", e)
 
     def latest(self) -> Dict[str, dict]:
-        """返回最新快照 {symbol: {bar, bar_c, ts, ts_c}}。"""
+        """返回最新快照 {symbol: {bar, bar_c, bar_c2, ts, ts_c, fvg, fvg_c}}。"""
         return self._snapshot
 
     def age(self) -> float:
@@ -137,6 +164,9 @@ class RealtimeCollector:
         if self._reader_task:
             self._reader_task.cancel()
             self._reader_task = None
+        if self._drain_task:
+            self._drain_task.cancel()
+            self._drain_task = None
         if self._proc and self._proc.returncode is None:
             self._proc.terminate()
             try:

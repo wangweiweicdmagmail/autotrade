@@ -10,9 +10,12 @@
 1. 以损定量：qty = RISK_PER_TRADE_USD / (entry - stop)，再被
    RISK_MAX_ORDER_QTY 封顶；
 2. 同时持仓数 <= RISK_MAX_OPEN_POSITIONS；
-3. 日亏损熔断：当日累计盈亏 <= -RISK_DAILY_LOSS_LIMIT_USD 后，
+3. 总风险敞口预算：全部开放 lot 剩余风险（PENDING 全额计划风险，
+   已成交按止损到成本的不利距离，保本后归 0）+ 本笔计划风险
+   > RISK_MAX_TOTAL_RISK_USD 时拦截（0 = 不限制）；
+4. 日亏损熔断：当日累计盈亏 <= -RISK_DAILY_LOSS_LIMIT_USD 后，
    当日不再开新仓（halt 状态落盘 logs/halt-YYYYMMDD，重启不丢）；
-4. 止损价合法性：多仓 stop < entry、空仓 stop > entry，且距离 > 0。
+5. 止损价合法性：多仓 stop < entry、空仓 stop > entry，且距离 > 0。
 
 参考 nautilus_ibkr_helloworld 的分层风控（时段/熔断/冷却/以损定量），
 v1 先实现硬性限额，冷却/相关组等后续补。
@@ -37,6 +40,7 @@ class RiskConfig:
     per_trade_usd: float = 200.0      # 净值未知时的降级固定额
     max_order_qty: int = 200
     max_open_positions: int = 3
+    max_total_risk_usd: float = 1500.0  # 总风险敞口预算（0 = 不限制）
     daily_loss_limit_usd: float = 1000.0
     daily_loss_halt_enabled: bool = False  # 日亏损熔断开关（默认关闭）
 
@@ -74,12 +78,18 @@ class RiskGate:
                         stop: float, qty: int,
                         open_positions: int,
                         daily_pnl: Optional[float] = None,
-                        risk_usd: float = 0) -> Tuple[bool, str]:
+                        risk_usd: float = 0,
+                        open_risk_usd: float = 0,
+                        risk_ref_px: float = 0) -> Tuple[bool, str]:
         """
         返回 (是否放行, 原因)。daily_pnl 为当日累计盈亏（实时+已实现），
         由调用方从 IBKR 账户摘要取得；None = 取不到（FA 口径未解决时），
         熔断检查跳过但每次显式告警（不静默失效）。
-        risk_usd 为设定风险金额：实际风险（qty×|entry−stop|）超出其 10% 则拦截。
+        risk_usd 为设定风险金额：实际风险（qty×|ref−stop|）超出其 10% 则拦截。
+        ref = risk_ref_px（>0 时，预期成交价）或 entry；marketable 单的溢价
+        限价只做成交保护，不进风险口径（BA 实锤：0.5% 溢价≈止损距离被误计）。
+        open_risk_usd 为现有全部开放 lot 的总风险敞口（OrderManager.risk_exposure），
+        与本笔计划风险相加超过 max_total_risk_usd 预算时拦截（0 = 不限制）。
         """
         if self.is_halted():
             return False, "日亏损熔断中，今日不再开新仓"
@@ -87,9 +97,10 @@ class RiskGate:
             if daily_pnl <= -self.cfg.daily_loss_limit_usd:
                 self.halt(f"daily_pnl={daily_pnl:.2f} 触发熔断")
                 return False, f"日亏损 {daily_pnl:.2f} 达到熔断线，已熔断"
-        if open_positions >= self.cfg.max_open_positions:
+        if self.cfg.max_open_positions > 0 \
+                and open_positions >= self.cfg.max_open_positions:
             return False, (f"持仓数 {open_positions} 达到上限 "
-                           f"{self.cfg.max_open_positions}")
+                           f"{self.cfg.max_open_positions}")   # 0 = 不限制
         if qty <= 0:
             return False, "qty <= 0"
         if stop <= 0 or entry <= 0:
@@ -101,11 +112,19 @@ class RiskGate:
         if side == "short" and not stop > entry:
             return False, f"空仓止损 {stop} 必须高于入场 {entry}"
         # 风险偏差容差：实际风险 ≤ 设定风险 × 1.10（允许 10% 上浮）
+        ref = risk_ref_px if risk_ref_px > 0 else entry
         if risk_usd and risk_usd > 0:
-            actual = qty * abs(entry - stop)
+            actual = qty * abs(ref - stop)
             if actual > risk_usd * 1.10:
                 return False, (f"实际风险 {actual:.2f} 超出设定风险 "
                                f"{risk_usd:.2f} 的 10% 容差")
+        # 总风险敞口预算：现有敞口 + 本笔计划风险 ≤ 预算（0 = 不限制）
+        if self.cfg.max_total_risk_usd > 0:
+            planned = qty * abs(ref - stop)
+            if open_risk_usd + planned > self.cfg.max_total_risk_usd:
+                return False, (f"总风险敞口 {open_risk_usd:.0f}+{planned:.0f}="
+                               f"{open_risk_usd + planned:.0f} 超预算 "
+                               f"{self.cfg.max_total_risk_usd:.0f}")
         return True, "ok"
 
     # ------------------------------------------------------------------

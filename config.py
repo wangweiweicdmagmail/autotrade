@@ -51,59 +51,60 @@ COLLECT_TIMEOUT = 15.0
 # 后台监控的股票池 = 用户的 TradingView 自选列表（2026-10-09 从图表 CDP 同步）
 # 同步脚本：service/sync_watchlist.py（从 TV 图表右侧自选表读取并写回本列表）
 WATCHLIST: List[str] = [
-    "NASDAQ:NBIS",
+    "NASDAQ:CRWD",
     "NASDAQ:PANW",
-    "NASDAQ:SMCI",
-    "NASDAQ:SKHY",
-    "NASDAQ:SNDK",
-    "NASDAQ:MSTR",
-    "NASDAQ:ARM",
-    "NASDAQ:MU",
-    "NASDAQ:MRVL",
-    "NYSE:BE",
-    "NASDAQ:AVGO",
-    "NASDAQ:SPCX",
-    "NASDAQ:APP",
-    "NASDAQ:QCOM",
-    "NASDAQ:COIN",
     "BLACKBULL:WTI",
-    "NYSE:CRCL",
-    "NASDAQ:HOOD",
+    "NASDAQ:SKHY",
+    "NYSE:SNOW",
+    "NASDAQ:MU",
+    "NASDAQ:SPCX",
+    "NASDAQ:MRVL",
+    "NASDAQ:AMD",
+    "NASDAQ:QCOM",
+    "NASDAQ:INTC",
+    "NYSE:TSM",
+    "NYSE:DELL",
+    "NYSE:NOW",
+    "NASDAQ:MSFT",
+    "NASDAQ:ASML",
+    "NASDAQ:SMH",
+    "NYSE:BA",
+    "NYSE:ORCL",
+    "NASDAQ:MSTR",
+    "CAPITALCOM:NAS100",
+    "NASDAQ:ARM",
+    "NASDAQ:QQQ",
+    "OTC:RBLK",
+    "NASDAQ:AVGO",
+    "NASDAQ:AAPL",
+    "NASDAQ:PLTR",
+    "NASDAQ:NVDA",
+    "NASDAQ:NBIS",
+    "CAPITALCOM:SPX500",
+    "AMEX:SPY",
     "NASDAQ:TSLA",
+    "AMEX:XLU",
+    "AMEX:XLB",
+    "NASDAQ:AMZN",
+    "NASDAQ:GOOGL",
+    "NASDAQ:META",
+    "AMEX:XLV",
     "NASDAQ:WMT",
+    "NYSE:CRCL",
+    "NASDAQ:APP",
+    "NASDAQ:SNDK",
+    "NYSE:UNH",
+    "NASDAQ:HOOD",
+    "NASDAQ:NFLX",
+    "NYSE:BABA",
+    "AMEX:XLP",
     "NASDAQ:MRNA",
     "NASDAQ:CRWV",
-    "NYSE:SNOW",
-    "NASDAQ:PLTR",
-    "NYSE:NOW",
-    "NASDAQ:AMD",
-    "NASDAQ:INTC",
-    "NASDAQ:NFLX",
-    "NYSE:DELL",
-    "NYSE:ORCL",
+    "NASDAQ:SMCI",
     "NASDAQ:ADBE",
-    "NASDAQ:META",
-    "NYSE:UNH",
-    "NYSE:TSM",
-    "NASDAQ:SMH",
-    "NASDAQ:GOOGL",
-    "NASDAQ:QQQ",
-    "NASDAQ:MSFT",
-    "CAPITALCOM:NAS100",
-    "NASDAQ:AMZN",
-    "OTC:RBLK",
     "NYSE:UBER",
-    "AMEX:SPY",
-    "CAPITALCOM:SPX500",
-    "NYSE:BABA",
-    "AMEX:XLV",
-    "NASDAQ:NVDA",
-    "NASDAQ:AAPL",
-    "NASDAQ:ASML",
-    "AMEX:XLP",
-    "NYSE:BA",
-    "AMEX:XLB",
-    "AMEX:XLU"
+    "NASDAQ:COIN",
+    "NYSE:BE"
 ]
 
 # 八宫格布局参数（对齐 Premium 套餐每标签页 8 图上限）
@@ -218,16 +219,43 @@ EXECUTION_ENABLED = _os.environ.get("EXECUTION_ENABLED", "0") == "1"
 RISK_PER_TRADE_PCT = 0.001        # 0.1% 账户净值
 RISK_PER_TRADE_USD = 200.0        # 净值未知时的降级固定风险额
 RISK_MAX_ORDER_QTY = 100000       # 单笔最大股数硬顶（仅极端兜底，不再干扰以损定量）
-RISK_MAX_OPEN_POSITIONS = 3       # 最大同时持仓数
+RISK_MAX_OPEN_POSITIONS = 0       # 最大同时持仓数；0 = 不限制（2026-10-22 用户要求取消三笔上限）
+# 总风险敞口预算：全部开放 lot 的剩余风险（PENDING 全额计划风险 /
+# 已成交按「当前止损到成本的不利距离」，保本后归 0）合计超过该预算即拦截新开仓；
+# 0 = 不限制
+RISK_MAX_TOTAL_RISK_USD = float(_os.environ.get("RISK_MAX_TOTAL_RISK_USD", "3000"))  # 2026-10-23 由 2000 调为 3000
 RISK_DAILY_LOSS_LIMIT_USD = 1000.0  # 日亏损熔断（SOD 净值锚点口径）
 ALLOW_SHORT = True                # 是否允许做空（2026-10-17 起双向交易：
                                   # 方向 = trend_state/ST 方向，无反向订单）
+
+CLIENT_TOKEN_TTL_HOURS = 10       # 客户端 token 有效期（小时，自 master 审批时刻起算；
+                                  # 过期后须重新登记并重新审批，2026-10-22 起）
+
+# 延迟行情标的黑名单（无 IBKR 实时行情订阅时报 10089）：默认空——
+# v2026-10-24 用户定稿「全部数据走 TV」，价格不再依赖 TWS 行情权限，
+# 原黑名单（SMH,PANW）系 API 延时误判，已撤销；机制保留备用。
+TRADE_BLOCKLIST = [s.strip().upper() for s in _os.environ.get(
+    "TRADE_BLOCKLIST", "").split(",") if s.strip()]
+
+# 严格市价成交：market/chase 单用裸 MARKET（父）+ STP（子）括号单
+# （延迟行情标的已在 TRADE_BLOCKLIST 屏蔽，10349 拒单前提不存在；2026-10-24 用户定稿）
+MARKET_ORDER_STRICT = _os.environ.get("MARKET_ORDER_STRICT", "1") == "1"
 ENTRY_LIMIT_PREMIUM_PCT = 0.5     # marketable 限价溢价（平仓单用）
                                   # （延迟行情下 IBKR 拒 bare MARKET，error 10349）
+# 追价允许的最大「现价-FVG边沿」距离（ATR 倍数）；现价偏离 FVG 边沿
+# 超过该倍数 × ATR 时拒绝追价（limit_type="chase" 服务端校验）
+FVG_CHASE_MAX_ATR_RATIO = float(_os.environ.get("FVG_CHASE_MAX_ATR_RATIO", "0.5"))
+
+# 全局止损 ATR 倍数：止损 = 锚定价 ∓ N×ATR（中点/市价/追价单及
+# trend_pullback 策略进场统一口径；回踩单用 bar_c2 极值不走 ATR）。
+# 此处为启动默认值；运行时经 POST /api/settings 修改并持久化到
+# logs/settings.json（重启后保持，settings.json 优先于本默认值）
+STOP_ATR_MULT = float(_os.environ.get("STOP_ATR_MULT", "1.0"))
 
 # ⚠️ 已废弃（2026-10-17）：TRAIL 跟踪止损路径已删除，止损统一为
-#    STP 固定止损子单，触发价 = 限价 ∓ 1×ATR（trend_state 的 Atr_Value）。
-#    以下两个配置仅被旧 main.py 提案卡链路引用，控制台链路不再使用。
+#    STP 固定止损子单，触发价 = 限价 ∓ STOP_ATR_MULT×ATR（trend_state 的
+#    Atr_Value，默认 1×）。以下两个配置仅被旧 main.py 提案卡链路引用，
+#    控制台链路不再使用。
 TRAIL_ATR_MULT = 2.0
 TP_RR = 0.0
 
@@ -245,10 +273,18 @@ AUTO_CLOSE_ON_ST_FLIP = True
 STOP_GUARD_ENABLED = True
 
 # 外部订单清理：号段外且不在旧工具白名单的挂单撤销、持仓平仓（默认按用户要求开启）
+# 外部订单/持仓处理：1=自动撤挂单+市价平残余持仓（默认，2026-10-23 用户恢复：
+# 非 autotrade 工具下单的仓位立即市价平仓）；0=告警模式（只检测+弹框提醒不动作）
 EXTERNAL_ORDER_CLEANUP_ENABLED = _os.environ.get("EXTERNAL_ORDER_CLEANUP_ENABLED", "1") == "1"
 
 # 全自动策略：单引擎并行实例上限（理论无上限，实际最多 5 个）
 AUTO_MAX_INSTANCES = 5
+
+# 未快速突破提醒：开仓后超过该秒数仍未保本 → 语音提醒「是否减仓」（默认 15 分钟）
+SLOW_BREAK_SECONDS = 900
+
+# 自动保本：ACTIVE 持仓浮盈 ≥ 该 R 倍数 → 自动把止损移到入场成本（默认 2R，1:2）
+AUTO_BREAKEVEN_R = 2.0
 
 
 def validate_config() -> None:

@@ -1,6 +1,7 @@
 # autotrade 交易控制台 — 详细设计文档
 
-> 版本：2026-10-18 更新（5M trend_state + ST 延续/推进指标 + 开仓候选人工确认 + 中点限价单）
+> 版本：2026-10-21 更新（回踩单 retest + 股数跟随改价、OCA 竞态成交真相根治、幻影守卫、FVG 监控器 + 通报阈值 + 3 分钟倒计时）
+> 历史版本：2026-10-20（FVG Finder+ 第二订阅指标：快照 fvg/fvg_c + 策略 FVG 入场线/过滤 + 选股 FVG 维度）
 > 覆盖范围：TradingView 数据订阅 → 指标计算 → 下单执行 → 仓位管理 → 前端控制台的全链路设计。
 > 配套文档：`PLAYBOOK.md`（交易规则）、`STRATEGY_RULES.md`（策略 v1）、`PROJECT_NOTES.md`（历史交接）。
 
@@ -70,7 +71,7 @@ TradingView 云端 WS
    ▼
 tv_cloud_daemon.js（常驻 Node 进程）
    │  每标的 1 个 5M session，session='extended'
-   │  只订阅 1 个 Study：trend_state（K线 + 指标同 session）
+   │  订阅 2 个 Study：trend_state + FVG Finder+（K线 + 指标同 session）
    │  内存维护 state，setInterval 1s 节流输出 JSON 行 + 30s 心跳
    ▼  stdout（每行一个 JSON）
 realtime_collector.py（Python asyncio subprocess）
@@ -95,6 +96,7 @@ Vue3 前端（宫格 + tab，实时计算限价/股数/金额/资金占比）
   "NASDAQ:SKHY": {
     "bar": { "time": ..., "open": ..., "high": ..., "low": ..., "close": ..., "volume": ... },  // 实时 5M K 线（未收盘）
     "bar_c": { "time": ..., "open": ..., "high": ..., "low": ..., "close": ..., "volume": ... }, // 上一根已收盘 K 线（稳定）
+    "bar_c2": { "time": ..., "open": ..., "high": ..., "low": ..., "close": ..., "volume": ... }, // 上上根已收盘 K 线（回踩单定价基准）
     "ts": {                            // 实时值（periods[0]，盘中抖动，仅显示用）
       "trend_state": 1,                // 1 单边多头 / -1 单边空头 / 0 震荡
       "direction": 1,                  // ST 方向：Up_Trend 有效=1 / Down_Trend 有效=-1 / 都无=0
@@ -106,7 +108,16 @@ Vue3 前端（宫格 + tab，实时计算限价/股数/金额/资金占比）
       "st_duration_bars": 12,          // 当前 ST 方向已延续的 5M bar 数（翻向当根为 0）
       "st_push_count": 8               // 当前方向内 ST 线有利推进累计次数（翻向清零）
     },
-    "ts_c": { ... 同上，但是上一根已收盘的「确认值」（periods[1]）... }  // 策略判断/下单全用这套，稳定不抖
+    "ts_c": { ... 同上，但是上一根已收盘的「确认值」（periods[1]）... },  // 策略判断/下单全用这套，稳定不抖
+    "fvg": {                           // FVG Finder+ 实时值（periods[0]，仅显示用）
+      "time": 1792531800,              // 该值所属 bar 的时间戳（与 bar_c.time 对齐校验用）
+      "fvg_cum_count": 3,              // ST 同向 FVG 累积计数（ST 转向清零）
+      "fvg_last_top": 263.35,          // 最后一个 FVG 上沿
+      "fvg_last_bottom": 263.23,       // 最后一个 FVG 下沿
+      "fvg_event": 0,                  // 当根 FVG 信号：1 需求区 / -1 供应区 / 0 无
+      "fvg_last_dir": 1                // 最后一个 FVG 的方向（daemon 扫历史最后非零 fvg_event 推导；窗口内无 FVG 为 null）
+    },
+    "fvg_c": { ... 同上，确认值（periods[1]），策略/选股用 ... }
   }
 }
 ```
@@ -115,7 +126,9 @@ Vue3 前端（宫格 + tab，实时计算限价/股数/金额/资金占比）
 
 | 指标 | 脚本 ID | 周期 | 用途 |
 |---|---|---|---|
-| `trend_state` | `USER;e577100fe79942b4830783d1ceaad535` | 5M（extended，range=200） | **唯一订阅指标**：趋势状态过滤 + 回踩入场线 + 方向 + 止损 ATR 全部来自它 |
+| `trend_state` | `USER;e577100fe79942b4830783d1ceaad535` | 5M（extended，range=200） | 趋势状态过滤 + 回踩入场线 + 方向 + 止损 ATR |
+| `fvg_finder` | `USER;5ec7d04179b3429ca9286db452352d85` | 5M（同 session 第二 Study） | FVG 累积计数 + 最后 FVG 上下沿/方向 + 当根信号；策略 FVG 入场线/过滤 + 选股维度 |
+| `smart_stop` | `USER;ca26e3ab587841e2adb38cfbfd0bec41` | 5M（同 session 第三 Study） | **智能止损价**（源码 smart_stop.pine）：结构止损（3 根极值）+ ATR 钳制（默认 1~2×ATR，指标面板可调）；plot `Smart_Stop_Long`/`Smart_Stop_Short` → ts/ts_c 的 `smart_stop_long`/`smart_stop_short` |
 
 plot 映射（订阅字段名，空格转下划线）：
 
@@ -131,6 +144,18 @@ plot 映射（订阅字段名，空格转下划线）：
 | `ST_Push_Count` | `st_push_count` | 当前方向内 ST 线有利推进累计次数，翻向清零 |
 | `Body_Middle` | — | 中线（plot 输出之一，当前快照未使用） |
 
+FVG Finder+ plot 映射（⚠️ 该指标 plot 标题为中文，WS 订阅键名 = 原标题剥离非 ASCII 字符 + 重名加后缀，**在 TV 上改 plot 标题会让键名静默变化、字段全部变 null**）：
+
+| 实际键名 | 原标题 | 快照字段 | 说明 |
+|---|---|---|---|
+| `STFVG` | ST同向FVG累积计数 | `fvg_cum_count` | 与当前 ST 方向同向的 FVG 累积（转向清零） |
+| `FVG` | 最后FVG上沿 | `fvg_last_top` | 最后一个 FVG 上沿 |
+| `FVG_2` | 最后FVG下沿 | `fvg_last_bottom` | 最后一个 FVG 下沿 |
+| `KFVG110` | 当前K线FVG信号（1涨/-1跌/0无） | `fvg_event` | 当根信号：1 需求区 / -1 供应区 / 0 无 |
+| —（daemon 推导） | — | `fvg_last_dir` | 最后 FVG 方向 = 历史中最后非零 fvg_event；200 根窗口内无 FVG 为 null |
+
+（保存版另有 plot_4/5 `_FVG_`/`_FVG__2`，忽略不用。）
+
 指标内部参数（Pine 里，所见即所得）：emafast=EMA20、emaslow=EMA100、SuperTrend(10,3)、channelEdge=ST±1×ATR；trendState 要求 ST 方向 + close/fast/slow 排列 + EMA 差值 > 1×ATR（回看 6 根）。控制端零逻辑，只读 plot 值。
 
 **ST 推进定义**：多头仅本根 ST 线值高于上一根才累计一次，空头仅低于上一根才累计；ST 不变不计，方向翻向时清零。两个 ST 延续字段只用于选股/候选的人工比较，不参与进出场、止损或排序过滤。远程私有指标未同步新 plot 时字段为 null，界面显示「—」，不能当成 0。
@@ -139,17 +164,30 @@ plot 映射（订阅字段名，空格转下划线）：
 
 ## 5. 事件流程
 
-### 5.1 下单流（三种限价单 + STP 子单）
+### 5.1 下单流（五种限价单 + STP 子单）
 
 ```
-宫格三个 tab：EMA快线（ema_fast）/ 通道边沿（channel_edge）/
-             中点限价单（midpoint=(bar_c.high+bar_c.low)/2）
+宫格五个 tab：EMA快线（ema_fast）/ 通道边沿（channel_edge）/
+             中点限价单（midpoint=(bar_c.high+bar_c.low)/2，OCA 双腿）/
+             回踩限价单（retest=bar_c2 极值）/ 市价单（market）
 前端点「下单」（按钮按 trend_state 方向显示 买入/卖出，震荡禁用）
 → POST /api/lots/limit-stop {symbol, side, qty, limit_px, stop_px, limit_type}
 → 【下单拦截】trend_state 过滤：做多需 ts_c.trend_state==1、做空需 ==-1、
    0（震荡）拒绝；side 必须与 trend_state 同向；force 执意开仓保留
-→ 止损统一 = 限价 ∓ 1×atr（多单减、空单加）
-→ midpoint 由服务端以 bar_c.high/low + ts_c.atr 重新定价，不信任浏览器价格
+→ 止损：ema/channel/midpoint/market/chase = **智能止损（smart_stop 指标，
+  所见即所得）**：止损距离 = 现价 − Smart_Stop_Long（多）/ Smart_Stop_Short − 现价（空），
+  指标内部 = 最近 3 根 K 线极值逻辑止损点钳制在 1×ATR ~ 2×ATR
+  （不太近被波动扫掉、不太远仓位上不去）；指标缺失时控制端按同公式回退计算
+  （上限 = 全局 stop_atr_mult，顶栏可调）。
+  不锚定含 0.5% 溢价的限价（v2026-10-21 修复：溢价 > ATR 时按限价锚定会
+  把止损挂到现价错误一侧，成交瞬间触发，GOOGL/NOW 两单实锤）；
+  **market/chase 的风控与股数口径用预期成交价（现价），溢价不进风险**
+  （v2026-10-23 修复：0.5% 溢价 ≈ 止损距离时被 10% 容差误杀，BA 实锤；
+  服务端以损定量拥有 market/chase 股数，init_entry_px（R 锚）= 现价）；
+  retest = bar_c2 另一端极值（不依赖 ATR）。
+→ midpoint/retest/chase/market 由服务端重新定价，不信任浏览器价格；
+  market/chase 为 marketable 限价（实时 close ×(1±0.5%)，不用裸 MARKET：
+  延迟行情会被券商拒单 error 10349）
 → OrderManager.place_limit_stop_lot()
    → RiskGate.check_new_order()
    → IBKRGateway.place_limit_with_stop()
@@ -159,12 +197,18 @@ plot 映射（订阅字段名，空格转下划线）：
 → 实盘：_watch_entry 轮询成交 → ACTIVE；dry-run：立即虚拟成交 ACTIVE
 ```
 
-**中点限价单的 PENDING 改价**：独立 `_midpoint_limit_reprice_loop` 每秒检查；
-当 `bar_c.time > reprice_bar_time` 时，以刚收盘 bar 的 `(high+low)/2` 和同套
-`ts_c.atr` 重算限价/止损，经 `modify_limit_stop` 以相同 orderId 同时修改
-STP 子单与 LMT 父单。每根 bar 每 lot 最多尝试一次，股数不变；失败保留原
-挂单并记录，下一根 bar 重试。进入 ACTIVE 后不再中点改价，恢复原单向
-止损管理。自动策略开关不影响手动中点单改价。
+**回踩限价单（retest，v2026-10-21）**：逻辑来自 FVG 定义——上上根 K 线的
+高点（多头）/低点（空头）大概率被回踩，不回踩即形成 gap。挂限价单在该极值
+等回踩成交，止损挂同一根 K 线的另一端极值（逻辑止损位）。PENDING 期间由
+`_retest_limit_reprice_loop` 每根确认 bar 重新定价（bar_c2 随新 bar 滚动），
+且**股数跟随改价**：用 `init_risk_usd` 作固定风险预算按新止损距离重新
+以损定量（部分成交后只改价不改股数；不足 1 股拒绝本次改价保留原单）。
+ACTIVE 后恢复原单向止损管理。事件：`retest_limit_repriced` /
+`retest_limit_reprice_failed`。
+
+**中点限价单（v2026-10-20 起）**：OCA 双腿结构（LMT 中点腿 + STP 突破腿，
+突破上根 K 线高/低点即成交，一成全撤），一次定价不再逐 bar 改价；
+`_midpoint_limit_reprice_loop` 仅作旧式单腿中点单的兼容兜底。
 
 > 止损单只有 **STP** 一种。中点限价单与已删除的旧「收盘价限价单」
 > （close-pending 整套）不同；旧 close-pending 与 TRAIL 路径不恢复。
@@ -176,9 +220,50 @@ STP 子单与 LMT 父单。每根 bar 每 lot 最多尝试一次，股数不变�
 ├── 改止损：update_trail（STP，只向有利方向棘轮，1 美分防抖）
 ├── 平仓：close_lot → CLOSING（记录 close orderId）→ 全部成交后才 CLOSED
 ├── 撤单：cancel_lot → 等券商终态；已成交部分转 ACTIVE，未成交才 CANCELLED
-└── ST 反向自动平仓：_position_scan_loop 只处理本工具 lot；
+├── ST 反向自动平仓：_position_scan_loop 只处理本工具 lot；
     外部持仓由独立清理循环处理，不再按账户净额重复补刀
+└── OCA 竞态修复（v2026-10-21）：终态判定以成交真相（executions）为准
 ```
+
+**中点单 OCA 双腿与成交真相（v2026-10-21 根治）**：中点单 = OCA 组双腿
+（LMT 中点腿 + STP 突破腿，一成全撤）+ LMT 腿下挂 STP 止损子单。突破腿成交
+与 LMT 腿被 OCA 撤单可在同一帧发生，缓存 `orderStatus.filled` 会漏报
+（QCOM/SMCI/BABA/SNOW 四次实锤：lot 误判「无实际成交 CANCELLED」，持仓裸奔）。
+修复两道防线：
+1. `_handle_entry_terminal` 终态判定前先查成交真相
+   （`entry_fills_by_order` 按 entry/breakout orderId 聚合 executions）；
+   有成交即按真相激活（突破腿转为入场腿、双腿双成自动平掉超计划部分、
+   `_restore_protection` 重建保护）；查询失败保持 PENDING 待对账，
+   绝不误判 CANCELLED；
+2. `reconcile` 复活通道：CANCELLED/FAILED 且本地零成交的 lot，若券商仍有
+   同向持仓且本 lot 订单确有成交 → 复活 ACTIVE + 恢复保护（余仓少于成交数
+   说明已被人工减仓，账本对齐余仓），每 lot 只复活一次，事件 `lot_revived`；
+3. PENDING 跨会话收敛（v2026-10-22）：重启后上一进程的已终结订单不在
+   开放快照（trade_map 无句柄）时，查成交真相（executions 跨会话有效）——
+   有成交按真相激活；无成交且订单不可见 = 已终结无成交，收敛 CANCELLED，
+   绝不永远挂 PENDING（NFLX 两单实锤）；查询失败保持 PENDING（fail-closed）。
+
+**幻影守卫（v2026-10-21）**：`breakeven()` / `_restore_protection` 新建
+保护单前强制校验券商侧有足额同向持仓（`_has_broker_position`），防止
+TWS 手动平仓后残留的幻影 ACTIVE lot 挂出真实反向单；快照认回失败进入
+30s 冷却（`protection_find_blocked_until`），自动保本循环每 lot 5s 节流。
+
+**FVG 事件固化对齐（v2026-10-21）**：daemon 的 K线回调与 FVG Study 回调是独立
+通道，跨 1s 推送边界时 fvg_c 可能还是旧 bar 的值。fvg 输出带 `time`（所属 bar
+时间戳），监控循环要求 `fvg_c.time == bar_c.time` 才固化，不齐挂起下拍重试
+（最多 5 拍，耗尽告警放弃——宁可丢事件记日志，不固化错值）。
+
+**保护单无成交终态自动恢复（v2026-10-21）**：保护单被撤/过期且无成交时，
+`_handle_trail_terminal` 置 `protection_restore_needed=True`，下轮 reconcile
+经幻影守卫后自动 `_restore_protection` 补挂——裸仓从「只告警」升级为
+「告警 + 自动恢复」。另：`_activate_from_ground_truth` 补 `_set_targets`
+（复活 lot 的 target_rr 不再为 0）；`close_half` 补保护单句柄守卫；
+突破腿 OCA 撤单滞后时防御性补撤。
+
+**回踩单股数封顶（v2026-10-21）**：下单请求与 OrderLot 新增
+`max_position_pct`（前端顶部「仓位上限%」透传），回踩改价股数除固定风险预算外
+再受净值占比封顶（`qty ≤ equity × pct% ÷ new_limit`），止损距离收窄时名义市值
+不超出下单口径。
 
 **父子单关联语义**：父单（限价）撤销/被拒时，子单（STOP）随 parentId 自动取消——即「平仓时子订单自动取消」。
 
@@ -193,15 +278,16 @@ _stop_guard_loop（每 60s，需 IBKR 已连接）
      + 前端语音/常驻弹窗，每分钟重复直到补齐（只告警，绝不自动补单/撤单）
 ```
 
-### 5.4 外部订单与持仓清理（每 30s）
+### 5.4 外部订单与持仓处理（每 30s）
 
 ```
-_external_cleanup_loop（需 EXTERNAL_ORDER_CLEANUP_ENABLED + 实盘连接）
-   → 同时取得开放订单、持仓和旧工具 ID 白名单；任一快照失败则零写操作
-   → 开放订单：88 号段或旧白名单保留；号段外挂单撤销并等待 Cancelled
-   → 持仓：broker 净仓 − 工具 lot 净仓 = 外部残余
-     → 用 88 号段 + orderRef=external_cleanup 的平仓单平掉并等待全部成交
-   → 清理中的平仓单去重；UNKNOWN/账户无法确认只告警，不误动工具订单
+_external_cleanup_loop
+  ├─ EXTERNAL_ORDER_CLEANUP_ENABLED=1（默认，v2026-10-23 用户恢复）：
+  │    非 autotrade 工具的挂单撤销、残余持仓**立即市价平仓**（88 号段 +
+  │    orderRef=external_cleanup，等待全部成交，去重防重）；
+  │    任一快照失败则零写操作；UNKNOWN/账户无法确认只告警
+  └─ =0：告警模式——只检测 + external_alerts 快照 + 节流事件 +
+       前端常驻弹窗/语音，绝不自动动作（v2026-10-22 曾短暂设为默认）
 ```
 
 ### 5.5 心跳 / 断线流（横切）
@@ -235,8 +321,9 @@ _heartbeat_loop（每 2s）
   两者天然一致，**不存在反向订单**
 
 选股默认按 EMA 发散度 `|ema_fast − ema_slow| / atr` 降序（指标内部同款度量，
-由 plot 值算出）；前端可切换为 ST 持续根数或 ST 推进次数降序，缺失值排最后、
-并列时回退 EMA 发散度。多空两列都展示（多头列 = trend_state==1、空头列 ==-1）。
+由 plot 值算出）；前端可切换为 ST 持续根数、ST 推进次数或 ST 同向 FVG 累积计数
+降序，缺失值排最后、并列时回退 EMA 发散度。多空两列都展示（多头列 = trend_state==1、
+空头列 ==-1），每行同时显示 FVG 方向与累积计数。
 
 ### 6.3 force 执意开仓
 
@@ -261,11 +348,15 @@ _heartbeat_loop（每 2s）
 **daemon 关键逻辑**：
 - 每标的只建 **1 个** `Session.Chart`：5M session（`{timeframe:'5', range:200, session:'extended'}`，
   200 根保证 EMA100 + 回看 6 根的 warmup）；
-- 只挂 **1 个 Study（trend_state）**，默认输入即源码默认
-  （ATR 10 / Factor 3.0 / Channel 1.0 / 回看 6 / 发散 1×ATR），无需 setOption；
+- 挂 **2 个 Study**：trend_state（默认输入即源码默认：ATR 10 / Factor 3.0 /
+  Channel 1.0 / 回看 6 / 发散 1×ATR）+ FVG Finder+（默认输入：过滤器 Off /
+  ST 3.0×10），均无需 setOption，与图表所见即所得；
 - **ts 输出两套**：`ts`（实时，periods[0]，显示用）+ `ts_c`（确认，periods[1]，策略/下单用）；
   `direction`：Up_Trend 有效=1、Down_Trend 有效=-1、都无=0；
   `supertrend` / `channel_edge` 取 Up/Down 两个 plot 中有效者；
+- **fvg 同样两套**：`fvg`（实时，显示用）+ `fvg_c`（确认，策略/选股用）；
+  `fvg_last_dir` 由 daemon 自 study periods 历史向前扫描最后一个非零
+  `fvg_event` 推导（上下沿只在新 FVG 形成时更新，两者天然对应）；
 - `atr == null` 时下单被显式拦截（「ATR 缺失，请检查图表上的 trend_state 指标」），不静默算错。
 
 ### 7.2 引擎层（engine/）
@@ -297,7 +388,7 @@ _heartbeat_loop（每 2s）
 | `connect` / `disconnect` | 连接 + 心跳任务 + 自动重连管理 |
 | `place_limit_with_stop` | **LMT 父 + STP 子**（parentId 关联，显式 orderId） |
 | `place_close` | 反向 marketable LIMIT 平仓（88 号段显式 orderId，支持 orderRef） |
-| `place_stop_only` | 平仓失败/余仓变化后的独立 STP 保护单 |
+| `place_stop_only` | 独立 STP 兜底；先认回原括号子单，确认缺失后才允许使用 |
 | `modify_stop` | 改保护止损触发价（STP 改 auxPrice，券商确认后更新本地） |
 | `modify_stop_qty` | 部分成交后调整 STP 覆盖数量（券商确认） |
 | `modify_limit_stop` | PENDING 中点单逐 bar 改价（同 orderId 修改 STP 子单 + LMT 父单） |
@@ -364,26 +455,48 @@ legacy TRAIL 路径 `POST /api/lots`。）
 
 **下单拦截**（两道闸门）：
 1. `ALLOW_SHORT` 硬闸门保留但默认放开（config 已改 True，开放双向）；
-2. `trend_state` 过滤：做多需 `ts_c.trend_state==1`、做空需 `==-1`、`0` 拒绝，
-   且 side 必须与 trend_state 同向——**可二次确认放行**（force 执意开仓，
-   见 6.3）。
+2. **ST direction 闸门**（现行语义）：做多需 `ts_c.direction == 1`、做空需
+   `== -1`；**震荡（trend_state=0）但 ST 方向正确也放行**；side 必须与
+   ST direction 同向——可二次确认放行（force 执意开仓，见 6.3）。
+   （注：与早期「trend_state==±1 才放行」不同，现行以 direction 为准。）
 
 **事件记录**：`record_event(type, **data)` 追加 `logs/events-YYYYMMDD.jsonl`，覆盖下单/平仓/撤单/失败等所有事件，跨天可回溯。
 
 #### 前端（static/）
 
-- 宫格交易台 + 每格三个 tab：**EMA快线（ema，默认）/ 通道边沿（channel）/
-  中点限价单（midpoint）**；
+- 宫格交易台 + 每格五个 tab：**EMA快线（ema，默认）/ 通道边沿（channel）/
+  中点限价单（midpoint）/ 回踩限价单（retest，限价=bar_c2 极值）/
+  市价单（market，marketable 限价=现价 ±0.5%，止损=限价 ∓1×ATR）**；
   - EMA/通道按 ts 实时值显示；midpoint 预览与后端一致，使用
     `(bar_c.high+bar_c.low)/2` 和 `ts_c.atr`；止损均为 `limit ∓ 1×ATR`，
     方向按钮按 trend_state 显示，震荡禁用；
-- 每格：选股（下拉可搜索）+ 现价大字 + 限价/止损 + 计算（限价/股数/金额/资金占比）+ 下单按钮；
+- 每格：选股（下拉可搜索）+ 现价大字 + 限价/止损 + 计算（限价/股数/金额/资金占比）+
+  FVG 摘要行（方向 + 累积计数 + 上下沿区间）+ 下单按钮；
 - 顶栏：DRY-RUN/LIVE 徽章、单笔风险输入（300）、仓位上限%（10-200%）、TV/IBKR 时钟、更新延时、日盈亏；
-- 底部 tab：**选股 / 自动策略 / 运行日志 / 绩效 / 事件**（「信号」tab 已删除）；
-  - 选股：多头列 / 空头列（双向展示），每行显示发散度、ST 延续根数与 ST 推进次数；
-    可按 EMA 发散度、ST 持续根数或 ST 推进次数降序，宫格默认标的跟随当前排序；
+- 底部 tab：**FVG 监控（默认）/ 选股 / 影子 / 自动策略 / 回测 / 运行日志 / 绩效 / 事件**（「信号」tab 已删除）；
+  - FVG 监控（v2026-10-20 起）：三列——多头 FVG / 空头 FVG / **FVG 回踩（首次）**；
+    事件行含时间、标的、缺口区间、ATR 倍数（缺口高 ÷ 同 bar ATR）、状态
+    （未回踩/回踩中/已回补/已回踩）；槽位无事件显示空占位；15/30/60 分钟窗口；
+    通报 = 常驻通知（方向底色：多绿/空红，3 分钟倒计时自动消失）+ 语音，
+    阈值「通报 ≥ X×ATR」可调（localStorage）；数据时钟每前进一根 bar 播 3s 钟声；
+    **FVG 预警（v2026-10-21）**：指标在第三根 K 线形成过程中实时计算缺口条件
+    （fvg = periods[0] 实时值），监控循环每拍校验 `fvg.time == bar.time` 且
+    `fvg_event == ±1` 即预警一次（每 bar 每方向仅一次，盘中回补翻回 0 不影响，
+    预警本就是提前量）；预警通知为虚线蓝框 + 「形成中」徽标，语音「F V G 预警」，
+    与确认事件（实线框）明确区分，同受 ATR 阈值过滤；事件 `fvg_warn` 落事件流；
+    **FVG 回踩列只报每个 FVG 的第一次回踩**（多：实时 bar.low ≤ 缺口上沿；
+    空：bar.high ≥ 下沿），终身一次、第二次不再报；
+    **FVG 追价一键下单（chase，v2026-10-21）**：事件行在「现价 − 缺口边沿 ≤
+    FVG_CHASE_MAX_ATR_RATIO（默认 0.5）×ATR」时显示「追」按钮 → 确认框 →
+    marketable 限价单（现价 ±0.5% 溢价）+ STP（限价 ∓ 1×ATR），以损定量，
+    服务端按实时价重新定价并二次校验距离（`_fvg_chase_prices`），
+    trend_state 闸门与 force 执意开仓与其他订单一致；
+  - 选股：多头列 / 空头列（双向展示），每行显示发散度、ST 延续根数、ST 推进次数、
+    FVG 方向与累积计数；可按 EMA 发散度、ST 持续根数、ST 推进次数或 FVG 累积
+    降序，宫格默认标的跟随当前排序；
   - 自动策略：启动表单 + 待确认候选列表 + 实例列表；候选并排展示发散度、
-    ST 延续/推进、入场/止损、估算股数/市值/仓位占比，人工点击「确认开仓」或「忽略」；
+    ST 延续/推进、FVG 方向/累积/上下沿、入场/止损、估算股数/市值/仓位占比，
+    人工点击「确认开仓」或「忽略」；
   - 事件：历史事件查询（按类型过滤）；
   - 绩效：已平仓交易统计。
 - 提醒：新开仓候选按 proposal_id 去重，常驻通知 + 汇总语音；保留自动平仓、
@@ -403,7 +516,11 @@ legacy TRAIL 路径 `POST /api/lots`。）
 | qty | int | 目标股数 |
 | entry_px | float | 限价 |
 | stop_px | float | STP 止损价（= 限价 ∓ 1×ATR） |
-| limit_type | str | ema / channel / midpoint / auto_* |
+| init_entry_px | float | 下单时计划限价，R 风险基准；改价/成交后不改变 |
+| init_stop_px | float | 下单时计划止损，R 风险基准；跟踪移动后不改变 |
+| init_risk_usd | float | 下单时计划风险金额 = qty × abs(init_entry_px − init_stop_px) |
+| limit_type | str | ema / channel / midpoint / retest / market / chase / auto_* / adopted |
+| trader | str | 订单归属交易员（master / 交易员名 / auto；v2026-10-22 多人协作） |
 | reprice_bar_time | float | midpoint 最近一次逐 bar 改价尝试时间（用于幂等与重启恢复） |
 | state | str | PENDING / ACTIVE / CLOSING / CANCELLED / FAILED / CLOSED |
 | close_order_id / close_permId | int | 平仓单 ID（88 号段）及券商永久 ID，供 CLOSING 对账恢复 |
@@ -416,7 +533,7 @@ legacy TRAIL 路径 `POST /api/lots`。）
 
 ### 8.3 事件日志（events-*.jsonl）
 
-每行一个 JSON：`{ts, type, ...}`。type：`order_placed / order_close_requested / order_closed / order_cancelled / order_close_failed / order_cancel_failed / position_scan_alert / auto_close_st_flip / missing_stop_alert / midpoint_limit_repriced / midpoint_limit_reprice_failed / external_order_cancelled / external_order_cancel_failed / external_position_closed / external_position_close_failed / external_position_close_pending`。
+每行一个 JSON：`{ts, type, ...}`。type：`order_placed / order_close_requested / order_closed / order_cancelled / order_close_failed / order_cancel_failed / position_scan_alert / auto_close_st_flip / missing_stop_alert / midpoint_limit_repriced / midpoint_limit_reprice_failed / retest_limit_repriced / retest_limit_reprice_failed / lot_revived / auto_breakeven / manual_breakeven / manual_breakeven_failed / external_order_cancelled / external_order_cancel_failed / external_position_closed / external_position_close_failed / external_position_close_pending`。
 
 （已删除事件类型：`pierce_signal / entry_signal / alert_signal / signals_cleared / close_limit_*`。策略引擎另有一组 `auto_*` 事件类型，见 12.5。）
 
@@ -426,18 +543,21 @@ legacy TRAIL 路径 `POST /api/lots`。）
 
 | 决策 | 选择 | 理由 |
 |---|---|---|
+| **价格源** | **全部 TV**（行情/K线/指标/定价/mark/平仓参考价），任何地方不用 TWS 行情数据（v2026-10-24 定稿） | TWS GUI 与 API 行情权限分离（FA 子账户 API 全线 10089 延时），TV 是唯一实时可靠源；`last_price` 已切换 TV provider + 撤销误伤黑名单（SMH/PANW） |
 | 数据语言 | Node.js（数据）/ Python（执行） | 上游库语言绑定 |
 | 周期 | 5 分钟（5M），K 线与指标同周期 | 噪音小（v2026-10-17 由 1M 调整） |
 | 会话 | extended | 24x7 会让美股卡在昨日收盘 |
-| 指标 | 单指标 trend_state（USER;e577100fe79942b4830783d1ceaad535，5M，range=200） | 过滤 + 入场线 + 方向 + ATR 一处算好（原 6 个指标合并） |
+| 指标 | 双指标同 session：trend_state（USER;e577100fe79942b4830783d1ceaad535）+ FVG Finder+（USER;5ec7d04179b3429ca9286db452352d85），5M，range=200 | 过滤 + 入场线 + 方向 + ATR 一处算好（原 6 个指标合并）；FVG 提供累积计数/上下沿/方向 |
 | 确认值 | 策略/下单用 ts_c（periods[1]，上一根已收盘）；实时值 ts 仅显示 | 避免盘中假转向 |
 | 过滤 | trend_state：做多需 ==1、做空需 ==-1、0 拦截；side 与 trend_state 同向 | 所见即所得，控制端零逻辑；下单方向=ST 方向，无反向订单 |
 | 信号提醒 | 无（两级信号 + 信号 tab 已删除） | 过滤器 + 人工下单 |
-| 订单类型 | EMA快线 / 通道边沿 / 中点限价单（midpoint=(bar_c.high+bar_c.low)/2） | 中点单 PENDING 每根 5M bar 同步改 LMT+STP，ACTIVE 后恢复统一管理 |
+| 订单类型 | EMA快线 / 通道边沿 / 中点限价单（midpoint=(bar_c.high+bar_c.low)/2，OCA 双腿）/ 回踩限价单（retest=bar_c2 极值，多:限价=高/止损=低）/ 市价单（market=marketable 限价，现价 ±0.5%）/ FVG追价（chase，距边沿 ≤0.5×ATR 才放行） | 中点单 OCA 一成全撤；回踩单 PENDING 逐 bar 改价 + 股数跟随（固定风险预算）；市价/追价一次定价 |
+| OCA 竞态 | 终态判定以 executions 成交真相为准 + reconcile 复活通道 | 突破腿成交与 LMT 撤单同帧时缓存状态漏报（四次实锤），成交真相是唯一可靠来源 |
+| 幻影守卫 | 新建保护单前校验券商持仓（_has_broker_position）+ 快照认回 30s 冷却 | 防止幻影 lot 挂出真实反向单（AMD 实锤） |
 | 止损 | 限价 ∓ 1×ATR，STP(GTC) 子单（parentId 关联 LMT(DAY) 父单） | 止损单只有 STP 一种；平仓/撤父单时子单自动取消 |
 | 双向交易 | ALLOW_SHORT=True，多空两列选股，空头开仓开放 | 多空都做（v2026-10-17 起） |
 | 强弱排序 | EMA 发散度 \|ema_fast−ema_slow\|/atr | 指标内部同款度量 |
-| 仓位 | 以损定量（risk_usd 最大风险 + maxPositionPct 上限） | 每笔固定风险 + 仓位封顶 |
+| 持仓 | 以损定量（risk_usd 最大风险 + maxPositionPct 上限）+ **总风险敞口预算 1500**（保本敞口归 0 释放额度）；顶栏实时显示总风险敞口与总仓位占比 | 每笔固定风险 + 敞口总量封顶，笔数不限 |
 | 账户口径 | dt_test 组 | 只操作目标组 |
 | 订单所有权 | 新单统一 88 号段，旧单使用本地 ID 白名单 | 号段外挂单/持仓一律清理，避免误动工具订单 |
 | 运行模式 | dry-run 默认，EXECUTION_ENABLED=1 实盘 | 先演练后实盘 |
@@ -458,10 +578,11 @@ legacy TRAIL 路径 `POST /api/lots`。）
 | `EXECUTION_ENABLED` | 0 | 0=dry-run / 1=实盘 |
 | `TOOL_ORDER_ID_BASE/MAX` | 88000000 / 88999999 | 工具订单专用 88 号段；其他系统不得复用 |
 | `TOOL_ORDER_ID_STATE_PATH` | logs/tool_order_id.json | 发号持久化（原子写 + 跨进程锁） |
-| `EXTERNAL_ORDER_CLEANUP_ENABLED` | 1 | 号段外且不在旧工具白名单的挂单撤销、持仓平仓 |
+| `EXTERNAL_ORDER_CLEANUP_ENABLED` | 1 | 1=（默认）号段外挂单撤销、非工具持仓立即市价平仓；0=告警模式只弹框提醒（v2026-10-23 恢复默认开启） |
 | `RISK_PER_TRADE_PCT/USD` | 0.001 / 200 | 以损定量（净值/降级） |
 | `RISK_MAX_ORDER_QTY` | 100000 | 单笔股数硬顶（仅极端兜底） |
-| `RISK_MAX_OPEN_POSITIONS` | 3 | 最大持仓数 |
+| `RISK_MAX_OPEN_POSITIONS` | 0 | 最大持仓数；0 = 不限制（v2026-10-22 取消三笔上限） |
+| `RISK_MAX_TOTAL_RISK_USD` | 3000 | **总风险敞口预算**（0=不限）：Σ 各 open lot 敞口（PENDING=qty×\|入场−止损\|；ACTIVE=filled×max(0,成本∓止损)，**保本归 0**）+ 新单风险 > 预算即拦截；笔数不限，能开几笔由敞口决定（v2026-10-22 引入，v2026-10-23 调整至 3000） |
 | `RISK_DAILY_LOSS_LIMIT_USD` | 1000 | 日亏损熔断（已屏蔽） |
 | `ALLOW_SHORT` | True | 是否允许做空（v2026-10-17 起开放双向） |
 | `ENTRY_LIMIT_PREMIUM_PCT` | 0.5 | marketable 限价溢价 |
@@ -469,7 +590,12 @@ legacy TRAIL 路径 `POST /api/lots`。）
 | `TP_RR` | 0.0 | **已废弃**（随 TRAIL 路径一并废弃） |
 | `STOP_GUARD_ENABLED` | True | 止损单守卫：每分钟核对持仓有无 STP 保护单，裸仓即提醒 |
 | `AUTO_CLOSE_ON_ST_FLIP` | True | 持仓方向与 ts_c.direction 相反（多仓 ==-1 / 空仓 ==1）时自动平仓；False 退化为弹窗提醒 |
+| `AUTO_BREAKEVEN_R` | 2.0 | ACTIVE 持仓浮盈达到 2R 时自动保本（按当前 bar 极值检查） |
+| `SLOW_BREAK_SECONDS` | 900 | 开仓 15 分钟仍未保本时提醒减仓 |
 | `AUTO_MAX_INSTANCES` | 5 | 全自动策略引擎的实例上限（见第 12 章） |
+| `FVG_CHASE_MAX_ATR_RATIO` | 0.5 | FVG 追价允许的最大「现价−缺口边沿」距离（ATR 倍数，chase 一键下单阈值） |
+| `CLIENT_TOKEN_TTL_HOURS` | 10 | 客户端 token 有效期（小时，自审批起算；过期须重新登记并重新审批） |
+| `STOP_ATR_MULT` | 1.0 | **止损 ATR 倍数全局默认**（env 覆盖）；运行时经「止损 ATR×」顶栏输入修改，持久化 logs/settings.json，快照 status.stop_atr_mult 同步全客户端（v2026-10-22） |
 
 ---
 
@@ -477,14 +603,25 @@ legacy TRAIL 路径 `POST /api/lots`。）
 
 ```bash
 # dry-run（默认，虚拟成交）
-EXECUTION_ENABLED=0 python3 -m uvicorn console.app:app --host 127.0.0.1 --port 8000
+EXECUTION_ENABLED=0 python3 -m uvicorn console.app:app --host 0.0.0.0 --port 8000
 
 # 实盘（先确认 TWS 在线 + 账户有资金 + 风控参数）
-EXECUTION_ENABLED=1 python3 -m uvicorn console.app:app --host 127.0.0.1 --port 8000
+EXECUTION_ENABLED=1 python3 -m uvicorn console.app:app --host 0.0.0.0 --port 8000
 
 # 同步自选列表（TV Chrome 9222 开着）
 python3 service/sync_watchlist.py
 ```
+
+**局域网多客户端（v2026-10-22）**：默认绑 0.0.0.0。本机（127.0.0.1）= master
+免确认；非本机打开需输入**交易员名称**注册（无密码），后端签 token 存
+localStorage，**master 审批条确认后**该客户端才能交易（未审批可读不可写，
+写端点 403；审批/拒绝仅本机可调）。**token 有效期 `CLIENT_TOKEN_TTL_HOURS`
+（默认 10 小时，自审批时刻起算）**：过期后写操作 403、self 返回
+`expired:true`，客户端自动清凭证回到登记页（可同名重新登记，旧 token 作废，
+须重新走 master 审批——相当于每日开工确认一次身份）。订单归属记
+`lot.trader`（master / 交易员名 / auto），订单表含交易员列，各端自己的
+在手订单排前、他人排后（不同交易员块间有空白间隔带）。客户端注册表持久化
+`logs/clients.json`（重启有效）。⚠️ 无密码体系，仅在可信内网开放。
 
 `logs/autotrade_writer.lock` 由 console、auto_runner、main.py 启动时获取；
 任一获取失败说明已有执行写进程在运行，禁止第二个实例重复撤改平同一订单。
@@ -513,7 +650,7 @@ python3 service/sync_watchlist.py
 3. **人工决策**：`approve_entry` 原子防双击，批准后才走原 `_open → LiveBroker → OrderManager`；`reject_entry` 只忽略候选。停止策略、迟到或重复批准均不能下单；
 4. **限价单**：LMT 父 + STP 子；`expire_bars`（3）根 bar 未成交 → 撤单回 WATCHING；
 5. **STP 止损** = 限价 ∓ 1×ATR（ts_c.atr）；
-6. **移动保本/跟踪止盈**：ACTIVE tick/回测极值达到 `breakeven_r`（2R）立即移成本（券商确认才标记，失败节流重试）；之后每根 bar 收盘按 `ts_c.supertrend` 单向棘轮（1 美分防抖 + 不越过现价）。
+6. **移动保本/跟踪止盈**：ACTIVE tick/回测极值达到 `breakeven_r`（2R）立即移成本（券商确认才标记，失败节流重试）；ST 线越过实际成本后即可按 `ts_c.supertrend` 单向棘轮，已保本后继续跟踪（1 美分防抖 + 不越过现价）。
 
 外加两条终结路径：**趋势反向平仓**（ts_c.direction 与持仓相反 → 平仓）；
 **手动取消/平仓**（含 TWS 上操作，由 lot 终态检测/对账发现）→ 实例 DONE。
@@ -566,6 +703,8 @@ python3 backtest_auto.py --strategy trend_pullback --symbol NASDAQ:NVDA --day 20
 
 - `trend_state == 1`（单边多头）：实时成交价触及 `ema_fast` 或 `channel_edge`（price ≤ 线值）→ 做多；两线同触取更低价（更优入场）；
 - `trend_state == -1`（单边空头）：price ≥ 线值 → 做空；取更高价；
+- **FVG 入场线**（`use_fvg_line`，默认开）：fvg_c 确认值中，多头方向存在需求区 FVG（`fvg_last_dir == 1`）时 `fvg_last_top` 作为第三条入场线（price ≤ 上沿 → 限价 = 上沿）；空头方向存在供应区 FVG（`fvg_last_dir == -1`）时 `fvg_last_bottom` 作线（price ≥ 下沿 → 限价 = 下沿）；与 EMA/通道线同触时同样取更优价；
+- **FVG 过滤**（可选，默认关）：`require_same_dir_fvg=true` 要求存在同向 FVG（`fvg_last_dir == direction`）才允许开仓；`min_fvg_cum=N`（N>0）要求 `fvg_cum_count >= N`；字段缺失一律视为不满足（拦截，不静默放行）；
 - 限价 = 线值；止损 = 限价 ∓ 1×ATR（ts_c.atr，ATR 缺失不进场）；方向 = ST 方向，无反向订单；
 - 时段闸：`entry_start_hm`（默认 09:45 ET）前、`entry_end_hm`（默认 15:00 ET）后不开新仓。
 
@@ -578,8 +717,134 @@ python3 backtest_auto.py --strategy trend_pullback --symbol NASDAQ:NVDA --day 20
 | `entry_start_hm` | 09:45 ET | 开盘前 15 分钟不开新仓 |
 | `entry_end_hm` | 15:00 ET | 最后一小时不开新仓 |
 | `max_entries_per_day` | 2 | 每标的每日进场上限 |
+| `use_fvg_line` | True | FVG 边沿作为第三条入场线（v2026-10-20） |
+| `require_same_dir_fvg` | False | 要求存在同向 FVG 才允许开仓（v2026-10-20） |
+| `min_fvg_cum` | 0 | 要求 ST 同向 FVG 累积计数 ≥ N（0=不过滤，v2026-10-20） |
 
 新策略在 `engine/strategies/__init__.py` 注册表登记（`build_strategy` 按名构建 + 参数覆盖）即可被引擎/回测/控制台使用。
+
+---
+
+## 14. 跟单系统（copy_trader，v2026-10-22）
+
+一主多从的跟单架构：master 控制台（交易员操作，**零改动**）→ 每个 IBKR 服务器
+一个独立跟单进程（互不影响，全部跑在 master Mac）。
+
+```
+master /ws 快照（lot 全生命周期）
+   ├─ copy_trader.py --name A → TWS A（clientId 13）
+   ├─ copy_trader.py --name B → TWS B（clientId 14）
+   └─ ...
+```
+
+**跟单语义（定稿）**：
+- master lot PENDING → 无动作（**master 没成交 = follower 永远无仓**，硬保证）
+- 首次转 ACTIVE → follower 市价入场（marketable 限价 = master avg_fill ×(1±0.5%)）
+  **+ STP 子单同发**（触发价 = master 当前 stop_px）——绝无裸仓；入场后立即
+  对齐一次 master 最新 stop_px（防秒级窗口）；部分成交不追加
+- master stop_px 变动（保本/跟踪/手动）→ follower 同步改 STP 到同一价格
+- master CLOSED（任何原因）→ 先撤 GTC STP 再市价平仓
+- master CANCELLED（未成交）→ 无动作 ✓
+
+**股数**（`size_mode` × `size_multiplier` 放大系数，调试 0.1 → 正常 1.0 → 稳定 1.5）：
+`risk`（默认）= risk_usd × 系数 ÷ |avg_fill − stop_px|；`multiplier` = master qty × 系数；
+`balance` = master qty × (follower净值/master净值) × 系数。qty<1 记失败不重试。
+
+**保险**：日回撤熔断（`max_drawdown_pct` 默认 3%，只拦新开仓，平仓/改止损同步照常，
+页面手动解除）；entry/modify 指数退避 3 次进失败队列；**close 每 30s 无限重试**；
+`direction=long_only` 方向过滤；`copy_existing_on_start=false` 不追历史仓。
+
+**master 侧（console/app.py）**：配置 CRUD（`logs/copy_servers.json`，clientId 13 起
+自动分配避开保留号段）+ CopySupervisor（每 enabled 服务器 spawn 子进程，崩溃指数
+退避重启 10 次/小时封顶，配置变更自动 reload，EXECUTION_ENABLED=0 追加 --dry-run）
++ 快照 `copy` 段（配置 + `logs/copy-{name}-status.json` 合并 + process_alive）
++ 人工指令 `logs/copy-{name}-cmd.json`（retry/dismiss/unhalt）。
+
+**前端「跟单管理」tab**：服务器配置表（参数/放大系数/熔断/方向/启停/增删）｜
+状态卡（连接灯/净值/已跟/待跟/失败/回撤/熔断徽章）｜跟踪订单对照表
+（master lot ↔ follower lot 状态）｜失败订单表（重放/忽略）。
+
+**已知坑**：websockets 16 新 asyncio 客户端在本环境（Python 3.11 + uvicorn）
+握手即 EOF（连最小 uvicorn ws 也失败）——WS 客户端一律用
+`websockets.legacy.client.connect`（实测稳定）。
+
+**daemon 稳定性（v2026-10-24，4 Study × 54 标的实测 28s 全就绪）**：
+- 分批启动（默认 6 chart/批 × 3s，`--batch-size`/`--batch-delay-ms` 可调）——
+  一次性发起 54×(1 chart+4 study) 会被 TV 限流卡死且不自愈（实测两次复现）；
+- 巡检自愈：每 30s 检查，chart 超 90s 无数据或 attack study 无值 →
+  销毁重建（间隔 1.5s，单 chart 上限 10 次）；
+- `realtime_collector` 两个管道坑：① stderr 接 PIPE 必须持续排空
+  （`_stderr_drain`），否则 daemon console.error 写满 64KB 管道永久阻塞；
+  ② `create_subprocess_exec` 必须 `limit=4MB`——tick JSON 单行 54 标的
+  实测 71KB > asyncio 默认 64KB 流上限，readline 抛 ValueError，
+  读取异常曾静默 break 导致「daemon 健康但零数据」（现已改为记日志退出）。
+
+---
+
+## 15. 盘前突破实时信号（breakout_tracker，v2026-10-24）
+
+把 `research_breakout.py` 的批量研究算法改造为实盘逐 bar 流式信号，
+口径与批量版**逐条对拍一致**（六天回放全绿：10-13/19/20/21/22/23）。
+
+**算法（多空双出，v2026-10-25）**：盘前区间 = 当天 04:00–09:25 ET 的 5M
+高低点 → 09:45 ET 起收盘越界（站上：前收 ≤ 盘前高 且 本收 > 盘前高；
+跌破：前收 ≥ 盘前低 且 本收 < 盘前低，每次越界都算）→ 下一根须同向
+FVG（多 fvg_event=1 / 空 -1）且同向 K 线 → 同一确认时刻候选 ≤3 只立即
+出信号，>3 只升级再等一根要求三连阳/三连阴镜像（确认时间延后到第三根）
+→ 确认时刻 ≤10:30 ET；BLACKBULL:/CAPITALCOM: 期货剔除。
+
+**架构**：
+- `engine/breakout_tracker.py` — 纯逻辑状态机（无 IO）：每 symbol 累积/锁定
+  盘前区间、越界挂起、FVG 确认、拥挤组终判（`flush(bar_time)`）、三连阳/阴升级。
+  **拥挤计数多空混算**（与批量版 Counter 口径一致——对拍一致的关键），
+  信号多空双出（side=站上高点/跌破低点，字段结构一致）。
+- `console/app.py` — `_breakout_loop`（1s）：bar_c.time 前进 = 新 bar 确认，
+  带对齐校验后的 fvg_c.fvg_event 喂 tracker；信号 → `record_event("breakout_signal")`
+  + `_breakout_signals` 缓冲（4h TTL）+ 快照 `breakout_signals` 段。
+- 前端信号栏新增「突破」/「跌破」卡片（多绿/空红亮底 + 徽标，显示
+  ticker/确认时间/盘前低~高/区间宽/确认方式），固定排栏顶，复用逐条
+  删除与 4 分钟过期机制；语音播报「站上盘前高点」/「跌破盘前低点」。
+
+**盘前区间双来源（v2026-10-24 二期）**：图表「5M 进攻区域」指标
+（`USER;8ab4f534e5874b47b24a5ce5c49acace`，daemon 第 4 个 Study，注册表
+`attack_zone`）plot 出 `premarketHigh/premarketLow/Bar_Color`（na=1e100→null），
+快照带 `attack/attack_c`；实测与 research.db 盘前口径（04:00–09:25 ET）精确一致。
+`_breakout_loop` 在 `attack_c.time == bar_c.time` 且 pmh>pml>0 时经
+`tracker.set_premarket()` 注入（每 symbol 每天一次），**注入优先于自累积**，
+无效值自动回落自累积——盘中重启控制台也能拿到正确盘前区间，原
+「必须 04:00 ET 前启动」限制解除。**注入门控 bar 时间 hm≥570**（09:30 ET）：
+指标的 premarketHigh/Low 盘前时段是累积中的半成品（实测 pml 一路下探，
+09:30 首根常规 K 线才锁定终值）——盘前启动等 09:30 首根注入，开盘后启动
+第一拍即注；否则盘前启动会把半成品区间锁死一整天（2026-10-24 用户指出）。
+`bar_color`（0/1 方向过滤）已下发快照，暂不使用。
+
+---
+
+## 16. 盘前热点新闻统计（news_digest，v2026-10-25）
+
+盘前新闻摘要：RSS 采集（无 key）+ LLM 主题归纳 + 自选股热点识别。
+
+- `engine/news_digest.py` — 纯逻辑 + 两个 IO 边界（fetcher/llm 可注入）。
+  数据源（2026-10-25 实测）：MarketWatch 头条 RSS + Google News RSS
+  主题查询（premarket movers / stock market today / Fed rate / earnings
+  各前 10 条）；个股层 watchlist 每 ticker 一次 Google 查询（0.25s 限速，
+  18h 时间窗，每票留 5 条）。⚠️ Yahoo 个股 RSS 已失效（返回 HTML），禁用。
+  标题归一化去重（Google 尾挂来源剥离）；摘要喂 agent_llm（JSON 约束）
+  产出 {market_mood, themes, hot_symbols{ticker:{headline,gist,sentiment,
+  catalyst}}}；LLM 不可用 → summary=None 降级纯标题列表，不阻塞。
+  落盘 logs/news-YYYYMMDD.json（tmp+replace 原子写）。
+- `console/app.py`（只追加）：`_news_loop` 每天 07:30 ET 自动生成一次；
+  GET /api/news（空态 {"empty": true}）；POST /api/news/refresh
+  （require_trader，冷却 10 分钟）；快照 status.news 小摘要
+  {generated_at, theme_count, hot_count, hot{ticker→gist}}；独立
+  @app.on_event("startup") 注册，不侵入既有函数体。生成走
+  asyncio.to_thread（阻塞 RSS/LLM 不进事件循环）。
+- 前端「盘前新闻」tab（FVG 监控后第二位）：大盘情绪+主题列表 / 自选股
+  热点卡（ticker 可点 → tvShow，情绪色 pos绿/neg红/neu灰 + 催化徽标）/
+  原始头条 / 手动刷新。徽标联动：突破卡/FVG 卡/选股行上标的命中当日
+  hot_symbols → 琥珀「新闻」小徽标（tooltip=gist）。
+- 测试 tests/test_news_digest.py（fixture XML + mock LLM，零网络）；
+  真网冒烟在 tests/live/test_news_live.py（mark live，默认不跑）。
 
 ---
 

@@ -80,7 +80,8 @@ async def run_day(rows: list, symbol: str, day: str,
                         ("time", "open", "high", "low", "close", "volume")}
             prev_ts = prev_row.get("ts") or {}
             # 1) bar 内 tick（极值建模）：触线进场 / 触价成交 / 触止损
-            await engine.on_bar_extremes(symbol, bar, prev_ts, prev_bar, hm)
+            await engine.on_bar_extremes(symbol, bar, prev_ts, prev_bar, hm,
+                                         fvg_c=prev_row.get("fvg"))
         # 2) bar 收盘管理（保本 / ST 跟踪 / 反向平仓 / 过期）
         await engine.on_bar(symbol, bar, ts)
         prev_row = row

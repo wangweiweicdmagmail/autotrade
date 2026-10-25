@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import config
+from ib_async import ExecutionFilter
 
 logger = logging.getLogger(__name__)
 
@@ -269,8 +270,10 @@ class IBKRGateway:
     def _set_stop_price(order, stop_px: float) -> None:
         if order.orderType == "STP":
             order.auxPrice = stop_px
+            order.trailStopPrice = 0.0
         else:
             order.trailStopPrice = stop_px
+            order.auxPrice = 0.0
 
     def _modification_error(self, trades, since: float) -> Optional[str]:
         statuses = [(t, t.orderStatus.status) for t in trades]
@@ -371,6 +374,65 @@ class IBKRGateway:
                 "limit_price": lmt, "trade": entry_trade,
                 "trail_trade": trail_trade}
 
+    async def place_market_with_stop(self, symbol: str, side: str, qty: int,
+                                     stop_px: float) -> dict:
+        """市价单（父，MKT DAY）+ 固定 STOP 止损（子，STP GTC，parentId 关联）。
+
+        严格市价成交（v2026-10-24 用户定稿：只做实时行情标的、严格市价成交）。
+        前置条件：本账户对该标的有实时行情订阅——延迟行情标的会被
+        error 10349 拒（已在 TRADE_BLOCKLIST 层屏蔽）。parentId 语义与
+        place_limit_with_stop 相同：父单未成交子单挂起，父单被撤子单随撤。
+        """
+        action = "BUY" if side == "long" else "SELL"
+        opp = "SELL" if side == "long" else "BUY"
+
+        if not (self.enabled and self._connected):
+            fake_entry = next(self._fake_ids)
+            fake_stop = next(self._fake_ids)
+            logger.info("[DRY-RUN] 市价+STOP 子单 %s: %s x%d @MKT | STOP %s %.2f | FA=%s",
+                        symbol, action, qty, opp, stop_px, self.fa_group)
+            return {"ok": True, "dry_run": True, "entry_order_id": fake_entry,
+                    "stop_order_id": fake_stop, "status": "DryRun"}
+
+        from ib_async import MarketOrder, Order
+        contract = await self._qualify(symbol)
+        parent = MarketOrder(action, qty, tif="DAY",
+                             orderId=self._next_tool_order_id(), transmit=False)
+        self._apply_fa(parent)
+        stop = Order()
+        stop.orderType = "STP"
+        stop.action = opp
+        stop.totalQuantity = qty
+        stop.tif = "GTC"
+        stop.auxPrice = round(stop_px, 2)
+        stop.orderId = self._next_tool_order_id()
+        stop.parentId = parent.orderId
+        stop.transmit = True
+        self._apply_fa(stop)
+        t0 = time.time()
+        entry_trade = self.ib.placeOrder(contract, parent)
+        stop_trade = self.ib.placeOrder(contract, stop)
+        await asyncio.sleep(2.5)
+        status = entry_trade.orderStatus.status
+        stop_status = stop_trade.orderStatus.status
+        fatal = self._recent_fatal_error(t0)
+        bad = ("Cancelled", "Inactive", "ApiCancelled")
+        if fatal or status in bad or stop_status in bad:
+            err = (fatal["msg"] if fatal else f"入场 {status} / STOP {stop_status}")
+            logger.error("市价+STOP 单失败 %s: %s", symbol, err)
+            return {"ok": False, "entry_order_id": parent.orderId,
+                    "stop_order_id": stop.orderId,
+                    "status": status, "stop_status": stop_status,
+                    "trade": entry_trade, "stop_trade": stop_trade,
+                    "error": err}
+        logger.info("市价+STOP 已提交 %s %s x%d | STOP %.2f | orderId=%d/%d(%s/%s)",
+                    symbol, action, qty, stop_px, parent.orderId, stop.orderId,
+                    status, stop_status)
+        return {"ok": True, "entry_order_id": parent.orderId,
+                "stop_order_id": stop.orderId, "status": status,
+                "stop_status": stop_status,
+                "trade": entry_trade, "stop_trade": stop_trade}
+
     async def place_limit_with_stop(self, symbol: str, side: str, qty: int,
                                     limit_px: float, stop_px: float) -> dict:
         """
@@ -431,6 +493,93 @@ class IBKRGateway:
                 "stop_order_id": stop.orderId, "status": status,
                 "limit_price": limit_px, "trade": entry_trade,
                 "stop_trade": stop_trade}
+
+    async def place_midpoint_oca(self, symbol: str, side: str, qty: int,
+                                 limit_px: float, breakout_px: float,
+                                 stop_px: float, oca_group: str) -> dict:
+        """中点 OCA 双腿入场：LMT 中点父单 + STP 突破入场腿，一成全撤。
+
+        结构：LMT 父单（transmit=False，OCA 组）+ STP 止损子单（parentId
+        关联 LMT，不入 OCA 组）+ STP 突破腿（transmit=True，OCA 组，
+        ocaType=1 成交即撤其余）。中点腿成交则止损子单原生生效；突破腿
+        成交时 OCA 撤销 LMT 腿并连带撤销其子止损，需由上层 watcher 补挂
+        独立止损。返回 {ok, entry_order_id, stop_order_id,
+        breakout_order_id, ...}。
+        """
+        action = "BUY" if side == "long" else "SELL"
+        opp = "SELL" if side == "long" else "BUY"
+
+        if not (self.enabled and self._connected):
+            fake_entry = next(self._fake_ids)
+            fake_stop = next(self._fake_ids)
+            fake_brk = next(self._fake_ids)
+            logger.info("[DRY-RUN] 中点OCA %s: %s x%d @LMT %.2f | 突破STP %.2f "
+                        "| STOP %s %.2f | OCA=%s",
+                        symbol, action, qty, limit_px, breakout_px,
+                        opp, stop_px, oca_group)
+            return {"ok": True, "dry_run": True, "entry_order_id": fake_entry,
+                    "stop_order_id": fake_stop, "breakout_order_id": fake_brk,
+                    "status": "DryRun", "limit_price": limit_px}
+
+        from ib_async import LimitOrder, Order
+        contract = await self._qualify(symbol)
+        parent = LimitOrder(action, qty, round(limit_px, 2), tif="DAY",
+                            orderId=self._next_tool_order_id(), transmit=False)
+        parent.ocaGroup = oca_group
+        parent.ocaType = 1                      # 成交即撤销组内其余订单
+        self._apply_fa(parent)
+        stop = Order()
+        stop.orderType = "STP"
+        stop.action = opp
+        stop.totalQuantity = qty
+        stop.tif = "GTC"
+        stop.auxPrice = round(stop_px, 2)      # STOP 触发价 = ST 线值
+        stop.orderId = self._next_tool_order_id()
+        stop.parentId = parent.orderId          # 止损只挂中点腿，不入 OCA 组
+        stop.transmit = True
+        self._apply_fa(stop)
+        brk = Order()
+        brk.orderType = "STP"                   # stop-market 突破入场
+        brk.action = action
+        brk.totalQuantity = qty
+        brk.tif = "DAY"
+        brk.auxPrice = round(breakout_px, 2)
+        brk.orderId = self._next_tool_order_id()
+        brk.ocaGroup = oca_group
+        brk.ocaType = 1
+        brk.transmit = True
+        self._apply_fa(brk)
+        t0 = time.time()
+        entry_trade = self.ib.placeOrder(contract, parent)
+        stop_trade = self.ib.placeOrder(contract, stop)
+        brk_trade = self.ib.placeOrder(contract, brk)
+        await asyncio.sleep(2.5)
+        status = entry_trade.orderStatus.status
+        stop_status = stop_trade.orderStatus.status
+        brk_status = brk_trade.orderStatus.status
+        fatal = self._recent_fatal_error(t0)
+        bad = ("Cancelled", "Inactive", "ApiCancelled")
+        if fatal or status in bad or stop_status in bad or brk_status in bad:
+            err = (fatal["msg"] if fatal else
+                   f"入场 {status} / STOP {stop_status} / 突破 {brk_status}")
+            logger.error("中点OCA 单失败 %s: %s", symbol, err)
+            return {"ok": False, "entry_order_id": parent.orderId,
+                    "stop_order_id": stop.orderId,
+                    "breakout_order_id": brk.orderId,
+                    "status": status, "stop_status": stop_status,
+                    "breakout_status": brk_status,
+                    "trade": entry_trade, "stop_trade": stop_trade,
+                    "breakout_trade": brk_trade, "error": err}
+        logger.info("中点OCA 已提交 %s %s x%d @LMT %.2f | 突破 %.2f | "
+                    "STOP %.2f | entryId=%d(%s) stopId=%d(%s) brkId=%d(%s)",
+                    symbol, action, qty, limit_px, breakout_px, stop_px,
+                    parent.orderId, status, stop.orderId, stop_status,
+                    brk.orderId, brk_status)
+        return {"ok": True, "entry_order_id": parent.orderId,
+                "stop_order_id": stop.orderId,
+                "breakout_order_id": brk.orderId, "status": status,
+                "limit_price": limit_px, "trade": entry_trade,
+                "stop_trade": stop_trade, "breakout_trade": brk_trade}
 
     async def place_close(self, symbol: str, side: str, qty: int,
                           ref_px: float, order_ref: str = "") -> dict:
@@ -560,6 +709,12 @@ class IBKRGateway:
         error = self._modification_error([trade], t0)
         if error:
             logger.warning("%s 止损修改未获 IBKR 接受: %s", unit.symbol, error)
+            fatal = self._recent_fatal_error(t0)
+            if fatal and fatal.get("code") == 320 \
+                    and hasattr(unit, "trail_modify_blocked_until"):
+                unit.trail_modify_blocked_until = time.time() + 300
+                logger.warning("%s IBKR error 320，止损修改冷却 5 分钟，避免连续打崩连接",
+                               unit.symbol)
             self._set_stop_price(trade.order, old_stop)
             try:
                 if not trade.isDone():
@@ -698,6 +853,233 @@ class IBKRGateway:
                     unit.symbol, new_limit, new_stop)
         return True
 
+    async def modify_limit_stop_qty(self, unit, new_limit_px: float,
+                                    new_stop_px: float, new_qty: int) -> bool:
+        """PENDING 父子单改价 + 改股数：LMT 父单与 STP 子单的 totalQuantity
+        随价格同步修改（同 orderId modify 语义），供回踩单逐 bar 以损定量。
+
+        两腿均获 IBKR 接受后才更新 unit；任一失败回滚全部（含原股数）。
+        股数不变时应走 modify_limit_stop 纯价格路径。
+        """
+        new_limit = round(new_limit_px, 2)
+        new_stop = round(new_stop_px, 2)
+        new_qty = int(new_qty)
+        if new_qty <= 0:
+            logger.warning("%s 回踩改价股数必须为正: %s", unit.symbol, new_qty)
+            return False
+        if not self.enabled:
+            logger.info("[DRY-RUN] 回踩父子单改价改量 %s: LMT %.2f / STP %.2f x%d",
+                        unit.symbol, new_limit, new_stop, new_qty)
+            unit.entry_px = new_limit
+            unit.stop_px = new_stop
+            return True
+        if not self._connected:
+            logger.warning("%s IBKR 断连，拒绝回踩改价改量", unit.symbol)
+            return False
+        entry = getattr(unit, "entry_trade", None)
+        stop = getattr(unit, "trail_trade", None)
+        if entry is None or stop is None:
+            logger.warning("%s 缺少父子单句柄，无法回踩改价改量", unit.symbol)
+            return False
+        if entry.isDone() or stop.isDone():
+            logger.warning("%s 父子单已有终态，拒绝回踩改价改量", unit.symbol)
+            return False
+        old_limit = entry.order.lmtPrice
+        old_stop = (stop.order.auxPrice if stop.order.orderType == "STP"
+                    else stop.order.trailStopPrice)
+        old_entry_qty = entry.order.totalQuantity
+        old_stop_qty = stop.order.totalQuantity
+
+        def rollback() -> None:
+            self._set_stop_price(stop.order, old_stop)
+            stop.order.totalQuantity = old_stop_qty
+            entry.order.lmtPrice = old_limit
+            entry.order.totalQuantity = old_entry_qty
+            errors = []
+            for trade in (stop, entry):
+                try:
+                    if not trade.isDone():
+                        self.ib.placeOrder(trade.contract, trade.order)
+                except Exception as e:
+                    errors.append(str(e))
+            if errors:
+                raise RuntimeError("; ".join(errors))
+
+        t0 = time.time()
+        try:
+            self._set_stop_price(stop.order, new_stop)
+            stop.order.totalQuantity = new_qty
+            self.ib.placeOrder(stop.contract, stop.order)
+            entry.order.lmtPrice = new_limit
+            entry.order.totalQuantity = new_qty
+            self.ib.placeOrder(entry.contract, entry.order)
+        except Exception as e:
+            logger.warning("%s 回踩父子单改价改量异常: %s", unit.symbol, e)
+            try:
+                rollback()
+            except Exception as rollback_error:
+                logger.error("%s 回踩改价改量回滚失败，需立即人工核查: %s",
+                             unit.symbol, rollback_error)
+            return False
+        await asyncio.sleep(2.5)
+        error = self._modification_error([stop, entry], t0)
+        if error:
+            logger.warning("%s 回踩改价改量未获 IBKR 接受: %s", unit.symbol, error)
+            try:
+                rollback()
+            except Exception as rollback_error:
+                logger.error("%s 回踩改价改量回滚失败，需立即人工核查: %s",
+                             unit.symbol, rollback_error)
+            return False
+        unit.entry_px = new_limit
+        unit.stop_px = new_stop
+        logger.info("回踩父子单已改价改量 %s: LMT %.2f / STP %.2f x%d",
+                    unit.symbol, new_limit, new_stop, new_qty)
+        return True
+
+    async def modify_midpoint_oca(self, unit, new_limit_px: float,
+                                  new_breakout_px: float,
+                                  new_stop_px: float) -> bool:
+        """中点 OCA 三腿改价：LMT 中点 + STP 突破触发 + STP 止损子单。
+
+        三腿均获 IBKR 接受后才更新 unit；任一失败回滚全部。
+        """
+        new_limit = round(new_limit_px, 2)
+        new_brk = round(new_breakout_px, 2)
+        new_stop = round(new_stop_px, 2)
+        if not self.enabled:
+            logger.info("[DRY-RUN] 中点OCA改价 %s: LMT %.2f / 突破 %.2f / STP %.2f",
+                        unit.symbol, new_limit, new_brk, new_stop)
+            unit.entry_px = new_limit
+            unit.stop_px = new_stop
+            return True
+        if not self._connected:
+            logger.warning("%s IBKR 断连，拒绝中点OCA改价", unit.symbol)
+            return False
+        entry = getattr(unit, "entry_trade", None)
+        stop = getattr(unit, "trail_trade", None)
+        brk = getattr(unit, "breakout_trade", None)
+        if entry is None or stop is None or brk is None:
+            logger.warning("%s 缺少OCA三腿句柄，无法中点改价", unit.symbol)
+            return False
+        if entry.isDone() or stop.isDone() or brk.isDone():
+            logger.warning("%s OCA三腿已有终态，拒绝中点改价", unit.symbol)
+            return False
+        old_limit = entry.order.lmtPrice
+        old_brk = brk.order.auxPrice
+        old_stop = (stop.order.auxPrice if stop.order.orderType == "STP"
+                    else stop.order.trailStopPrice)
+
+        def rollback() -> None:
+            self._set_stop_price(stop.order, old_stop)
+            entry.order.lmtPrice = old_limit
+            brk.order.auxPrice = old_brk
+            errors = []
+            for trade in (stop, brk, entry):
+                try:
+                    if not trade.isDone():
+                        self.ib.placeOrder(trade.contract, trade.order)
+                except Exception as e:
+                    errors.append(str(e))
+            if errors:
+                raise RuntimeError("; ".join(errors))
+
+        t0 = time.time()
+        try:
+            self._set_stop_price(stop.order, new_stop)
+            self.ib.placeOrder(stop.contract, stop.order)
+            brk.order.auxPrice = new_brk
+            self.ib.placeOrder(brk.contract, brk.order)
+            entry.order.lmtPrice = new_limit
+            self.ib.placeOrder(entry.contract, entry.order)
+        except Exception as e:
+            logger.warning("%s 中点OCA改价异常: %s", unit.symbol, e)
+            try:
+                rollback()
+            except Exception as rollback_error:
+                logger.error("%s 中点OCA改价回滚失败，需立即人工核查: %s",
+                             unit.symbol, rollback_error)
+            return False
+        await asyncio.sleep(2.5)
+        error = self._modification_error([stop, brk, entry], t0)
+        if error:
+            logger.warning("%s 中点OCA改价未获 IBKR 接受: %s", unit.symbol, error)
+            try:
+                rollback()
+            except Exception as rollback_error:
+                logger.error("%s 中点OCA改价回滚失败，需立即人工核查: %s",
+                             unit.symbol, rollback_error)
+            return False
+        unit.entry_px = new_limit
+        unit.stop_px = new_stop
+        logger.info("中点OCA已改价 %s: LMT %.2f / 突破 %.2f / STP %.2f",
+                    unit.symbol, new_limit, new_brk, new_stop)
+        return True
+
+    async def convert_entry_to_market(self, unit) -> bool:
+        """PENDING 入场父单由 LMT 原地改 MKT（同 orderId 修改，一次性升级）。
+
+        STP 子单经 parentId 关联，无需变动。市价单通常立即成交，
+        成交即成功；未成交且 IBKR 未接受修改时回滚为原 LMT 挂单。
+        """
+        if not self.enabled:
+            logger.info("[DRY-RUN] 入场单升级市价 %s (orderId=%s)",
+                        unit.symbol, getattr(unit, "entry_order_id", None))
+            return True
+        if not self._connected:
+            logger.warning("%s IBKR 断连，拒绝市价升级", unit.symbol)
+            return False
+        entry = getattr(unit, "entry_trade", None)
+        if entry is None:
+            logger.warning("%s 无入场单句柄，无法市价升级", unit.symbol)
+            return False
+        if entry.isDone():
+            logger.warning("%s 入场单已为终态，拒绝市价升级", unit.symbol)
+            return False
+        old_type = entry.order.orderType
+        old_limit = entry.order.lmtPrice
+        t0 = time.time()
+        try:
+            entry.order.orderType = "MKT"
+            entry.order.lmtPrice = 0.0
+            self.ib.placeOrder(entry.contract, entry.order)
+        except Exception as e:
+            logger.warning("%s 市价升级异常: %s", unit.symbol, e)
+            entry.order.orderType = old_type
+            entry.order.lmtPrice = old_limit
+            try:
+                if not entry.isDone():
+                    self.ib.placeOrder(entry.contract, entry.order)
+            except Exception as rollback_error:
+                logger.error("%s 市价升级回滚失败，需立即人工核查: %s",
+                             unit.symbol, rollback_error)
+            return False
+        await asyncio.sleep(2.5)
+        if entry.isDone():
+            filled = float(entry.orderStatus.filled or 0)
+            if filled > 0:
+                logger.info("入场单已升级市价并成交 %s x%.0f (orderId=%d)",
+                            unit.symbol, filled, entry.order.orderId)
+                return True
+            logger.warning("%s 市价升级后入场单终态无成交 (status=%s)",
+                           unit.symbol, entry.orderStatus.status)
+            return False
+        error = self._modification_error([entry], t0)
+        if error:
+            logger.warning("%s 市价升级未获 IBKR 接受: %s", unit.symbol, error)
+            entry.order.orderType = old_type
+            entry.order.lmtPrice = old_limit
+            try:
+                if not entry.isDone():
+                    self.ib.placeOrder(entry.contract, entry.order)
+            except Exception as rollback_error:
+                logger.error("%s 市价升级回滚失败，需立即人工核查: %s",
+                             unit.symbol, rollback_error)
+            return False
+        logger.info("入场单已升级市价 %s (%s -> MKT, orderId=%d)",
+                    unit.symbol, old_type, entry.order.orderId)
+        return True
+
     async def last_price(self, symbol: str, timeout: float = 5.0) -> Optional[float]:
         """snapshot 最新价（用于 PnL 计算）。未连接/取不到返回 None。"""
         if not self._connected:
@@ -770,7 +1152,6 @@ class IBKRGateway:
         """
         if not self._connected:
             return None
-        from ib_async import ExecutionFilter
         ticker = symbol.split(":")[-1].upper()
         want = "SLD" if side == "long" else "BOT"
         legacy_ids = set()
@@ -811,6 +1192,49 @@ class IBKRGateway:
         if total_shares <= 0:
             return None
         return round(total_amt / total_shares, 4), int(total_shares)
+
+    async def entry_fills_by_order(self, symbol: str,
+                                   order_ids) -> Optional[Dict[int, tuple]]:
+        """按订单号聚合本日成交（成交真相）：{orderId: (成交股数, 加权均价)}。
+
+        OCA 双腿场景：突破腿成交与 LMT 腿被撤可在同一帧发生，缓存的
+        orderStatus.filled 可能漏报；executions 是唯一可靠来源。
+        None = 查询失败（调用方不得把 None 当作无成交）。
+        """
+        if not self._connected:
+            return None
+        ticker = symbol.split(":")[-1].upper()
+        want_ids = set()
+        for oid in order_ids or ():
+            try:
+                want_ids.add(int(oid))
+            except (TypeError, ValueError):
+                continue
+        if not want_ids:
+            return {}
+        try:
+            fills = await asyncio.wait_for(
+                self.ib.reqExecutionsAsync(ExecutionFilter()), timeout=10)
+        except Exception as e:
+            logger.warning("成交回报查询失败: %s", e)
+            return None
+        out: Dict[int, list] = {}
+        for f in fills:
+            try:
+                if f.contract.symbol.upper() != ticker:
+                    continue
+                ex = f.execution
+                oid = int(ex.orderId)
+                if oid not in want_ids:
+                    continue
+                shares, amt = out.get(oid, [0.0, 0.0])
+                shares += float(ex.shares)
+                amt += float(ex.price) * float(ex.shares)
+                out[oid] = [shares, amt]
+            except Exception:
+                continue
+        return {oid: (int(shares), round(amt / shares, 4))
+                for oid, (shares, amt) in out.items() if shares > 0}
 
     async def fa_accounts(self) -> List[str]:
         """

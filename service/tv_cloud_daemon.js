@@ -3,20 +3,37 @@
  * ================================================
  *
  * 常驻订阅模式：保持一条 TradingView WS 连接，每标的 1 个 5M chart
- * session，只挂 1 个 Study（trend_state），按 1s 节流把最新快照以
- * JSON 行输出到 stdout，供 Python 采集器（subprocess）消费。
+ * session，挂 4 个 Study（trend_state + FVG Finder+ + smart_stop +
+ * 5M 进攻区域），按 1s 节流把最新快照以 JSON 行输出到 stdout，供 Python 采集器（subprocess）消费。
+ * smart_stop 的值（Smart_Stop_Long/Short）归一化后合入 ts/ts_c 的
+ * smart_stop_long / smart_stop_short 字段。
  *
  * 用法：
  *   node tv_cloud_daemon.js --symbols BATS:SKHY,BATS:NVDA
+ *   node tv_cloud_daemon.js --symbols ... --batch-size 6 --batch-delay-ms 3000
+ *
+ * 启动与自愈（2026-10-24 修复订阅风暴）：
+ *   - 分批发起 chart 订阅（默认每批 6 个、批间 3s，--batch-size /
+ *     --batch-delay-ms 可调）：一次性并发建几十个 chart 会被 TV 服务端
+ *     限流，实测卡在部分标的（无 K线 / attack study 无值）且不自愈。
+ *   - 巡检自愈（每 30s）：chart 创建超 90s 仍无 bar、或 attack study
+ *     超 90s 无 pmh 值 → chart.delete() 后销毁重建（逐个间隔 1.5s，
+ *     单 chart 上限 10 次防 thrash），重建计数与原因写 stderr。
  *
  * 输出（stdout 每行一个 JSON）：
  *   {"type":"tick","ts":...,"symbols":{
  *     "BATS:SKHY":{
  *       "bar":  {time,open,high,low,close,volume},   // 实时 5M K线（未收盘）
  *       "bar_c": {...},                              // 上一根已收盘（稳定）
+ *       "bar_c2": {...},                             // 上上根已收盘（periods[2]，回踩单定价基准）
  *       "ts":  {trend_state,direction,ema_fast,ema_slow,supertrend,
  *               channel_edge,atr,st_duration_bars,st_push_count}, // 实时值（periods[0]）
- *       "ts_c": {...同结构}                          // 确认值（periods[1]，策略/下单用）
+ *       "ts_c": {...同结构},                         // 确认值（periods[1]，策略/下单用）
+ *       "fvg":  {fvg_cum_count,fvg_last_top,fvg_last_bottom,
+ *                fvg_event,fvg_last_dir},            // FVG 实时值（periods[0]）
+ *       "fvg_c": {...同结构}                         // FVG 确认值（periods[1]，策略/选股用）
+ *       "attack":  {time,bar_color,pmh,pml},         // 进攻区域实时值（periods[0]）
+ *       "attack_c": {...同结构}                      // 进攻区域确认值（periods[1]，盘前区间注入用）
  *     }}}
  *   {"type":"heartbeat","ts":...}
  *
@@ -29,6 +46,24 @@
  *   Atr_Value      ATR(10)，止损 = 限价 ∓ 1×ATR
  *   ST_Duration_Bars  当前 ST 方向延续的 5M bar 数（翻向当根为 0）
  *   ST_Push_Count     当前方向内 ST 线有利推进次数（翻向清零）
+ *
+ * FVG Finder+ 指标（USER;5ec7d04179b3429ca9286db452352d85）：
+ *   ⚠️ plot 键名 = 原标题剥离非 ASCII 字符 + 重名加后缀（实测）。
+ *   在 TV 上改 plot 标题会让键名静默变化，字段将全部变 null！
+ *   STFVG    ← 'ST同向FVG累积计数'        → fvg_cum_count（ST 同向 FVG 累积，转向清零）
+ *   FVG      ← '最后FVG上沿'              → fvg_last_top
+ *   FVG_2    ← '最后FVG下沿'              → fvg_last_bottom（与上沿撞名加后缀）
+ *   KFVG110  ← '当前K线FVG信号(1涨/-1跌/0无)' → fvg_event（1 需求/-1 供应/0 无）
+ *   fvg_last_dir：最后 FVG 方向，daemon 自 periods 历史向前扫描最后一个
+ *   非零 fvg_event 推导（上下沿只在新 FVG 形成时更新，两者天然对应）；
+ *   200 根窗口内无 FVG 事件则为 null。保存版另有 plot_4/5（_FVG_/_FVG__2），忽略。
+ *
+ * 5M 进攻区域指标（USER;8ab4f534e5874b47b24a5ce5c49acace，
+ * 「5M 进攻区域- 方向过滤器,双区间」，plot 标题全 ASCII 无剥键问题）：
+ *   Bar_Color      0/1（na 时为 1e100，finite() 转 null）
+ *   premarketHigh  当天盘前高点（指标 TV 侧自算 04:00–09:25 ET 口径，
+ *                  实测与 research.db 盘前区间精确一致，权威来源）
+ *   premarketLow   当天盘前低点
  */
 
 'use strict';
@@ -38,6 +73,9 @@ const path = require('path');
 const TradingView = require('@mathieuc/tradingview');
 
 const TREND_STATE_ID = 'USER;e577100fe79942b4830783d1ceaad535';
+const FVG_ID = 'USER;5ec7d04179b3429ca9286db452352d85';
+const SMART_STOP_ID = 'USER;ca26e3ab587841e2adb38cfbfd0bec41';
+const ATTACK_ZONE_ID = 'USER;8ab4f534e5874b47b24a5ce5c49acace';
 const PUSH_INTERVAL_MS = 1000;      // 输出节流：每秒一次
 const HEARTBEAT_MS = 30000;         // 心跳：每 30s
 
@@ -54,6 +92,17 @@ function parseArgs(argv) {
   }
   return args;
 }
+
+const _args = parseArgs(process.argv);
+// 分批订阅参数：一次性并发建几十个 chart 会被 TV 服务端限流（实测卡死
+// 部分标的且不自愈），每批 6 个、批间 3s，51 标的约 30s 内全部发起
+const BATCH_SIZE = Math.max(1, parseInt(_args['batch-size'] || '6', 10) || 6);
+const BATCH_DELAY_MS = Math.max(0, parseInt(_args['batch-delay-ms'] || '3000', 10) || 0);
+const INSPECT_INTERVAL_MS = 30000;    // 巡检间隔：死 chart 自愈检查
+const READY_GRACE_MS = 90000;         // chart 创建超过 90s 仍无 bar → 重建
+const ATTACK_GRACE_MS = 90000;        // attack study 超过 90s 无 pmh 值 → 重建
+const REBUILD_STAGGER_MS = 1500;      // 重建逐个间隔（别一次性全砸）
+const MAX_REBUILDS = 10;              // 单 chart 重建上限（防无限 thrash）
 
 function finite(v) {
   return (v !== undefined && v !== null && v < 1e99) ? v : null;
@@ -81,14 +130,78 @@ function tsFromPeriod(p) {
   };
 }
 
+// smart_stop 指标（USER;ca26e3ab587841e2adb38cfbfd0bec41，源码 smart_stop.pine）：
+//   Smart_Stop_Long / Smart_Stop_Short  智能止损价（结构极值+ATR钳制，
+//   指标内部按 close 计算距离；控制端用距离套到实际入场价上）
+//   归一化后合入 ts/ts_c：smart_stop_long / smart_stop_short
+function ssFromPeriod(p) {
+  if (!p) return {};
+  return {
+    smart_stop_long: finite(p.Smart_Stop_Long),
+    smart_stop_short: finite(p.Smart_Stop_Short),
+  };
+}
+
+// 「5M 进攻区域」指标（USER;8ab4f534e5874b47b24a5ce5c49acace）：
+//   Bar_Color      0/1（na = 1e100，finite 转 null）
+//   premarketHigh / premarketLow  当天盘前区间（TV 侧自算，权威来源，
+//   供 console 注入 BreakoutTracker，盘中重启控制台也能拿到正确区间）
+function attackFromPeriod(p) {
+  if (!p) return {};
+  // plot 键名 = 标题剥离非 ASCII。用户改过指标后 premarketHigh/premarketLow
+  // 的标题变成中文/空标题，WS 键名退化为 plot_1/_2（实测 HOOD 验证：
+  // plot_1=98.1=周五盘前高，_2=96=盘前低）——两套键名都兼容。
+  // K/K_2 = 第二区间（双区间之开盘区间，暂不使用）。
+  const pmhRaw = p.premarketHigh != null ? p.premarketHigh : p.plot_1;
+  const pmlRaw = p.premarketLow != null ? p.premarketLow : p._2;
+  return {
+    time: p.$time,   // 该值所属 bar 的时间戳：消费方用它校验 attack_c 与 bar_c 对齐
+    bar_color: finite(p.Bar_Color),
+    pmh: finite(pmhRaw),
+    pml: finite(pmlRaw),
+  };
+}
+
+// 把一根 bar 的 FVG Finder+ plot 值归一化为标准结构。
+// 键名是中文 plot 标题被剥离非 ASCII 后的实测结果（见文件头映射表）。
+// fvg_last_dir：上下沿只在新 FVG 形成时更新，方向 = 自 idx 向前扫描
+// periods 历史中最后一个非零 fvg_event；扫不到（窗口内无 FVG）为 null。
+function fvgFromPeriod(p, periods, idx) {
+  if (!p) return {};
+  let lastDir = null;
+  if (periods) {
+    for (let i = idx; i < periods.length; i++) {
+      const ev = finite(periods[i] && periods[i].KFVG110);
+      if (ev !== null && ev !== 0) { lastDir = ev > 0 ? 1 : -1; break; }
+    }
+  }
+  return {
+    time: p.$time,   // 该值所属 bar 的时间戳：消费方用它校验 fvg_c 与 bar_c 对齐
+    fvg_cum_count: finite(p.STFVG),
+    fvg_last_top: finite(p.FVG),
+    fvg_last_bottom: finite(p.FVG_2),
+    fvg_event: finite(p.KFVG110),
+    fvg_last_dir: lastDir,
+  };
+}
+
 async function main() {
-  const args = parseArgs(process.argv);
+  const args = _args;
   const creds = JSON.parse(fs.readFileSync(args.creds, 'utf8'));
 
   const trendStateIndic = await TradingView.getIndicator(
     TREND_STATE_ID, 'last', creds.sessionid, creds.sessionid_sign);
   // 输入全部用指标默认值（ATR 10 / Factor 3.0 / Channel 1.0 / 回看 6 /
   // EMA差值>1×ATR），与图表上的指标所见即所得，不做 setOption 覆盖
+  const fvgIndic = await TradingView.getIndicator(
+    FVG_ID, 'last', creds.sessionid, creds.sessionid_sign);
+  // FVG 同样用指标默认输入（过滤器 Off / ST 3.0×10 等），与图表所见即所得
+  const ssIndic = await TradingView.getIndicator(
+    SMART_STOP_ID, 'last', creds.sessionid, creds.sessionid_sign);
+  // smart_stop 同样用默认输入（ATR10 / 回看 3 / 钳制 1~2×ATR）
+  const attackIndic = await TradingView.getIndicator(
+    ATTACK_ZONE_ID, 'last', creds.sessionid, creds.sessionid_sign);
+  // 进攻区域同样用指标默认输入（双区间/方向过滤器均为图表默认值）
 
   const client = new TradingView.Client({
     token: creds.sessionid,
@@ -96,20 +209,27 @@ async function main() {
   });
 
   const state = {};
-  const charts = [];
+  const entries = {};   // symbol -> {chart, studies, createdAt, rebuilds, rebuilding, gaveUp}
 
-  for (const symbol of args.symbols) {
-    state[symbol] = { bar: null, bar_c: null, ts: {}, ts_c: {} };
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-    // 5M session：K线 + trend_state（200 根保证 EMA100 + 回看 warmup）
-    // 会话 = extended：含当天完整盘前数据的指标才与用户图表一致
-    // （regular 缺盘前历史，EMA/ST/ATR 开盘时段严重失真，实测 10-13 翻车）
+  // 单 chart 创建（初始分批与巡检重建共用）：4 个 Study 同 session 挂载，
+  // state[symbol] 对象跨重建复用（推送循环只认 state，无感）
+  function spawnChart(symbol, rebuilds = 0) {
     const chart = new client.Session.Chart();
-    charts.push(chart);
     chart.setMarket(symbol, { timeframe: '5', range: 200, session: 'extended' });
     const tsStudy = new chart.Study(trendStateIndic);
+    const fvgStudy = new chart.Study(fvgIndic);
+    const ssStudy = new chart.Study(ssIndic);
+    const attackStudy = new chart.Study(attackIndic);
+    entries[symbol] = {
+      chart, studies: { attack: attackStudy },
+      createdAt: Date.now(), rebuilds, rebuilding: false, gaveUp: false,
+    };
 
     chart.onUpdate(() => {
+      const ent = entries[symbol];
+      if (ent) ent.rebuilding = false;   // 首批数据到达 = 重建完成
       if (chart.periods && chart.periods.length) {
         const b = chart.periods[0];   // periods 倒序 [0]=最新（实时，未收盘）
         state[symbol].bar = {
@@ -123,6 +243,13 @@ async function main() {
             low: bc.min, close: bc.close, volume: bc.volume,
           };
         }
+        const b2 = chart.periods[2];  // 上上根已收盘（回踩单定价基准，随新 bar 滚动）
+        if (b2) {
+          state[symbol].bar_c2 = {
+            time: b2.time, open: b2.open, high: b2.max,
+            low: b2.min, close: b2.close, volume: b2.volume,
+          };
+        }
       }
     });
     tsStudy.onUpdate(() => {
@@ -132,15 +259,103 @@ async function main() {
         if (ps[1]) state[symbol].ts_c = tsFromPeriod(ps[1]);  // 确认（策略用）
       }
     });
+    ssStudy.onUpdate(() => {
+      // smart_stop 存独立字段（ss/ss_c），推送时才合并进 ts/ts_c——
+      // 直接 Object.assign 进 ts 会被 tsStudy 的下一次整对象覆盖（竞态丢值）
+      const ps = ssStudy.periods;
+      if (ps && ps.length) {
+        state[symbol].ss = ssFromPeriod(ps[0]);
+        if (ps[1]) state[symbol].ss_c = ssFromPeriod(ps[1]);
+      }
+    });
+    fvgStudy.onUpdate(() => {
+      const ps = fvgStudy.periods;
+      if (ps && ps.length) {
+        state[symbol].fvg = fvgFromPeriod(ps[0], ps, 0);      // 实时（仅显示）
+        if (ps[1]) state[symbol].fvg_c = fvgFromPeriod(ps[1], ps, 1);  // 确认（策略/选股用）
+      }
+    });
+    attackStudy.onUpdate(() => {
+      // 进攻区域存独立字段（attack/attack_c），推送时直接下发——
+      // 同 ss 的教训：不 Object.assign 进别的通道，防整对象覆盖竞态
+      const ps = attackStudy.periods;
+      if (ps && ps.length) {
+        state[symbol].attack = attackFromPeriod(ps[0]);       // 实时（仅显示）
+        if (ps[1]) state[symbol].attack_c = attackFromPeriod(ps[1]);  // 确认（盘前区间注入用）
+      }
+    });
     chart.onError((...e) => console.error(`[${symbol}/5m] err:`,
       JSON.stringify(e).slice(0, 150)));
   }
+
+  async function rebuildChart(symbol, why) {
+    const e = entries[symbol];
+    if (!e || e.rebuilding || e.gaveUp) return;
+    e.rebuilding = true;
+    const n = e.rebuilds + 1;
+    try { e.chart.delete(); } catch (_) { /* 旧 session 可能已死，忽略 */ }
+    if (n > MAX_REBUILDS) {
+      e.gaveUp = true;
+      e.rebuilding = false;
+      console.error(`[${symbol}] 重建已达 ${MAX_REBUILDS} 次仍不就绪（${why}），放弃自动重建`);
+      return;
+    }
+    console.error(`[${symbol}] 重建 chart（${why}，第 ${n}/${MAX_REBUILDS} 次）`);
+    spawnChart(symbol, n);
+    // spawnChart 会替换 entries[symbol]（rebuilding 被重置），重新标记，
+    // 直到新 chart 首批数据到达（chart.onUpdate 里清除）
+    const ne = entries[symbol];
+    if (ne) ne.rebuilding = true;
+  }
+
+  // 分批发起订阅：一次性并发建 51 chart 会被 TV 限流（实测卡在部分标的
+  // 且不自愈），每批 BATCH_SIZE 个、批间 sleep BATCH_DELAY_MS
+  for (const symbol of args.symbols) {
+    state[symbol] = { bar: null, bar_c: null, bar_c2: null, ts: {}, ts_c: {}, fvg: {}, fvg_c: {}, ss: {}, ss_c: {}, attack: {}, attack_c: {} };
+  }
+  for (let i = 0; i < args.symbols.length; i += BATCH_SIZE) {
+    const batch = args.symbols.slice(i, i + BATCH_SIZE);
+    for (const symbol of batch) spawnChart(symbol);
+    console.error(`[batch] 已发起 ${Math.min(i + BATCH_SIZE, args.symbols.length)}/${args.symbols.length} 个 chart`);
+    if (i + BATCH_SIZE < args.symbols.length) await sleep(BATCH_DELAY_MS);
+  }
+
+  // 巡检自愈：chart 创建超过 READY_GRACE_MS 仍无 bar 数据，或 attack study
+  // 超过 ATTACK_GRACE_MS 无 pmh 值 → 销毁重建（逐个间隔发起，别一次性全砸）
+  let sweeping = false;   // 单飞：一轮重建 54 chart×1.5s 远超巡检间隔，
+                          // 不拦会叠扫→同一 chart 连环重建（实测 40ms 内 3 次）
+  setInterval(() => {
+    if (sweeping) return;
+    sweeping = true;
+    const now = Date.now();
+    const dead = [];
+    for (const [sym, e] of Object.entries(entries)) {
+      if (e.rebuilding || e.gaveUp) continue;
+      const age = now - e.createdAt;
+      const hasBars = !!(e.chart.periods && e.chart.periods.length);
+      const aps = e.studies.attack.periods;
+      const hasAttack = !!(aps && aps.length && finite(aps[0].premarketHigh != null ? aps[0].premarketHigh : aps[0].plot_1) !== null);
+      if (age > READY_GRACE_MS && !hasBars) dead.push([sym, '无K线数据']);
+      else if (age > ATTACK_GRACE_MS && hasBars && !hasAttack) dead.push([sym, 'attack无值']);
+    }
+    (async () => {
+      try {
+        for (const [sym, why] of dead) {
+          await rebuildChart(sym, why);
+          await sleep(REBUILD_STAGGER_MS);
+        }
+      } finally {
+        sweeping = false;
+      }
+    })();
+  }, INSPECT_INTERVAL_MS);
 
   // 每秒输出一次最新快照
   setInterval(() => {
     const symbols = {};
     for (const [sym, s] of Object.entries(state)) {
-      if (s.bar) symbols[sym] = { bar: s.bar, bar_c: s.bar_c, ts: s.ts, ts_c: s.ts_c };
+      // smart_stop（ss/ss_c 独立通道）推送时合并进 ts/ts_c，消费方无感知
+      if (s.bar) symbols[sym] = { bar: s.bar, bar_c: s.bar_c, bar_c2: s.bar_c2, ts: { ...s.ts, ...s.ss }, ts_c: { ...s.ts_c, ...s.ss_c }, fvg: s.fvg, fvg_c: s.fvg_c, attack: s.attack, attack_c: s.attack_c };
     }
     if (Object.keys(symbols).length > 0) {
       process.stdout.write(JSON.stringify({
@@ -154,7 +369,7 @@ async function main() {
     process.stdout.write(JSON.stringify({ type: 'heartbeat', ts: Date.now() / 1000 }) + '\n');
   }, HEARTBEAT_MS);
 
-  console.error(`daemon 订阅就绪: ${args.symbols.length} 个标的 (5M K线 + trend_state)`);
+  console.error(`daemon 订阅就绪: ${args.symbols.length} 个标的 (5M K线 + trend_state + FVG Finder+ + smart_stop + 进攻区域；分批 ${BATCH_SIZE}×${BATCH_DELAY_MS}ms，巡检自愈已开启)`);
 }
 
 main().catch((e) => {
