@@ -51,8 +51,31 @@
         <span class="stat-item">IBKR <b>{{ clock(ibkrTime) }}</b></span>
         <span class="stat-item">更新延时 <b :class="(status.bar_update_delay || 0) > 5 ? 'delay-warn' : ''">{{ status.bar_update_delay == null ? '—' : status.bar_update_delay + 's' }}</b></span>
         <span class="stat-item">最大 <b>{{ maxDelay }}s</b></span>
+        <el-button size="small" class="precheck-btn" @click="openPrecheck">盘前检查</el-button>
       </div>
     </header>
+
+    <!-- 盘前检查单结果面板（绿灯/红灯/中性一眼扫完） -->
+    <el-dialog v-model="precheckVisible" title="盘前检查单" width="560px">
+      <template v-if="precheck">
+        <div class="precheck-head">
+          <el-tag :type="precheck.overall === 'ok' ? 'success' : 'danger'" effect="dark">
+            {{ precheck.overall === 'ok' ? '全部就绪' : '有红项' }}
+          </el-tag>
+          <span class="muted">{{ precheck.day }} · {{ new Date(precheck.ts * 1000).toLocaleTimeString() }}</span>
+          <el-button size="small" type="primary" style="margin-left:auto" :loading="precheckLoading" @click="runPrecheck">重新运行</el-button>
+        </div>
+        <div v-for="it in precheck.items" :key="it.key" class="precheck-row" :class="it.status">
+          <span class="precheck-dot">{{ precheckIcon(it.status) }}</span>
+          <b class="precheck-name">{{ it.name }}</b>
+          <span class="precheck-detail">{{ it.detail }}</span>
+        </div>
+      </template>
+      <div v-else class="muted log-empty">
+        暂无记录
+        <el-button size="small" type="primary" :loading="precheckLoading" @click="runPrecheck">立即运行</el-button>
+      </div>
+    </el-dialog>
 
     <!-- 告警横幅：活跃告警（数据陈旧/TWS断线/裸仓等），可逐条消除，服务端解除自动消失 -->
     <div v-if="visibleAlerts.length" class="alert-banner">
@@ -190,7 +213,7 @@
                 <div class="fvg-head">
                   <span class="fvg-title">FVG 动态监控</span>
                   <div class="fvg-window">
-                    <span v-for="w in [15, 30, 60]" :key="w" :class="{ on: fvgWindow === w }" @click="fvgWindow = w">{{ w >= 60 ? '1 小时' : w + ' 分钟' }}</span>
+                    <span v-for="w in [10, 15, 30]" :key="w" :class="{ on: fvgWindow === w }" @click="fvgWindow = w">{{ w + ' 分钟' }}</span>
                   </div>
                   <span class="fvg-legend">ATR 倍数 = 缺口高度 ÷ ATR(10) · 按时间倒序 · 5M 收盘确认</span>
                   <span class="fvg-tick-toggle" :title="fvgTickOn ? '五分钟滴答提醒：开（点击关闭）' : '五分钟滴答提醒：关（点击开启）'" @click="toggleFvgTick">{{ fvgTickOn ? '🔊' : '🔇' }}</span>
@@ -265,6 +288,52 @@
                         <span class="fvg-empty-text">暂无回踩</span>
                       </div>
                     </div>
+                  </div>
+                </div>
+              </div>
+            </el-tab-pane>
+            <!-- 盘前报告 tab（第二位）：生成按钮+进度态 / 历史列表 / markdown 正文 -->
+            <el-tab-pane label="盘前报告" name="reports">
+              <div class="perf-panel report-wrap">
+                <div class="report-head">
+                  <span class="news-title">盘前交易分析报告</span>
+                  <el-button size="small" type="primary" :loading="reportStatus.running" @click="generateReport">
+                    {{ reportStatus.running ? '生成中 ' + reportElapsed + 's' : '生成今日报告' }}
+                  </el-button>
+                  <span v-if="reportStatus.last_result" class="muted">上次：{{ reportStatus.last_result.date }} · {{ reportStatus.last_result.degraded ? '降级' : (reportStatus.last_result.model || '') }} · {{ reportStatus.last_result.market_items ?? '?' }}条</span>
+                  <span v-if="reportStatus.last_error" class="report-err">{{ reportStatus.last_error }}</span>
+                </div>
+                <!-- 视频源：粘贴 YouTube 链接，字幕摘要并入报告第六章 -->
+                <div class="src-bar">
+                  <el-input v-model="srcInput" size="small" class="src-input"
+                            placeholder="粘贴 YouTube 视频链接（字幕并入盘前报告）"
+                            @keyup.enter="addSource"></el-input>
+                  <el-button size="small" @click="addSource">添加视频源</el-button>
+                  <div v-if="srcList.length" class="src-list">
+                    <span v-for="s in srcList" :key="s.video_id" class="src-chip" :class="{ off: !s.enabled }"
+                          :title="s.last_error || s.url">
+                      <el-checkbox :model-value="!!s.enabled" size="small" @change="toggleSource(s)"></el-checkbox>
+                      <b class="src-name">{{ s.title || s.video_id }}</b>
+                      <small class="muted">{{ s.channel }}</small>
+                      <span v-if="s.last_error" class="src-err">⚠ {{ s.last_status === 'meta_failed' ? '元数据失败' : s.last_error }}</span>
+                      <span class="src-x" title="删除" @click="deleteSource(s)">×</span>
+                    </span>
+                  </div>
+                </div>
+                <div class="report-body">
+                  <div class="report-list">
+                    <div v-for="r in reportList" :key="r.date" class="report-item tv-link"
+                         :class="{ on: reportDate === r.date }" @click="loadReport(r.date)">
+                      <b>{{ r.date }}</b>
+                      <small class="muted">{{ (r.meta && r.meta.model) || '降级' }} · {{ (r.meta && r.meta.market_items) ?? '?' }}条</small>
+                    </div>
+                    <div v-if="!reportList.length" class="muted log-empty">
+                      暂无历史报告。每天盘前点「生成今日报告」：采集大盘+自选股新闻（约 2 分钟），LLM 归纳五章节分析，存档供复盘。
+                    </div>
+                  </div>
+                  <div class="report-content" @click="reportClick">
+                    <div v-if="!reportMd" class="muted log-empty">{{ reportList.length ? '← 选择左侧日期查看报告' : '' }}</div>
+                    <div v-else v-html="renderMd(reportMd)"></div>
                   </div>
                 </div>
               </div>
@@ -371,6 +440,58 @@
             <!-- 影子回测 tab -->
             <el-tab-pane label="影子" name="shadow">
               <div class="perf-panel">
+                <!-- 每日复盘报告（收盘后 16:20 ET 自动生成；此处可手动重算任意历史日） -->
+                <div class="perf-group">
+                  <div class="perf-group-title">每日复盘报告</div>
+                  <div class="shadow-bt-form">
+                    <el-date-picker v-model="reportDay" size="small" type="date" value-format="YYYY-MM-DD" placeholder="日期（默认当天）" style="width:170px"></el-date-picker>
+                    <el-button size="small" type="primary" :loading="reportLoading" @click="loadReport">生成/查看</el-button>
+                    <span v-if="report" class="muted">{{ report.day }} · 影子单 {{ report.total_signals }} 笔 · 生成于 {{ report.generated_at }}</span>
+                  </div>
+                  <template v-if="report">
+                    <div class="perf-group-title">分组统计（信号类型 × 方向）</div>
+                    <div class="perf-row shadow-dist-head">
+                      <span class="perf-name">类型/方向</span><span>笔数(成交率)</span><span>胜率</span><span>平均R / 期望R</span><span>到2R / 触止损</span>
+                    </div>
+                    <div v-for="g in report.groups" :key="g.type + g.side" class="perf-row">
+                      <span class="perf-name">{{ shadowTypeText(g.type) }}·{{ g.side === 'long' ? '多' : '空' }}</span>
+                      <span>{{ g.count }}（{{ g.fill_rate }}%）</span>
+                      <span :class="pnlClass(g.win_rate - 50)">{{ g.win_rate }}%</span>
+                      <span>{{ g.avg_r }}R / {{ g.expectancy }}R</span>
+                      <span>{{ g.reached_2r_pct }}% / {{ g.hit_stop_pct }}%</span>
+                    </div>
+                    <template v-if="report.breakout_crowd && report.breakout_crowd.length">
+                      <div class="perf-group-title">突破：拥挤度细分（三连升级有没有用）</div>
+                      <div v-for="g in report.breakout_crowd" :key="g.bucket" class="perf-row">
+                        <span class="perf-name" style="width:150px">{{ g.bucket }}</span>
+                        <span>{{ g.count }} 笔</span>
+                        <span :class="pnlClass(g.win_rate - 50)">胜率 {{ g.win_rate }}%</span>
+                        <span>期望 {{ g.expectancy }}R</span>
+                      </div>
+                    </template>
+                    <div class="perf-group-title">大行情抓到 vs 漏掉（RTH ≥+{{ report.big_moves.threshold_pct }}%）</div>
+                    <div class="perf-row">
+                      <span>共 {{ report.big_moves.total_big_moves }} 只：抓住 <b class="pnl-pos">{{ report.big_moves.caught_count }}</b> / 漏掉 <b class="pnl-neg">{{ report.big_moves.missed_count }}</b></span>
+                    </div>
+                    <div v-for="m in report.big_moves.caught" :key="'c'+m.symbol" class="perf-row">
+                      <span class="perf-name pnl-pos">✓ {{ m.symbol.split(':').pop() }}</span>
+                      <span>+{{ m.pct }}%</span>
+                      <span>入 {{ m.entry }}</span>
+                      <b :class="pnlClass(m.outcome_r)">{{ shadowOutcomeText(m.outcome) }} {{ m.outcome_r }}R</b>
+                    </div>
+                    <div v-for="m in report.big_moves.missed" :key="'m'+m.symbol" class="perf-row">
+                      <span class="perf-name pnl-neg">✗ {{ m.symbol.split(':').pop() }}</span>
+                      <span>+{{ m.pct }}%</span>
+                      <span class="muted">{{ m.reason }}</span>
+                    </div>
+                    <div class="perf-group-title">止损松紧分析（已成交 {{ report.stop_analysis.hit_stop_count }} 笔止损）</div>
+                    <div class="perf-row">
+                      <span>止损距离 &lt;1×ATR：<b>{{ report.stop_analysis.tighter_than_1atr_pct }}%</b>（{{ report.stop_analysis.tighter_than_1atr_count }} 笔）</span>
+                      <span>曾浮盈 &gt;0.5R 被打回：<b>{{ report.stop_analysis.had_05r_pct }}%</b></span>
+                      <span>曾浮盈 &gt;1R 被打回：<b class="pnl-neg">{{ report.stop_analysis.had_1r_pct }}%</b></span>
+                    </div>
+                  </template>
+                </div>
                 <div class="perf-overall">
                   <div class="perf-stat"><span>事件总数</span><b>{{ shadow.stats.total_events || 0 }}</b></div>
                   <div class="perf-stat"><span>跟踪中</span><b>{{ shadow.stats.active || 0 }}</b></div>
@@ -408,6 +529,23 @@
                     <span>≥1R {{ d.pct_ge_1r }}%</span>
                   </div>
                 </div>
+                <!-- 统一影子跟踪：按信号类型分组 + 结局分布 -->
+                <div class="perf-group" v-if="shadow.stats.by_type || shadow.stats.outcomes">
+                  <div class="perf-group-title">按信号类型（笔数 / ≥1R / 平均MFE / 平均MAE / 平均结果）</div>
+                  <div v-for="(d, k) in shadow.stats.by_type" :key="k" class="perf-row">
+                    <span class="perf-name">{{ shadowTypeText(k) }}</span>
+                    <span>笔数{{ d.count }}</span>
+                    <span>≥1R {{ d.pct_ge_1r }}%</span>
+                    <span>MFE {{ d.avg_mfe }}R / MAE {{ d.avg_mae }}R</span>
+                    <b :class="pnlClass(d.avg_outcome_rr)">{{ d.avg_outcome_rr }}R</b>
+                  </div>
+                  <div class="perf-row" v-if="shadow.stats.outcomes">
+                    <span class="perf-name">结局</span>
+                    <span v-for="(c, o) in shadow.stats.outcomes" :key="o" class="muted">
+                      {{ shadowOutcomeText(o) }} {{ c }}
+                    </span>
+                  </div>
+                </div>
                 <div class="perf-group">
                   <div class="perf-group-title">历史回测（指定标的 + 交易日）</div>
                   <div class="shadow-bt-form">
@@ -434,22 +572,30 @@
                   </template>
                 </div>
                 <div class="perf-group">
-                  <div class="perf-group-title">当日回踩事件（实时推演）</div>
+                  <div class="perf-group-title" style="display:flex;align-items:center;gap:10px">
+                    <span>当日影子信号（实时推演）</span>
+                    <el-select v-model="shadowTypeFilter" size="small" style="width:130px">
+                      <el-option label="全部类型" value="all"></el-option>
+                      <el-option v-for="t in ['pullback','proposal','fvg_event','fvg_retest','fvg_warn','breakout']"
+                                 :key="t" :label="shadowTypeText(t)" :value="t"></el-option>
+                    </el-select>
+                  </div>
                   <div class="perf-row shadow-dist-head">
                     <span class="perf-name">时间</span>
-                    <span>标的/方向/线</span>
+                    <span>标的/方向/类型</span>
                     <span>入场/止损</span>
-                    <span>止损前MFE / 收盘前MFE</span>
+                    <span>MFE / MAE</span>
                     <span>结果</span>
                   </div>
-                  <div v-for="t in shadow.events" :key="t.shadow_id" class="perf-row">
+                  <div v-for="t in filteredShadowEvents" :key="t.shadow_id" class="perf-row">
                     <span class="perf-name">{{ hmET(t.bar_time) }}</span>
-                    <span>{{ t.ticker }} <b :class="t.side === 'long' ? 'pnl-pos' : 'pnl-neg'">{{ t.side === 'long' ? '多' : '空' }}</b> {{ t.line_type === 'ema' ? 'EMA' : '通道' }}</span>
+                    <span>{{ t.ticker }} <b :class="t.side === 'long' ? 'pnl-pos' : 'pnl-neg'">{{ t.side === 'long' ? '多' : '空' }}</b>
+                      {{ shadowTypeText(t.signal_type) }}{{ t.line_type ? '·' + (t.line_type === 'ema' ? 'EMA' : '通道') : '' }}{{ t.filled === false ? '（未触及）' : '' }}</span>
                     <span>{{ t.entry }} / {{ t.stop }}</span>
-                    <span>{{ t.mfe_rr }}R / {{ t.mfe_rr_eod }}R</span>
-                    <b :class="t.settled ? pnlClass(t.outcome_rr) : 'muted'">{{ t.settled ? t.outcome_rr + 'R' : (t.stopped ? '已止损' : '跟踪中') }}</b>
+                    <span>{{ t.mfe_rr }}R / {{ t.mae_rr }}R</span>
+                    <b :class="t.settled ? pnlClass(t.outcome_rr) : 'muted'">{{ t.settled ? shadowOutcomeText(t.outcome) + ' ' + t.outcome_rr + 'R' : (t.stopped ? '已止损' : (t.filled === false ? '等成交' : '跟踪中')) }}</b>
                   </div>
-                  <div v-if="!shadow.events.length" class="muted log-empty">暂无回踩事件（盘中实时检测：ema_fast / channel_edge 刺穿收回）</div>
+                  <div v-if="!filteredShadowEvents.length" class="muted log-empty">暂无影子信号（实时检测：回踩/FVG/突破/策略候选 全类型建档）</div>
                 </div>
               </div>
             </el-tab-pane>

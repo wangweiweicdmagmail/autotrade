@@ -1,6 +1,7 @@
 # autotrade 交易控制台 — 详细设计文档
 
-> 版本：2026-10-21 更新（回踩单 retest + 股数跟随改价、OCA 竞态成交真相根治、幻影守卫、FVG 监控器 + 通报阈值 + 3 分钟倒计时）
+> 版本：2026-10-27 更新（盘前报告工作流 + YouTube 视频源章节；TV 切标的冷启动修专用 Chrome profile；FVG 监控窗口 10/15/30 分钟）
+> 历史版本：2026-10-21（回踩单 retest + 股数跟随改价、OCA 竞态成交真相根治、幻影守卫、FVG 监控器 + 通报阈值 + 3 分钟倒计时）
 > 历史版本：2026-10-20（FVG Finder+ 第二订阅指标：快照 fvg/fvg_c + 策略 FVG 入场线/过滤 + 选股 FVG 维度）
 > 覆盖范围：TradingView 数据订阅 → 指标计算 → 下单执行 → 仓位管理 → 前端控制台的全链路设计。
 > 配套文档：`PLAYBOOK.md`（交易规则）、`STRATEGY_RULES.md`（策略 v1）、`PROJECT_NOTES.md`（历史交接）。
@@ -845,6 +846,45 @@ FVG（多 fvg_event=1 / 空 -1）且同向 K 线 → 同一确认时刻候选 �
   hot_symbols → 琥珀「新闻」小徽标（tooltip=gist）。
 - 测试 tests/test_news_digest.py（fixture XML + mock LLM，零网络）；
   真网冒烟在 tests/live/test_news_live.py（mark live，默认不跑）。
+
+---
+
+## 17. 盘前报告工作流 + YouTube 视频源（v2026-10-25）
+
+新闻摘要（§16）之上再加一层「盘前交易分析报告」：LLM 生成中文 markdown
+（固定五章节：隔夜综述/主题/自选股催化/盘前异动/风险提示；有视频源时加
+第六章「盘前视频观点」），存档供复盘。
+
+- **报告层**（engine/news_digest.py）：`news_window`（D-1 16:00 ~ D 09:30
+  ET 窗口）/ `backfill_suffix`（Google News after:/before: 日期运算符回填）
+  / `generate_report`（markdown 章节校验，缺章回退降级汇编）/ `save_report`
+  （报告头 + 原始条目附录，tmp+replace 原子写 → logs/reports/
+  premarket-YYYYMMDD.md）。降级路径：LLM 不可用仍产出标题汇编版并标注。
+- **视频源**（engine/youtube_digest.py）：用户贴 YouTube 链接（watch?v=/
+  youtu.be//shorts/ 三种形态），本机 yt-dlp（env YT_DLP 覆盖路径）抓元数据
+  + 字幕（元数据直链优先，回退 --write-auto-subs；VTT→纯文本去时间戳、
+  滚动重复行合并、6000 词截断）；⚠️ 必须带 Chrome cookies（env
+  YT_DLP_COOKIES，默认 "chrome"，空串关闭）否则被反爬拦「not a bot」。
+  发布时间窗口过滤（timestamp 精确优先，upload_date 日级兜底）；LLM 中文
+  摘要 ~200 字；缓存 logs/yt_cache/<video_id>.json（字幕哈希一致不重复调
+  LLM）。单视频任何失败只标记 status/error，不阻塞报告。
+  ⚠️ YouTube 对字幕端点有 IP 级 429 限流（Google「Sorry」页），密集重试
+  会加重；触发后等一段时间再试，报告侧自动降级跳过该视频。
+- **CLI**：`python3 premarket_report.py [--day YYYY-MM-DD]`（--day=回填
+  模式：窗口过滤 + 跳过 MarketWatch 无历史；缺省=当日前 18h）。
+- **console API**（只追加）：`GET /api/reports`（列表倒序）/
+  `GET /api/reports/{date}`（全文，日期格式硬校验防路径穿越）/
+  `GET /api/reports/status` / `POST /api/reports/generate`（require_trader；
+  在跑 409、冷却 10 分钟 429；asyncio task 后台跑，完成/失败记事件）；
+  视频源管理 `GET|POST /api/report/sources`、`/{video_id}/toggle|delete`
+  （落盘 logs/report_sources.json，添加后异步补元数据，生成后回写
+  last_status/last_error）。
+- **前端「盘前报告」tab**（FVG 监控后第二位，盘前新闻顺延第三）：
+  「生成今日报告」按钮（running 倒计时 + 上次结果）/ 左列历史列表 /
+  右列轻量 markdown 渲染（ticker 可点 → tvShow）/ 视频源输入框与列表。
+- 测试：tests/test_reports_api.py（API/工作流/并发锁/冷却/路径穿越）、
+  tests/test_youtube_digest.py（链接解析/VTT/窗口/缓存/编排，全 mock）；
+  真网冒烟 tests/live/test_youtube_live.py（mark live）。
 
 ---
 

@@ -51,6 +51,7 @@ from engine.breakout_tracker import BreakoutTracker
 from engine import news_digest
 from engine.notifier import Notifier
 from engine.realtime_collector import RealtimeCollector
+from engine import shadow_report
 from engine.shadow_tracker import ShadowTracker
 from engine.strategies import build_strategy
 from execution.ibkr import IBKRGateway
@@ -659,6 +660,7 @@ _auto_close_notices: dict = {}
 # 影子回测跟踪器（回踩事件 → 逐 bar 回测推演 → 信号有效性统计）
 shadow_tracker: ShadowTracker = ShadowTracker()
 _shadow_task: Optional[asyncio.Task] = None
+_shadow_proposal_recorded: set = set()   # 已建档的策略候选 proposal_id（当天去重）
 
 # 策略引擎（开仓候选人工确认 + bar 收盘自动管理）
 auto_engine: StrategyEngine = StrategyEngine(
@@ -696,6 +698,8 @@ _breakout_injected: dict = {}    # symbol -> 已注入盘前区间的 ET 交易�
 _breakout_task: Optional[asyncio.Task] = None
 _naked_position_task: Optional[asyncio.Task] = None   # 裸仓巡检（STP 缺失自动补挂）
 _health_watch_task: Optional[asyncio.Task] = None     # 健康巡检（TWS 断线/数据陈旧）
+_report_task: Optional[asyncio.Task] = None           # 每日复盘（交易日 16:20 ET）
+_precheck_task: Optional[asyncio.Task] = None         # 盘前检查单（交易日 09:25 ET）
 
 
 # ---------------------------------------------------------------------------
@@ -1382,6 +1386,267 @@ async def _health_watch_loop() -> None:
             logger.exception("健康巡检异常: %s", e)
 
 
+# ---------------------------------------------------------------------------
+# 每日复盘报告（shadow_report）：交易日 16:20 ET 自动生成 + 手动重算
+# ---------------------------------------------------------------------------
+
+_REPORTS_DIR = Path(__file__).resolve().parent.parent / "logs"
+
+
+async def _generate_daily_report(day: str, db_path: Optional[Path] = None
+                                 ) -> dict:
+    """生成并落盘当日复盘报告（logs/report-YYYYMMDD.json）+ 事件 +
+    iMessage 摘要（未配置收件人自动跳过）。"""
+    report = shadow_report.generate_report(day, db_path=db_path)
+    path = _REPORTS_DIR / f"report-{day.replace('-', '')}.json"
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(report, ensure_ascii=False, indent=1),
+                   encoding="utf-8")
+    os.replace(tmp, path)
+    bm = report["big_moves"]
+    record_event("shadow_report", day=day, total=report["total_signals"],
+                 big_moves=bm["total_big_moves"], caught=bm["caught_count"],
+                 missed=bm["missed_count"], path=str(path))
+    lines = shadow_report.summary_lines(report)
+    await notifier.notify(f"report:{day}", "info", "每日复盘", lines[0])
+    await notifier.send_imessage(f"report:{day}", "\n".join(lines))
+    logger.info("每日复盘报告已生成: %s（%d 笔影子单）", path,
+                report["total_signals"])
+    return report
+
+
+async def _report_check_once(now, done_days: set,
+                             db_path: Optional[Path] = None) -> bool:
+    """调度单拍（可测）：ET 工作日且时间 ≥16:20 且当天未生成 → 生成。
+    返回本拍是否生成。周末（weekday>=5）不跑。"""
+    if now.weekday() >= 5:
+        return False
+    hm = now.hour * 60 + now.minute
+    day_key = now.strftime("%Y-%m-%d")
+    if hm < 16 * 60 + 20 or day_key in done_days:
+        return False
+    await _generate_daily_report(day_key, db_path=db_path)
+    done_days.add(day_key)
+    return True
+
+
+async def _report_loop() -> None:
+    """每日复盘调度（每 60s 检查；单拍见 _report_check_once）。"""
+    from zoneinfo import ZoneInfo
+    import datetime as _dt
+    et = ZoneInfo("America/New_York")
+    done_days: set = set()
+    while True:
+        await asyncio.sleep(60.0)
+        try:
+            await _report_check_once(_dt.datetime.now(et), done_days)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("每日复盘调度异常: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# 盘前检查单（precheck）：开盘前绿灯清单，09:25 ET 自动跑 + 手动随时跑
+# ---------------------------------------------------------------------------
+
+_PRECHECK_DIR = Path(__file__).resolve().parent.parent / "logs"
+
+
+def _pc_item(key: str, name: str, status: str, detail: str) -> dict:
+    return {"key": key, "name": name, "status": status, "detail": detail}
+
+
+async def run_precheck() -> dict:
+    """盘前检查单（纯读现有状态，无副作用）。
+    每项 {key, name, status: ok/bad/neutral/skip, detail}；
+    overall = 有红则 bad，否则 ok（neutral/skip 不拖红）。"""
+    from zoneinfo import ZoneInfo
+    import datetime as _dt
+    et = ZoneInfo("America/New_York")
+    now = _dt.datetime.now(et)
+    hm = now.hour * 60 + now.minute
+    items = []
+
+    # 1) 数据流：快照标的覆盖率 + 最新 bar 新鲜度
+    market = collector.latest() or {}
+    n_syms, n_watch = len(market), len(config.WATCHLIST)
+    missing = sorted(set(config.WATCHLIST) - set(market))
+    bt = collector.latest_bar_time or 0
+    age = (time.time() - bt) if bt else None
+    fresh = age is not None and age < 600
+    detail = (f"标的 {n_syms}/{n_watch}"
+              + (f"，缺 {', '.join(m[:12] for m in missing[:5])}"
+                 + ("…" if len(missing) > 5 else "") if missing else "")
+              + ("；最新 bar " + ("无数据" if age is None
+                 else f"{int(age // 60)} 分钟前" + ("（新鲜）" if fresh
+                 else "（>10 分钟，陈旧）"))))
+    items.append(_pc_item("data_flow", "数据流",
+                          "ok" if (n_syms >= n_watch and fresh) else "bad",
+                          detail))
+
+    # 2) 盘前区间注入（attack_c）：09:30 前未注入属正常（中性「待注入」）
+    n_attack = sum(1 for d in market.values()
+                   if (d.get("attack_c") or {}).get("pmh") is not None)
+    if hm < 570:
+        items.append(_pc_item("attack_zone", "盘前区间注入", "neutral",
+                              f"待注入（09:30 锁定后注入）：当前 {n_attack}/"
+                              f"{n_syms} 已有 attack_c 值"))
+    else:
+        items.append(_pc_item("attack_zone", "盘前区间注入",
+                              "ok" if (n_syms and n_attack >= n_syms)
+                              else "bad",
+                              (f"{n_attack}/{n_syms} 标的已注入盘前区间"
+                               if n_syms else "无快照数据（数据流先修）")))
+
+    # 3) IBKR：连接 + 净值可取（取不到则日亏损熔断处于 fail-open）
+    status = await get_status_cached()
+    connected = bool(gateway._connected)
+    equity = status.get("equity")
+    ok3 = connected and equity is not None
+    items.append(_pc_item(
+        "ibkr", "IBKR 连接", "ok" if ok3 else "bad",
+        ("已连接" if connected else "未连接")
+        + (f"，净值 ${equity:,.0f}" if equity is not None
+           else "，净值取不到（日盈亏熔断 fail-open，风控不设防）")))
+
+    # 4) 风险预算：设置值 / 已用 / 余量
+    exp = order_mgr.risk_exposure()["total"]
+    budget = config.RISK_MAX_TOTAL_RISK_USD
+    if budget <= 0:
+        items.append(_pc_item("risk_budget", "风险预算", "neutral",
+                              f"未设总敞口预算（0=不限制）；当前已用 ${exp:,.0f}"))
+    else:
+        over = exp > budget
+        items.append(_pc_item("risk_budget", "风险预算",
+                              "bad" if over else "ok",
+                              f"预算 ${budget:,.0f} / 已用 ${exp:,.0f} / "
+                              f"余量 ${budget - exp:,.0f}"
+                              + ("（超预算！）" if over else "")))
+
+    # 5) 跟单进程：enabled 服务器进程存活 + follower 净值同步
+    servers = [s for s in _load_copy_servers() if s.get("enabled")]
+    if not servers:
+        items.append(_pc_item("copy", "跟单进程", "skip", "无启用的跟单服务器"))
+    else:
+        bad5 = []
+        for s in servers:
+            name = s.get("name", "?")
+            alive = copy_supervisor.process_alive(name)
+            st = _copy_status(name) or {}
+            if not alive:
+                bad5.append(f"{name} 进程不在")
+            elif st and st.get("master_ws") is False:
+                bad5.append(f"{name} 未连上 master")
+            elif st and st.get("last_error"):
+                bad5.append(f"{name} 报错: {str(st['last_error'])[:30]}")
+        items.append(_pc_item("copy", "跟单进程",
+                              "bad" if bad5 else "ok",
+                              "；".join(bad5) if bad5
+                              else f"{len(servers)} 台 enabled 服务器进程均在运行"))
+
+    # 6) 时钟：本机 vs IBKR 服务器（未连接跳过）vs 数据时钟
+    if not connected:
+        items.append(_pc_item("clock", "时钟", "skip",
+                              "IBKR 未连接，服务器时钟比对跳过"))
+    else:
+        ibkr_t = gateway.ibkr_time or 0
+        drift = abs(time.time() - ibkr_t) if ibkr_t else None
+        ok6 = drift is not None and drift < 30
+        items.append(_pc_item("clock", "时钟",
+                              "ok" if ok6 else "bad",
+                              (f"IBKR 时钟偏差 {drift:.1f}s" if drift is not None
+                               else "IBKR 时钟未取得")
+                              + (f"；数据时钟 {int(age)}s 前"
+                                 if age is not None else "")))
+
+    # 7) 昨日遗留：昨天事件日志里未恢复的 warning/critical 告警
+    yday = (now - _dt.timedelta(days=1)).strftime("%Y%m%d")
+    ev_path = _PRECHECK_DIR / f"events-{yday}.jsonl"
+    if not ev_path.exists():
+        items.append(_pc_item("leftover", "昨日遗留告警", "neutral",
+                              f"无昨日事件日志（{yday}）"))
+    else:
+        alerts: dict = {}
+        try:
+            for line in ev_path.read_text(encoding="utf-8").splitlines():
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if rec.get("type") == "alert" and rec.get("level") in (
+                        "warning", "critical"):
+                    alerts[rec.get("key")] = (rec.get("level"),
+                                              rec.get("title"), rec.get("msg"))
+                elif rec.get("type") == "alert_recovered":
+                    alerts.pop(rec.get("key"), None)
+        except OSError:
+            alerts = {}
+        crits = {k: v for k, v in alerts.items() if v[0] == "critical"}
+        if crits:
+            items.append(_pc_item("leftover", "昨日遗留告警", "bad",
+                                  "；".join(f"{v[1]}" for v in
+                                            list(crits.values())[:3])
+                                  + (f" 等 {len(crits)} 条" if len(crits) > 3
+                                     else "") + "（昨日未恢复）"))
+        elif alerts:
+            items.append(_pc_item("leftover", "昨日遗留告警", "neutral",
+                                  f"{len(alerts)} 条 warning 级昨日未恢复"))
+        else:
+            items.append(_pc_item("leftover", "昨日遗留告警", "ok",
+                                  "昨日无未恢复告警"))
+
+    overall = "bad" if any(i["status"] == "bad" for i in items) else "ok"
+    return {"ts": time.time(), "day": now.strftime("%Y-%m-%d"),
+            "overall": overall, "items": items}
+
+
+async def _precheck_check_once(now, done_days: set) -> bool:
+    """调度单拍（可测）：ET 工作日且时间 ≥09:25 且当天未跑 → 跑检查单并落盘
+    （logs/precheck-YYYYMMDD.json）+ 事件 + 有红项走 notifier（critical：
+    声音 + 前端 + iMessage 摘要列出红项）。返回本拍是否执行。"""
+    if now.weekday() >= 5:
+        return False
+    hm = now.hour * 60 + now.minute
+    day_key = now.strftime("%Y-%m-%d")
+    if hm < 9 * 60 + 25 or day_key in done_days:
+        return False
+    report = await run_precheck()
+    path = _PRECHECK_DIR / f"precheck-{day_key.replace('-', '')}.json"
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(report, ensure_ascii=False, indent=1),
+                   encoding="utf-8")
+    os.replace(tmp, path)
+    bads = [i for i in report["items"] if i["status"] == "bad"]
+    record_event("precheck", day=day_key, overall=report["overall"],
+                 bad=[i["key"] for i in bads], path=str(path))
+    if bads:
+        await notifier.notify(
+            f"precheck:{day_key}", "critical", "盘前检查有红项",
+            "；".join(f"{i['name']}（{i['detail']}）" for i in bads))
+    logger.info("盘前检查单已生成: %s（%s，红项 %d）", path, report["overall"],
+                len(bads))
+    done_days.add(day_key)
+    return True
+
+
+async def _precheck_loop() -> None:
+    """盘前检查调度（每 60s 检查；ET 工作日 09:25 自动跑一次；
+    单拍见 _precheck_check_once，周末不跑）。"""
+    from zoneinfo import ZoneInfo
+    import datetime as _dt
+    et = ZoneInfo("America/New_York")
+    done_days: set = set()
+    while True:
+        await asyncio.sleep(60.0)
+        try:
+            await _precheck_check_once(_dt.datetime.now(et), done_days)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("盘前检查调度异常: %s", e)
+
+
 async def _slow_break_loop() -> None:
     """未快速突破提醒（每分钟）：ACTIVE 持仓开仓超过 SLOW_BREAK_SECONDS 仍未保本
     → 记录提醒，前端语音播报「未快速突破，是否减仓」。每个 lot 只提醒一次。"""
@@ -1497,9 +1762,47 @@ async def _auto_breakeven_loop() -> None:
 # 事件记录与快照辅助
 # ---------------------------------------------------------------------------
 
+def _shadow_record_event(tr) -> None:
+    """影子单建档事件（全类型统一出口）。"""
+    record_event("shadow_signal", shadow_id=tr.shadow_id, type=tr.signal_type,
+                 symbol=tr.symbol, ticker=tr.ticker, side=tr.side,
+                 fill_mode=tr.fill_mode, entry=tr.entry, stop=tr.stop,
+                 atr=tr.atr, bar_time=tr.bar_time, meta=tr.meta)
+
+
+def _shadow_signal(signal_type: str, symbol: str, side: str, trigger_px: float,
+                   stop_px: float, atr: float, bar_time: float,
+                   meta: Optional[dict] = None, fill_mode: str = "market",
+                   limit_px: float = 0.0, dedup_key: Optional[str] = None):
+    """统一影子建档（各信号源调用）：登记 + 写事件流。已建档返回 None。"""
+    tr = shadow_tracker.record(
+        signal_type, symbol, side, trigger_px, stop_px, atr, bar_time,
+        meta=meta, fill_mode=fill_mode, limit_px=limit_px,
+        dedup_key=dedup_key)
+    if tr is not None:
+        _shadow_record_event(tr)
+    return tr
+
+
+def _shadow_stop_for(data: dict, side: str, px: float, atr: float) -> float:
+    """影子止损位：smart_stop 指标距离优先（所见即所得），缺失回退 1×ATR；
+    返回 0 表示无法确定（tracker 还会再兜一次 1×ATR）。"""
+    if atr and atr > 0 and px:
+        try:
+            dist = _smart_stop_dist(data, side, px, atr)
+            stop = round(px + (-1 if side == "long" else 1) * dist, 2)
+            if stop > 0:
+                return stop
+        except Exception:
+            pass
+    return 0.0
+
+
 async def _shadow_loop() -> None:
-    """影子回测循环（每 1s）：新收盘 5M bar 喂入回测引擎——检测 ema_fast /
-    channel_edge 回踩事件并逐 bar 推演，事件与结算写入当日事件流。"""
+    """统一影子跟踪循环（每 1s）：新收盘 5M bar 喂入 ShadowTracker——
+    限价单触及成交判定 + 逐 bar 推演（MFE/MAE/止损/EOD 定稿）+ pullback
+    回踩事件自检；事件与结算写入当日事件流（shadow_signal/shadow_settled）。
+    外部信号源（FVG 事件/回踩/预警、突破、策略候选）在各自产出处建档。"""
     while True:
         await asyncio.sleep(1.0)
         try:
@@ -1512,12 +1815,13 @@ async def _shadow_loop() -> None:
                              symbol=tr.symbol, ticker=tr.ticker, side=tr.side,
                              line_type=tr.line_type, bar_time=tr.bar_time,
                              entry=tr.entry, stop=tr.stop, atr=tr.atr)
+                _shadow_record_event(tr)   # 统一建档事件（shadow_signal）
             for tr in settled:
                 record_event("shadow_settled", shadow_id=tr.shadow_id,
                              symbol=tr.symbol, ticker=tr.ticker, side=tr.side,
                              line_type=tr.line_type, stopped=tr.stopped,
                              mfe_rr=tr.mfe_rr, mfe_rr_eod=tr.mfe_rr_eod,
-                             outcome_rr=tr.outcome_rr)
+                             outcome=tr.outcome, outcome_rr=tr.outcome_rr)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -1553,6 +1857,15 @@ def _fvg_record_event(sym: str, bt: float, data: dict) -> bool:
     })
     logger.info("FVG 事件固化: %s %s %.2f~%.2f 高 %.2f ratio %s",
                 sym, side, bottom, top, height, ratio)
+    # 统一影子建档：FVG 事件市价成交（事件确认 bar 收盘价）
+    close = (data.get("bar_c") or {}).get("close")
+    if close and atr:
+        _shadow_signal("fvg_event", sym, side, trigger_px=close,
+                       stop_px=_shadow_stop_for(data, side, close, atr),
+                       atr=atr, bar_time=bt,
+                       meta={"top": top, "bottom": bottom, "height": height,
+                             "ratio": ratio},
+                       dedup_key=f"fvg_event:{sym}:{int(bt)}:{side}")
     return True
 
 
@@ -1612,6 +1925,18 @@ async def _fvg_monitor_loop() -> None:
                             "bottom", "height", "atr", "ratio")})
                         logger.info("FVG 预警: %s %s 缺口形成中 %.2f~%.2f ratio %s",
                                     sym, side_rt, bottom or 0, top or 0, ratio)
+                        # 统一影子建档：FVG 预警市价成交（预警时实时价）
+                        close_rt = bar_rt.get("close")
+                        if close_rt and atr:
+                            _shadow_signal(
+                                "fvg_warn", sym, side_rt, trigger_px=close_rt,
+                                stop_px=_shadow_stop_for(data, side_rt,
+                                                         close_rt, atr),
+                                atr=atr, bar_time=b_rt,
+                                meta={"top": top, "bottom": bottom,
+                                      "height": height, "ratio": ratio,
+                                      "forming": True},
+                                dedup_key=f"fvg_warn:{warn_key}")
                 # ---- 确认值通道（收盘固化） ----
                 # 先冲刷挂起的待固化 bar（等 daemon 的 FVG study 追上 K线）
                 pend = _fvg_pending.get(sym)
@@ -1677,6 +2002,22 @@ async def _fvg_monitor_loop() -> None:
                     logger.info("FVG 首次回踩: %s %s %.2f~%.2f 触价 %.2f",
                                 sym, ev["side"], ev["bottom"], ev["top"],
                                 retest_px)
+                    # 统一影子建档：限价挂区域边沿（多=top/空=bottom），
+                    # 触及才成交；bar_time 用 FVG 形成 bar（回踩 bar 确认时
+                    # 触及判定生效——本次回踩本身即首次触及，届时成交）
+                    edge = ev["top"] if ev["side"] == "long" else ev["bottom"]
+                    atr_rt = ev.get("atr")
+                    if edge and atr_rt:
+                        _shadow_signal(
+                            "fvg_retest", sym, ev["side"], trigger_px=edge,
+                            stop_px=_shadow_stop_for(data, ev["side"],
+                                                     edge, atr_rt),
+                            atr=atr_rt, bar_time=ev["bar_time"],
+                            meta={"top": ev["top"], "bottom": ev["bottom"],
+                                  "height": ev["height"], "ratio": ev["ratio"],
+                                  "retest_px": retest_px},
+                            fill_mode="limit", limit_px=edge,
+                            dedup_key=f"fvg_retest:{ev['id']}")
             # 清理 4 小时前的旧事件（deque 按时间递增，头部弹出即可）
             cutoff = time.time() - FVG_EVENT_TTL_SECONDS
             while _fvg_events and _fvg_events[0]["bar_time"] < cutoff:
@@ -1723,6 +2064,27 @@ def _emit_breakout(sig: dict) -> None:
                    sig["confirm_time"], sig["break_time"], sig["close"],
                    sig["premarket_low"], sig["premarket_high"], sig["crowd"],
                    "，三连确认" if sig["triple"] else "")
+    # 统一影子建档：盘前突破/跌破市价成交（确认 bar 收盘价），
+    # meta 带 crowd/triple/盘前区间
+    sym = sig["symbol"]
+    side = "long" if sig["side"] == "站上高点" else "short"
+    data = (collector.latest() or {}).get(sym, {})
+    bar_c = data.get("bar_c") or {}
+    close = (bar_c.get("close") if bar_c.get("time") == sig.get("confirm_epoch")
+             else None) or sig["close"]
+    ts_c = data.get("ts_c") or data.get("ts") or {}
+    atr = ts_c.get("atr")
+    if close and atr:
+        _shadow_signal(
+            "breakout", sym, side, trigger_px=close,
+            stop_px=_shadow_stop_for(data, side, close, atr),
+            atr=atr, bar_time=sig["confirm_epoch"],
+            meta={"crowd": sig["crowd"], "triple": sig["triple"],
+                  "premarket_high": sig["premarket_high"],
+                  "premarket_low": sig["premarket_low"],
+                  "zone_width": sig["zone_width"],
+                  "break_time": sig["break_time"], "side_text": sig["side"]},
+            dedup_key=f"breakout:{sig['id']}")
 
 
 async def _breakout_loop() -> None:
@@ -1862,6 +2224,35 @@ async def _auto_loop() -> None:
                             await auto_engine.on_bar(sym, bar_c, ts_c)
                 except Exception:
                     logger.exception("auto 收养扫描异常")
+            # 统一影子建档：自动策略开仓候选（ST/EMA 回踩限价单，触及才成交）
+            try:
+                for p in auto_engine.proposals():
+                    pid = p.get("proposal_id")
+                    if not pid or pid in _shadow_proposal_recorded:
+                        continue
+                    sym = p.get("symbol")
+                    data = market.get(sym) or {}
+                    bt = p.get("bar_time") or (data.get("bar_c") or {}).get("time")
+                    atr = p.get("atr") or abs((p.get("limit_px") or 0)
+                                              - (p.get("stop_px") or 0))
+                    if not (sym and bt and p.get("limit_px") and atr):
+                        continue
+                    tr = _shadow_signal(
+                        "proposal", sym, p.get("side") or "long",
+                        trigger_px=p["limit_px"],
+                        stop_px=p.get("stop_px") or 0,
+                        atr=atr, bar_time=bt,
+                        meta={"strategy": p.get("strategy"),
+                              "line_type": p.get("line"),
+                              "divergence": p.get("divergence"),
+                              "st_duration_bars": p.get("st_duration_bars"),
+                              "st_push_count": p.get("st_push_count")},
+                        fill_mode="limit", limit_px=p["limit_px"],
+                        dedup_key=f"proposal:{pid}")
+                    if tr is not None:
+                        _shadow_proposal_recorded.add(pid)
+            except Exception:
+                logger.exception("影子建档（策略候选）异常")
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -2356,6 +2747,7 @@ async def on_startup() -> None:
     global _shadow_task, _auto_task, _midpoint_reprice_task, _external_cleanup_task
     global _slow_break_task, _auto_breakeven_task, _fvg_task, _retest_reprice_task
     global _breakout_task, _naked_position_task, _health_watch_task
+    global _report_task, _precheck_task
     config.validate_config()
     if not acquire_writer_lock("logs/autotrade_writer.lock"):
         raise RuntimeError("另一个 autotrade 执行写进程正在运行，禁止重复管理订单")
@@ -2387,6 +2779,8 @@ async def on_startup() -> None:
     _breakout_task = asyncio.create_task(_breakout_loop())
     _naked_position_task = asyncio.create_task(_naked_position_loop())
     _health_watch_task = asyncio.create_task(_health_watch_loop())
+    _report_task = asyncio.create_task(_report_loop())
+    _precheck_task = asyncio.create_task(_precheck_loop())
 
 
 @app.on_event("shutdown")
@@ -2396,7 +2790,8 @@ async def on_shutdown() -> None:
               _midpoint_reprice_task, _retest_reprice_task,
               _external_cleanup_task, _slow_break_task,
               _auto_breakeven_task, _fvg_task, _breakout_task,
-              _naked_position_task, _health_watch_task):
+              _naked_position_task, _health_watch_task, _report_task,
+              _precheck_task):
         if t:
             t.cancel()
     await copy_supervisor.stop_all()
@@ -2782,6 +3177,10 @@ async def _tv_activate_window() -> None:
 
 
 _TV_CHART_URL = "https://cn.tradingview.com/chart/I2KwX1s0/"  # auto_trade 保存布局
+# 独立调试 profile（已登录 TV）。必须显式指定：① Chrome ≥136 起默认
+# user-data-dir 下 --remote-debugging-port 被忽略（安全策略），端口永远起不来；
+# ② 独立 profile 与日常 Chrome 互不干扰（各自单实例），且免登录。
+_TV_CHROME_PROFILE = str(Path.home() / ".tv-chrome-profile")
 
 
 async def _cdp_alive() -> bool:
@@ -2839,7 +3238,9 @@ async def _tv_ensure_browser() -> Optional[str]:
         logger.info("CDP 离线，启动浏览器打开 TradingView ...")
         await asyncio.create_subprocess_exec(
             "open", "-na", "Google Chrome", "--args",
-            "--remote-debugging-port=9222", _TV_CHART_URL,
+            "--remote-debugging-port=9222",
+            f"--user-data-dir={_TV_CHROME_PROFILE}", "--no-first-run",
+            _TV_CHART_URL,
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
         # 等调试端口起来（Chrome 冷启动）
         for _ in range(15):
@@ -2847,9 +3248,10 @@ async def _tv_ensure_browser() -> Optional[str]:
             if await _cdp_alive():
                 break
         else:
-            return ("Chrome 未以可控模式启动（若 Chrome 已在运行但没开调试端口，"
-                    "单例机制会吞掉参数——请完全退出 Chrome 后再点一次，"
-                    "我会以可控模式重新打开）")
+            return ("调试 Chrome 未以可控模式启动（专用 profile "
+                    f"{_TV_CHROME_PROFILE} 下 9222 端口 30s 未就绪；"
+                    "该 profile 与日常 Chrome 独立，无需退出日常 Chrome——"
+                    "请确认 profile 目录存在后再点一次）")
     # 等图表页 target 出现
     for _ in range(15):
         if await asyncio.to_thread(_chart_page_up):
@@ -2987,6 +3389,37 @@ async def api_shadow() -> dict:
     """当日影子回测：统计 + 全部回踩事件（实时逐 bar 推演）。"""
     return {"stats": shadow_tracker.stats(),
             "events": shadow_tracker.events(200)}
+
+
+@app.get("/api/shadow/report")
+async def api_shadow_report(day: str = "") -> dict:
+    """每日影子复盘报告：缺省=当天（ET），任意历史日可重算（实时计算）。"""
+    import re as _re
+    from zoneinfo import ZoneInfo
+    import datetime as _dt
+    if day and not _re.match(r"^\d{4}-\d{2}-\d{2}$", day):
+        raise HTTPException(400, "day 格式应为 YYYY-MM-DD")
+    if not day:
+        day = _dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    return shadow_report.generate_report(day)
+
+
+@app.get("/api/precheck")
+async def api_precheck() -> dict:
+    """盘前检查单：手动随时跑（纯读状态，无副作用；非交易日如实报红）。"""
+    return await run_precheck()
+
+
+@app.get("/api/precheck/last")
+async def api_precheck_last() -> dict:
+    """最近一次落盘的盘前检查单（logs/precheck-*.json 最新一份）。"""
+    files = sorted(_PRECHECK_DIR.glob("precheck-*.json"))
+    if not files:
+        raise HTTPException(404, "暂无盘前检查记录")
+    try:
+        return json.loads(files[-1].read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise HTTPException(500, "最近一份盘前检查读取失败")
 
 
 class AutoStartRequest(BaseModel):
@@ -3655,3 +4088,289 @@ async def api_news_refresh(trader: str = Depends(require_trader)) -> dict:
         raise HTTPException(500, "生成失败（详见日志）")
     return {"ok": True, "generated_at": payload["generated_at"],
             "generated_at_et": payload["generated_at_et"]}
+
+
+# ---------------------------------------------------------------------------
+# 盘前报告工作流（logs/reports/premarket-*.md 历史列表 + 异步生成）
+# 生成是长任务（采集 ~2 分钟 + LLM ~16s）：asyncio task 后台跑，前端轮询
+# /api/reports/status 做进度态。只追加，不侵入既有函数体。
+# ---------------------------------------------------------------------------
+
+_REPORTS_DIR = Path(__file__).resolve().parent.parent / "logs" / "reports"
+_REPORT_DATE_RE = re.compile(r"^\d{8}$")
+REPORT_GEN_COOLDOWN_S = 600          # 同一报告 10 分钟内不重复生成
+_report_task: Optional[asyncio.Task] = None
+_report_state = {"running": False, "started_at": 0.0,
+                 "last_result": None, "last_error": None}
+_report_last_done: float = 0.0       # 最近一次生成成功时刻（冷却用）
+
+
+def _report_meta_from_text(text: str) -> dict:
+    """从报告文件头解析元信息（条目数/模型/degraded/耗时/tokens）。"""
+    meta: dict = {"degraded": "⚠️ LLM 降级" in text}
+    m = re.search(r"条目：大盘 (\d+) 条 / 自选股 (\d+) 票 (\d+) 条", text)
+    if m:
+        meta["market_items"], meta["ticker_count"], meta["ticker_items"] = \
+            int(m.group(1)), int(m.group(2)), int(m.group(3))
+    m = re.search(r"模型：(\S+) · 耗时 ([\d.]+)s · tokens (\S+)", text)
+    if m:
+        meta["model"], meta["latency_s"], meta["tokens"] = \
+            m.group(1), float(m.group(2)), m.group(3)
+    return meta
+
+
+def _report_file(date: str) -> Optional[Path]:
+    """date（YYYYMMDD，正则硬校验防路径穿越）→ 报告文件路径或 None。"""
+    if not _REPORT_DATE_RE.match(date):
+        return None
+    path = (_REPORTS_DIR / f"premarket-{date}.md").resolve()
+    if _REPORTS_DIR.resolve() not in path.parents:
+        return None
+    return path if path.exists() else None
+
+
+@app.get("/api/reports")
+async def api_reports_list() -> dict:
+    """历史报告列表（日期倒序，含文件头元信息）。"""
+    rows = []
+    if _REPORTS_DIR.exists():
+        for p in _REPORTS_DIR.glob("premarket-*.md"):
+            date = p.stem.replace("premarket-", "")
+            if not _REPORT_DATE_RE.match(date):
+                continue
+            try:
+                head = p.read_text(encoding="utf-8")[:2000]
+            except OSError:
+                continue
+            rows.append({"date": date, "mtime": p.stat().st_mtime,
+                         "meta": _report_meta_from_text(head)})
+    rows.sort(key=lambda r: -r["mtime"])
+    rows.sort(key=lambda r: r["date"], reverse=True)
+    return {"reports": rows}
+
+
+@app.get("/api/reports/status")
+async def api_reports_status() -> dict:
+    """生成进度：running/started_at/elapsed_s/last_result/last_error。"""
+    st = dict(_report_state)
+    st["elapsed_s"] = (round(time.time() - st["started_at"], 1)
+                       if st["running"] else None)
+    return st
+
+
+@app.get("/api/reports/{date}")
+async def api_reports_get(date: str) -> dict:
+    """该日报告 markdown 全文（date 格式校验，防路径穿越）。"""
+    if not _REPORT_DATE_RE.match(date):
+        raise HTTPException(400, "date 必须是 YYYYMMDD")
+    path = _report_file(date)
+    if path is None:
+        raise HTTPException(404, f"无 {date} 的报告")
+    text = path.read_text(encoding="utf-8")
+    return {"date": date, "markdown": text,
+            "meta": _report_meta_from_text(text[:2000])}
+
+
+async def _report_generate_run(day: str, trader: str) -> None:
+    """后台生成任务：采集+LLM 全部 to_thread，完成/失败更新 _report_state。"""
+    global _report_last_done
+    try:
+        tickers = _news_tickers()
+        ticker_set = set(tickers)
+
+        def _work():
+            market = news_digest.collect_market(ticker_set=ticker_set)
+            ticker_news = news_digest.collect_tickers(tickers)
+            # 视频源（enabled 的）：字幕抓取 + LLM 摘要（缓存命中不重复调）
+            from engine import youtube_digest
+            window = (time.time() - 18 * 3600, time.time())
+            videos = youtube_digest.process_videos(
+                _report_enabled_urls(), window=window, ticker_set=ticker_set)
+            md, meta = news_digest.generate_report(day, market, ticker_news,
+                                                   videos=videos)
+            path = news_digest.save_report(day, md, market, ticker_news, meta,
+                                           videos=videos)
+            return path, meta, market, ticker_news, videos
+
+        path, meta, market, ticker_news, videos = await asyncio.to_thread(_work)
+        _report_apply_video_status(videos)
+        _report_last_done = time.time()
+        result = {"date": day.replace("-", ""),
+                  "path": str(path), "degraded": bool(meta.get("degraded")),
+                  "model": meta.get("model"),
+                  "tokens": (meta.get("usage") or {}).get("total_tokens"),
+                  "latency_s": meta.get("latency_s"),
+                  "market_items": len(market),
+                  "ticker_count": len(ticker_news),
+                  "finished_at": time.time()}
+        _report_state["last_result"] = result
+        _report_state["last_error"] = None
+        logger.warning("盘前报告已生成（by %s）: %s（%s）", trader, path,
+                       "降级" if result["degraded"] else result["model"])
+        record_event("news_report_generated", trader=trader, **result)
+    except Exception as e:
+        logger.exception("盘前报告生成失败")
+        _report_state["last_error"] = str(e)
+        record_event("news_report_failed", trader=trader, error=str(e))
+    finally:
+        _report_state["running"] = False
+
+
+@app.post("/api/reports/generate")
+async def api_reports_generate(trader: str = Depends(require_trader)) -> dict:
+    """生成今日报告（异步长任务）：立即返回 running=true；在跑 → 409；
+    10 分钟冷却内 → 429。"""
+    global _report_task
+    if _report_state["running"]:
+        raise HTTPException(409, "报告生成中，请等待完成")
+    wait = REPORT_GEN_COOLDOWN_S - (time.time() - _report_last_done)
+    if wait > 0:
+        raise HTTPException(429, f"生成冷却中，{int(wait)}s 后再试")
+    day = _dt.datetime.now(_ZI_ET).strftime("%Y-%m-%d")
+    _report_state["running"] = True
+    _report_state["started_at"] = time.time()
+    _report_state["last_error"] = None
+    _report_task = asyncio.create_task(_report_generate_run(day, trader))
+    return {"ok": True, "running": True, "day": day}
+
+
+# ---------------------------------------------------------------------------
+# 报告视频源管理（logs/report_sources.json）：
+# 用户贴 YouTube 链接，生成报告时把字幕摘要并入（第六章节「盘前视频观点」）。
+# 只追加，不侵入既有函数体。
+# ---------------------------------------------------------------------------
+
+_REPORT_SOURCES_PATH = (Path(__file__).resolve().parent.parent
+                        / "logs" / "report_sources.json")
+
+
+def _load_report_sources() -> list:
+    """加载视频源列表；缺文件/损坏返回 []。"""
+    try:
+        payload = json.loads(_REPORT_SOURCES_PATH.read_text(encoding="utf-8"))
+        if isinstance(payload, list):
+            return payload
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as e:
+        logger.warning("report_sources.json 加载失败: %s", e)
+    return []
+
+
+def _save_report_sources(sources: list) -> None:
+    """原子写落盘（tmp + os.replace）。"""
+    try:
+        _REPORT_SOURCES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _REPORT_SOURCES_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(sources, ensure_ascii=False, indent=1),
+                       encoding="utf-8")
+        os.replace(tmp, _REPORT_SOURCES_PATH)
+    except OSError:
+        logger.exception("report_sources.json 落盘失败")
+
+
+def _report_enabled_urls() -> list:
+    return [s["url"] for s in _load_report_sources() if s.get("enabled")]
+
+
+def _report_apply_video_status(videos: list) -> None:
+    """生成报告后把各视频的处理状态回写进源列表（失败原因前端可见）。"""
+    if not videos:
+        return
+    sources = _load_report_sources()
+    by_id = {v.get("video_id"): v for v in videos if v.get("video_id")}
+    dirty = False
+    for s in sources:
+        v = by_id.get(s.get("video_id"))
+        if v is None:
+            continue
+        s["last_status"] = v.get("status")
+        s["last_error"] = v.get("error") or ""
+        if v.get("title"):
+            s["title"] = v["title"]
+        if v.get("channel"):
+            s["channel"] = v["channel"]
+        dirty = True
+    if dirty:
+        _save_report_sources(sources)
+
+
+class ReportSourceAddRequest(BaseModel):
+    url: str = Field(..., description="YouTube 链接（watch?v=/youtu.be//shorts/）")
+
+
+@app.get("/api/report/sources")
+async def api_report_sources() -> dict:
+    """视频源列表。"""
+    return {"sources": _load_report_sources()}
+
+
+async def _source_fill_meta(video_id: str) -> None:
+    """后台补视频元数据（title/channel）；失败原因写进 last_error。"""
+    from engine import youtube_digest
+    sources = _load_report_sources()
+    row = next((s for s in sources if s.get("video_id") == video_id), None)
+    if row is None:
+        return
+    try:
+        meta = await asyncio.to_thread(youtube_digest.fetch_metadata, row["url"])
+        row["title"] = meta.get("title") or ""
+        row["channel"] = meta.get("channel") or ""
+        row["last_status"] = "meta_ok"
+        row["last_error"] = ""
+    except Exception as e:
+        row["last_status"] = "meta_failed"
+        row["last_error"] = str(e)
+        logger.warning("视频源元数据抓取失败 %s: %s", video_id, e)
+    _save_report_sources(sources)
+
+
+@app.post("/api/report/sources")
+async def api_report_source_add(req: ReportSourceAddRequest,
+                                trader: str = Depends(require_trader)) -> dict:
+    """添加视频源（幂等：同 video_id 返回已有行）；异步补元数据。"""
+    from engine import youtube_digest
+    url = req.url.strip()
+    video_id = youtube_digest.parse_video_id(url)
+    if not video_id:
+        raise HTTPException(400, "无法解析 YouTube video_id（支持 watch?v=/"
+                                 "youtu.be//shorts/ 三种形态）")
+    sources = _load_report_sources()
+    for s in sources:
+        if s.get("video_id") == video_id:
+            return {"ok": True, "source": s, "duplicated": True}
+    row = {"url": url, "video_id": video_id, "title": "", "channel": "",
+           "added_at": time.time(), "enabled": True,
+           "last_status": "pending", "last_error": ""}
+    sources.append(row)
+    _save_report_sources(sources)
+    record_event("report_source_added", video_id=video_id, url=url,
+                 trader=trader)
+    asyncio.create_task(_source_fill_meta(video_id))   # 后台补元数据
+    return {"ok": True, "source": row}
+
+
+@app.post("/api/report/sources/{video_id}/toggle")
+async def api_report_source_toggle(video_id: str,
+                                   trader: str = Depends(require_trader)) -> dict:
+    """启用/停用翻转。"""
+    sources = _load_report_sources()
+    row = next((s for s in sources if s.get("video_id") == video_id), None)
+    if row is None:
+        raise HTTPException(404, "视频源不存在")
+    row["enabled"] = not row.get("enabled", True)
+    _save_report_sources(sources)
+    return {"ok": True, "enabled": row["enabled"]}
+
+
+@app.post("/api/report/sources/{video_id}/delete")
+async def api_report_source_delete(video_id: str,
+                                   trader: str = Depends(require_trader)) -> dict:
+    """删除视频源。"""
+    sources = _load_report_sources()
+    new = [s for s in sources if s.get("video_id") != video_id]
+    if len(new) == len(sources):
+        raise HTTPException(404, "视频源不存在")
+    _save_report_sources(new)
+    record_event("report_source_deleted", video_id=video_id, trader=trader)
+    return {"ok": True}

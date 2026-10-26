@@ -107,7 +107,8 @@ def _extract_json(text: str) -> dict:
     return json.loads(m.group(0))
 
 
-def _post(cfg: dict, system: str, user: str, max_tokens: int) -> dict:
+def _post(cfg: dict, system: str, user: str, max_tokens: int,
+          json_mode: bool = True) -> dict:
     body = {
         "model": cfg["model"],
         "messages": [
@@ -115,9 +116,10 @@ def _post(cfg: dict, system: str, user: str, max_tokens: int) -> dict:
             {"role": "user", "content": user},
         ],
         "max_tokens": max_tokens,
-        "response_format": {"type": "json_object"},
         # 不传 temperature：kimi-k2/k3 系只允许 1
     }
+    if json_mode:
+        body["response_format"] = {"type": "json_object"}
     req = urllib.request.Request(
         cfg["base"] + "/chat/completions",
         data=json.dumps(body).encode("utf-8"),
@@ -162,3 +164,32 @@ def call_llm(system: str, user: str) -> dict:
             if attempt == 0:
                 time.sleep(1)
     raise RuntimeError(f"LLM 调用失败: {last_err}")
+
+
+MAX_TEXT_TOKENS = 4000         # 纯文本输出（盘前报告 markdown 等长文）
+
+
+def call_llm_text(system: str, user: str,
+                  max_tokens: int = MAX_TEXT_TOKENS) -> dict:
+    """纯文本输出调用（盘前报告 markdown 等）：不加 JSON 约束、不做 JSON 解析。
+    网络错重试 1 次；空输出重试 1 次。失败抛 LLMUnavailable / RuntimeError。
+    返回 {"text": ..., "_usage", "_latency_s", "_model"}。"""
+    cfg = _backend_config()
+    t0 = time.monotonic()
+    last_err = None
+    for attempt in (0, 1):
+        try:
+            raw = _post(cfg, system, user, max_tokens, json_mode=False)
+            choice = (raw.get("choices") or [{}])[0]
+            msg = choice.get("message") or {}
+            text = msg.get("content") or ""
+            if not text.strip():
+                raise ValueError("空输出")
+            return {"text": text, "_usage": raw.get("usage") or {},
+                    "_latency_s": round(time.monotonic() - t0, 2),
+                    "_model": f"{cfg['name']}/{cfg['model']}"}
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
+            last_err = e
+            logger.warning("LLM 文本调用失败（第 %d 次）: %s", attempt + 1, e)
+            time.sleep(2)
+    raise RuntimeError(f"LLM 文本调用失败: {last_err}")

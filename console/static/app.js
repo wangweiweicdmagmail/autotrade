@@ -73,9 +73,16 @@ createApp({
       events: [],                 // 历史事件（持久日志回溯）
       eventFilter: 'all',         // 事件类型过滤
       shadow: { stats: {}, events: [] },   // 当日影子回测（统计 + 回踩事件）
+      shadowTypeFilter: 'all',             // 影子 tab 信号类型筛选（all/pullback/proposal/fvg_event/fvg_retest/fvg_warn/breakout）
+      reportDay: '',                       // 日报日期（缺省=当天）
+      report: null,                        // 每日复盘报告（/api/shadow/report）
+      reportLoading: false,
+      precheck: null,                      // 盘前检查单（/api/precheck 结果或最近一次落盘）
+      precheckVisible: false,              // 盘前检查结果面板
+      precheckLoading: false,
       fvgMonitor: { slots: [], retests: [] },   // FVG 监控快照（bar 槽位 + 多空事件 + 首次回踩事件）
-      fvgWindow: (() => {          // FVG 面板时间窗口（分钟）：15 / 30 / 60，localStorage 持久化
-        try { const v = parseInt(localStorage.getItem('fvg_window'), 10); return [15, 30, 60].includes(v) ? v : 15; } catch (e) { return 15; }
+      fvgWindow: (() => {          // FVG 面板时间窗口（分钟）：10 / 15 / 30，localStorage 持久化
+        try { const v = parseInt(localStorage.getItem('fvg_window'), 10); return [10, 15, 30].includes(v) ? v : 15; } catch (e) { return 15; }
       })(),
       // 五分钟滴答提醒音开关（默认开，localStorage 持久化）
       fvgTickOn: (() => { try { return localStorage.getItem('fvg_tick_on') !== '0'; } catch (e) { return true; } })(),
@@ -91,6 +98,13 @@ createApp({
       news: null,                  // 盘前新闻摘要（/api/news，30s 轮询 + 手动刷新）
       newsHot: {},                 // 快照 status.news.hot：ticker → gist（「新闻」徽标联动）
       newsBusy: false,             // 手动刷新中（10 分钟冷却由后端管）
+      reportList: [],              // 盘前报告历史列表（/api/reports，日期倒序）
+      reportDate: '',              // 当前查看的报告日期（YYYYMMDD）
+      reportMd: '',                // 当前报告 markdown 全文
+      reportStatus: { running: false, started_at: 0, last_result: null, last_error: null },
+      reportWasRunning: false,     // 生成中→完成 跳变检测（完成即刷新列表+提示）
+      srcInput: '',                // 视频源输入框（YouTube 链接）
+      srcList: [],                 // 视频源列表（/api/report/sources）
       // 悬浮交易台折叠状态（localStorage 持久化，小屏省空间）
       deckCollapsed: (() => { try { return localStorage.getItem('deck_collapsed') === '1'; } catch (e) { return false; } })(),
       fvgFreshIds: {},             // 会话内新到事件 id -> 到达时间（新鲜行高亮用）
@@ -233,6 +247,12 @@ createApp({
     visibleAlerts() {
       return this.alerts.filter(a => !this.dismissedAlerts[a.key]);
     },
+    // 影子 tab：信号类型筛选 + 类型中文名 + 结局中文名
+    filteredShadowEvents() {
+      const evs = (this.shadow && this.shadow.events) || [];
+      if (this.shadowTypeFilter === 'all') return evs;
+      return evs.filter(t => t.signal_type === this.shadowTypeFilter);
+    },
     allowShort() { return this.status.allow_short !== false; },
     // 各服务器跟踪订单聚合（附加服务器名；follower 侧无映射的 master 单后端不会下发，无需补）
     copyOrders() {
@@ -297,6 +317,11 @@ createApp({
     // 盘前新闻（每 30s 轮询，手动刷新后立即拉）
     this.fetchNews();
     setInterval(() => this.fetchNews(), 30000);
+    // 盘前报告：历史列表 + 生成进度轮询（2s；完成跳变时刷新列表并提示）
+    this.fetchReports();
+    this.fetchReportStatus();
+    this.fetchSources();
+    setInterval(() => this.fetchReportStatus(), 2000);
   },
 
   beforeUnmount() {
@@ -343,6 +368,150 @@ createApp({
       } finally {
         this.newsBusy = false;
       }
+    },
+
+    // ---- 盘前报告工作流 ----
+    // 历史列表（日期倒序）；首次载入自动选最新一份
+    async fetchReports() {
+      try {
+        const r = await fetch('/api/reports');
+        if (!r.ok) return;
+        const d = await r.json();
+        this.reportList = d.reports || [];
+        if (!this.reportDate && this.reportList.length) {
+          this.loadReport(this.reportList[0].date);
+        }
+      } catch (e) { /* 忽略 */ }
+    },
+    async loadReport(date) {
+      try {
+        const r = await fetch(`/api/reports/${date}`);
+        if (!r.ok) return;
+        const d = await r.json();
+        this.reportDate = date;
+        this.reportMd = d.markdown || '';
+      } catch (e) { /* 忽略 */ }
+    },
+    // 生成今日报告：异步长任务，按下即禁用（running 由 status 轮询驱动），
+    // 409=在跑 / 429=冷却 由后端把关
+    async generateReport() {
+      try {
+        const r = await fetch('/api/reports/generate', { method: 'POST', headers: this.tradeHeaders() });
+        this.checkWrite403(r);
+        const d = await r.json();
+        if (!r.ok) throw new Error(typeof d.detail === 'string' ? d.detail : '生成失败');
+        this.$message.info('报告生成中（采集约 2 分钟），进度见按钮倒计时');
+        this.fetchReportStatus();
+      } catch (e) {
+        this.$message.error(e.message || String(e));
+      }
+    },
+    // 生成状态轮询：running 跳变 true→false = 完成/失败 → 刷新列表+通知
+    async fetchReportStatus() {
+      try {
+        const r = await fetch('/api/reports/status');
+        if (!r.ok) return;
+        const st = await r.json();
+        if (this.reportWasRunning && !st.running) {
+          if (st.last_error) {
+            this.$notify({ title: '盘前报告生成失败', message: st.last_error, type: 'error', duration: 0, position: 'bottom-right' });
+          } else if (st.last_result) {
+            this.$notify({ title: '盘前报告已生成', message: `${st.last_result.date} · ${st.last_result.degraded ? 'LLM 降级（纯标题汇编）' : st.last_result.model}`, type: 'success', duration: 10000, position: 'bottom-right' });
+            this.reportList = [];
+            await this.fetchReports();
+            if (st.last_result.date) this.loadReport(st.last_result.date);
+          }
+        }
+        this.reportWasRunning = !!st.running;
+        this.reportStatus = st;
+      } catch (e) { /* 忽略 */ }
+    },
+    // 轻量 markdown 渲染（局域网离线环境，不引外部 CDN）：
+    // 先 HTML 转义，再处理 标题/加粗/无序有序列表/链接/分隔线；
+    // watchlist ticker 包成可点 tv-link（data-tv 委托 reportClick 切 TV）
+    renderMd(text) {
+      if (!text) return '';
+      const esc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const tickers = new Set(Object.keys(this.market).map(s => s.split(':').pop()));
+      const inline = s => esc(s)
+        .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
+        .replace(/(https?:\/\/[^\s)]+)/g, '<a href="$1" target="_blank" rel="noopener">链接</a>')
+        .replace(/\b([A-Z]{2,5})\b/g, (m) =>
+          tickers.has(m) ? `<span class="tv-link md-ticker" data-tv="${m}">${m}</span>` : m);
+      const out = [];
+      let inUl = false, inOl = false;
+      const closeLists = () => {
+        if (inUl) { out.push('</ul>'); inUl = false; }
+        if (inOl) { out.push('</ol>'); inOl = false; }
+      };
+      for (const line of text.split('\n')) {
+        const t = line.trim();
+        let m;
+        if ((m = t.match(/^(#{1,3})\s+(.*)/))) {
+          closeLists();
+          const lv = m[1].length;
+          out.push(`<h${lv} class="md-h">${inline(m[2])}</h${lv}>`);
+        } else if (/^---+$/.test(t)) {
+          closeLists(); out.push('<hr class="md-hr">');
+        } else if ((m = t.match(/^[-*]\s+(.*)/))) {
+          if (!inUl) { closeLists(); out.push('<ul class="md-ul">'); inUl = true; }
+          out.push(`<li>${inline(m[1])}</li>`);
+        } else if ((m = t.match(/^\d+\.\s+(.*)/))) {
+          if (!inOl) { closeLists(); out.push('<ol class="md-ol">'); inOl = true; }
+          out.push(`<li>${inline(m[1])}</li>`);
+        } else if (t === '') {
+          closeLists();
+        } else {
+          closeLists();
+          out.push(`<p class="md-p">${inline(t)}</p>`);
+        }
+      }
+      closeLists();
+      return out.join('');
+    },
+    // 报告正文里的 ticker 点击（事件委托）→ CDP 切 TV
+    reportClick(e) {
+      const t = e.target.closest('[data-tv]');
+      if (t) this.tvShow(t.dataset.tv);
+    },
+
+    // ---- 报告视频源管理 ----
+    async fetchSources() {
+      try {
+        const r = await fetch('/api/report/sources');
+        if (r.ok) this.srcList = (await r.json()).sources || [];
+      } catch (e) { /* 忽略 */ }
+    },
+    async addSource() {
+      const url = (this.srcInput || '').trim();
+      if (!url) return;
+      try {
+        const r = await fetch('/api/report/sources', {
+          method: 'POST', headers: this.tradeHeaders(true),
+          body: JSON.stringify({ url }),
+        });
+        this.checkWrite403(r);
+        const d = await r.json();
+        if (!r.ok) throw new Error(typeof d.detail === 'string' ? d.detail : '添加失败');
+        this.srcInput = '';
+        this.$message.success(d.duplicated ? '该视频已在源列表' : '已添加，正在抓取元数据…');
+        await this.fetchSources();
+        setTimeout(() => this.fetchSources(), 4000);   // 元数据补完后刷新标题
+      } catch (e) { this.$message.error(e.message || String(e)); }
+    },
+    async toggleSource(s) {
+      try {
+        await fetch(`/api/report/sources/${encodeURIComponent(s.video_id)}/toggle`,
+                    { method: 'POST', headers: this.tradeHeaders() });
+        await this.fetchSources();
+      } catch (e) { /* 忽略 */ }
+    },
+    async deleteSource(s) {
+      try {
+        await fetch(`/api/report/sources/${encodeURIComponent(s.video_id)}/delete`,
+                    { method: 'POST', headers: this.tradeHeaders() });
+        await this.fetchSources();
+      } catch (e) { /* 忽略 */ }
     },
 
     // ---- 局域网多客户端：身份登记与审批 ----
@@ -677,6 +846,58 @@ createApp({
     exitReasonText(r) {
       return { stop: '止损', trend_reverse: '趋势反向', eod: '收盘了结',
                eod_cancel: '收盘撤单', manual: '手动平仓' }[r] || r;
+    },
+    shadowTypeText(t) {
+      return { pullback: '回踩', proposal: '策略候选', fvg_event: 'FVG事件',
+               fvg_retest: 'FVG回踩', fvg_warn: 'FVG预警', breakout: '突破' }[t] || t || '回踩';
+    },
+    shadowOutcomeText(o) {
+      return { hit_stop: '触止损', reached_2R: '到2R', eod_flat: '收盘了结',
+               unfilled: '未成交' }[o] || o;
+    },
+
+    // 每日复盘报告（/api/shadow/report，缺省=当天，任意历史日可重算）
+    async loadReport() {
+      this.reportLoading = true;
+      try {
+        const d = this.reportDay || '';
+        const r = await fetch(`/api/shadow/report?day=${encodeURIComponent(d)}`);
+        const data = await r.json();
+        if (!r.ok) throw new Error(typeof data.detail === 'string' ? data.detail : '加载失败');
+        this.report = data;
+      } catch (e) {
+        this.report = null;
+        this.$message.error(e.message || String(e));
+      } finally {
+        this.reportLoading = false;
+      }
+    },
+
+    // 盘前检查单：开面板时先展示最近一次落盘结果（非交易日可查看），
+    // 点「重新运行」实时重跑（/api/precheck，纯读无副作用）
+    async openPrecheck() {
+      this.precheckVisible = true;
+      if (this.precheck) return;
+      try {
+        const r = await fetch('/api/precheck/last');
+        if (r.ok) this.precheck = await r.json();
+      } catch (e) { /* 无历史记录 */ }
+    },
+    async runPrecheck() {
+      this.precheckLoading = true;
+      try {
+        const r = await fetch('/api/precheck');
+        const data = await r.json();
+        if (!r.ok) throw new Error(typeof data.detail === 'string' ? data.detail : '检查失败');
+        this.precheck = data;
+      } catch (e) {
+        this.$message.error(e.message || String(e));
+      } finally {
+        this.precheckLoading = false;
+      }
+    },
+    precheckIcon(s) {
+      return { ok: '🟢', bad: '🔴', neutral: '🟡', skip: '⚪' }[s] || '⚪';
     },
     fmt2(v) { return (v === null || v === undefined) ? '—' : Number(v).toFixed(2); },
 

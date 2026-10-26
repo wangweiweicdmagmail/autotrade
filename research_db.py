@@ -11,6 +11,10 @@
   + smart_stop 指标：smart_stop_long/smart_stop_short
   + FVG 指标：fvg_cum_count/fvg_last_top/fvg_last_bottom/fvg_event/fvg_last_dir
 
+附表 shadow_signals（2026-10-25 起）：统一影子跟踪（engine/shadow_tracker.py
+写入）——每类信号（pullback/fvg_event/fvg_retest/fvg_warn/breakout/proposal）
+单独建档，逐 bar 更新 MFE/MAE/R，结局 hit_stop/reached_2R/eod_flat/unfilled。
+
 用法：
     from research_db import upsert_bars, load_day, symbols
     upsert_bars("NASDAQ:NVDA", dump_rows)          # rows 来自 dump_trend_state.js
@@ -51,6 +55,31 @@ CREATE TABLE IF NOT EXISTS bars (
   PRIMARY KEY (symbol, time)
 );
 CREATE INDEX IF NOT EXISTS idx_bars_time ON bars(time);
+
+-- 统一影子跟踪（engine/shadow_tracker.py）：每类交易信号单独建档、
+-- 假设成交、逐 bar 更新 MFE/MAE、结局定稿，供 research 脚本与 bars 表 join
+CREATE TABLE IF NOT EXISTS shadow_signals (
+  id TEXT PRIMARY KEY,            -- {type}:{symbol}:{bar_time}:{seq}
+  day TEXT NOT NULL,              -- ET 交易日 YYYY-MM-DD
+  type TEXT NOT NULL,             -- pullback/fvg_event/fvg_retest/fvg_warn/breakout/proposal
+  symbol TEXT NOT NULL, ticker TEXT,
+  side TEXT NOT NULL,             -- long/short
+  fill_mode TEXT NOT NULL,        -- market（信号 bar 收盘市价）/ limit（触及才成交）
+  trigger_px REAL, limit_px REAL, stop_px REAL, atr REAL,
+  bar_time INTEGER,               -- 信号 bar 时间（epoch 秒）
+  meta TEXT,                      -- JSON：crowd/triple/区间/策略名/ATR倍数等
+  filled INTEGER DEFAULT 0, fill_px REAL, fill_time INTEGER,
+  mfe_r REAL DEFAULT 0, mae_r REAL DEFAULT 0,
+  mfe_r_eod REAL DEFAULT 0, mae_r_eod REAL DEFAULT 0,
+  reached_1r INTEGER DEFAULT 0, reached_2r INTEGER DEFAULT 0,
+  hit_stop INTEGER DEFAULT 0,
+  last_px REAL,
+  outcome TEXT,                   -- hit_stop/reached_2R/eod_flat/unfilled（NULL=跟踪中）
+  outcome_r REAL,
+  settled INTEGER DEFAULT 0, settled_at REAL,
+  created_at REAL NOT NULL, updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_day ON shadow_signals(day);
 """
 
 
@@ -112,6 +141,39 @@ def symbols(db_path: Path = DEFAULT_DB) -> list:
     with sqlite3.connect(db_path) as conn:
         return [r[0] for r in conn.execute(
             "SELECT DISTINCT symbol FROM bars ORDER BY symbol")]
+
+
+# ----------------------------------------------------------------------
+# 统一影子跟踪持久化（engine/shadow_tracker.py 用；research 脚本可读 join）
+# ----------------------------------------------------------------------
+
+_SHADOW_COLS = ("id", "day", "type", "symbol", "ticker", "side", "fill_mode",
+                "trigger_px", "limit_px", "stop_px", "atr", "bar_time", "meta",
+                "filled", "fill_px", "fill_time", "mfe_r", "mae_r",
+                "mfe_r_eod", "mae_r_eod", "reached_1r", "reached_2r",
+                "hit_stop", "last_px", "outcome", "outcome_r",
+                "settled", "settled_at", "created_at", "updated_at")
+
+
+def shadow_upsert(row: dict, db_path: Path = DEFAULT_DB) -> None:
+    """影子信号建档/逐 bar 更新/结局定稿（幂等 upsert，整行快照式写入）。"""
+    init(db_path)
+    rec = [row.get(c) for c in _SHADOW_COLS]
+    ph = ",".join("?" for _ in rec)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            f"INSERT OR REPLACE INTO shadow_signals ({','.join(_SHADOW_COLS)})"
+            f" VALUES ({ph})", rec)
+
+
+def shadow_load_day(day: str, db_path: Path = DEFAULT_DB) -> list:
+    """按 ET 交易日读影子信号（YYYY-MM-DD），含跟踪中与已定稿。"""
+    init(db_path)
+    with sqlite3.connect(db_path) as conn:
+        cur = conn.execute(
+            "SELECT * FROM shadow_signals WHERE day=? ORDER BY bar_time",
+            (day,))
+        return _rows_to_dicts(cur)
 
 
 def day_summary(db_path: Path = DEFAULT_DB) -> list:

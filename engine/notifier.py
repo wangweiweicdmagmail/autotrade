@@ -100,6 +100,11 @@ class Notifier:
     def is_active(self, key: str) -> bool:
         return key in self._active
 
+    async def send_imessage(self, key: str, text: str) -> None:
+        """直发 iMessage（不受告警级别限制，如每日复盘摘要；
+        仍受同 key 节流与「未配置收件人跳过」约束）。"""
+        await self._send_imessage(key, text)
+
     # ------------------------------------------------------------------
     # iMessage 通道
     # ------------------------------------------------------------------
