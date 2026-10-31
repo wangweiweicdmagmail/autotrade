@@ -19,6 +19,8 @@ IBKR 网关适配层 (IBKRGateway)
 
 import asyncio
 import fcntl
+import functools
+import inspect
 import itertools
 import json
 import logging
@@ -26,8 +28,10 @@ import os
 import threading
 import time
 import xml.etree.ElementTree as ET
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import config
 from ib_async import ExecutionFilter
@@ -45,6 +49,40 @@ _FATAL_ERROR_CODES = {
 }
 
 
+_IBKR_CONTROL_METHODS = (
+    "place_bracket", "place_market_with_stop", "place_limit_with_stop",
+    "place_midpoint_oca", "place_close", "place_stop_only", "modify_stop",
+    "modify_stop_qty", "modify_limit_stop", "modify_limit_stop_qty",
+    "modify_midpoint_oca", "convert_entry_to_market", "cancel_order",
+)
+
+
+def _guard_ibkr_control_methods(cls):
+    """系统关闭后拒绝所有券商写操作，并跟踪进行中的调用供关闭流程等待。"""
+    for name in _IBKR_CONTROL_METHODS:
+        method = getattr(cls, name)
+        if inspect.iscoroutinefunction(method):
+            @functools.wraps(method)
+            async def async_guard(self, *args, __method=method, **kwargs):
+                self._begin_control()
+                try:
+                    return await __method(self, *args, **kwargs)
+                finally:
+                    self._active_controls -= 1
+            setattr(cls, name, async_guard)
+        else:
+            @functools.wraps(method)
+            def sync_guard(self, *args, __method=method, **kwargs):
+                self._begin_control()
+                try:
+                    return __method(self, *args, **kwargs)
+                finally:
+                    self._active_controls -= 1
+            setattr(cls, name, sync_guard)
+    return cls
+
+
+@_guard_ibkr_control_methods
 class IBKRGateway:
     """
     用法::
@@ -75,6 +113,21 @@ class IBKRGateway:
         self._fake_ids = itertools.count(900000)   # dry-run 伪造订单号
         self._tool_order_id_next: Optional[int] = None
         self._tool_order_id_lock = threading.Lock()
+        self._control_allowed = True
+        self._active_controls = 0
+
+    def _begin_control(self) -> None:
+        if not getattr(self, "_control_allowed", True):
+            raise RuntimeError("系统正在关闭，已禁止 IBKR 交易控制")
+        self._active_controls = getattr(self, "_active_controls", 0) + 1
+
+    async def disable_control(self) -> None:
+        """永久关闭本进程的交易门，等进行中的写调用结束后断开 API。"""
+        self._control_allowed = False
+        self.auto_reconnect = False
+        while getattr(self, "_active_controls", 0):
+            await asyncio.sleep(0.05)
+        await self.disconnect()
 
     @classmethod
     def from_config(cls) -> "IBKRGateway":
@@ -1363,13 +1416,20 @@ class IBKRGateway:
             logger.warning("前一日权益查询失败: %s", e)
             return None
 
+    @staticmethod
+    def _daily_pnl_session_active(now: datetime) -> bool:
+        """常规交易日 09:30 ET 后才展示当日盈亏，盘后保留当日结果。"""
+        return now.weekday() < 5 and now.hour * 60 + now.minute >= 9 * 60 + 30
+
     async def daily_pnl(self) -> Optional[float]:
         """
-        当日盈亏 = 当前净值 - 前一日权益（IBKR PreviousDayEquityWithLoanValue）。
-        注意：此口径含隔夜持仓的日内浮盈浮亏，适合「账户今日总盈亏」显示，
-        不适合做日亏损熔断基准（隔夜持仓波动会误触发熔断）。
-        取不到返回 None。
+        常规时段当日盈亏 = 当前净值 - 前一日权益（PreviousDayEquityWithLoanValue）。
+        周末和 09:30 ET 前返回 0，避免把上一交易日差值显示成今天盈利；
+        盘后保留当日结果。此口径含日内浮动，不作日亏损熔断基准。
+        常规时段取不到净值返回 None。
         """
+        if not self._daily_pnl_session_active(datetime.now(ZoneInfo("America/New_York"))):
+            return 0.0
         cur = await self.net_liquidation()
         prev = await self.prev_day_equity()
         if cur is None or prev is None:

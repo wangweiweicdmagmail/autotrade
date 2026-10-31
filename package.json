@@ -4,6 +4,7 @@
   "private": true,
   "description": "AutoTrade. controller/tv_control.js controls a local TradingView Desktop client via CDP; its connection layer is vendored from tradesdontlie/tradingview-mcp (MIT, see controller/vendor/tradingview-mcp/).",
   "dependencies": {
+    "@mathieuc/tradingview": "^3.5.2",
     "chrome-remote-interface": "^0.33.2"
   }
 }

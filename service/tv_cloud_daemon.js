@@ -3,10 +3,12 @@
  * ================================================
  *
  * 常驻订阅模式：保持一条 TradingView WS 连接，每标的 1 个 5M chart
- * session，挂 4 个 Study（trend_state + FVG Finder+ + smart_stop +
- * 5M 进攻区域），按 1s 节流把最新快照以 JSON 行输出到 stdout，供 Python 采集器（subprocess）消费。
+ * session，挂 5 个 Study（trend_state + FVG Finder+ + smart_stop +
+ * ema9_autotrade + 5M 进攻区域），按 1s 节流输出快照。ema9_autotrade
+ * 输出 e9/e9_c，分别供金字塔实时建仓和确认管理。
  * smart_stop 的值（Smart_Stop_Long/Short）归一化后合入 ts/ts_c 的
- * smart_stop_long / smart_stop_short 字段。
+ * smart_stop_long / smart_stop_short 字段；EMA9 由同一 chart 的 5M 收盘价
+ * 计算（Length=9/Source=close/Offset=0），合入 ts/ts_c.ema_9。
  *
  * 用法：
  *   node tv_cloud_daemon.js --symbols BATS:SKHY,BATS:NVDA
@@ -71,10 +73,13 @@
 const fs = require('fs');
 const path = require('path');
 const TradingView = require('@mathieuc/tradingview');
+const { loadIndicatorWithText } = require('./pine_text.js');
+const { emaFromPeriods } = require('./ema.js');
 
 const TREND_STATE_ID = 'USER;e577100fe79942b4830783d1ceaad535';
 const FVG_ID = 'USER;5ec7d04179b3429ca9286db452352d85';
 const SMART_STOP_ID = 'USER;ca26e3ab587841e2adb38cfbfd0bec41';
+const EMA9_AUTO_ID = 'USER;a17a52ae5b6642e0a3ddbba23edc9ff3';
 const ATTACK_ZONE_ID = 'USER;8ab4f534e5874b47b24a5ce5c49acace';
 const PUSH_INTERVAL_MS = 1000;      // 输出节流：每秒一次
 const HEARTBEAT_MS = 30000;         // 心跳：每 30s
@@ -100,7 +105,7 @@ const BATCH_SIZE = Math.max(1, parseInt(_args['batch-size'] || '6', 10) || 6);
 const BATCH_DELAY_MS = Math.max(0, parseInt(_args['batch-delay-ms'] || '3000', 10) || 0);
 const INSPECT_INTERVAL_MS = 30000;    // 巡检间隔：死 chart 自愈检查
 const READY_GRACE_MS = 90000;         // chart 创建超过 90s 仍无 bar → 重建
-const ATTACK_GRACE_MS = 90000;        // attack study 超过 90s 无 pmh 值 → 重建
+const ATTACK_GRACE_MS = 90000;        // attack study 超过 90s 无 pmh 值 → 聚合告警
 const REBUILD_STAGGER_MS = 1500;      // 重建逐个间隔（别一次性全砸）
 const MAX_REBUILDS = 10;              // 单 chart 重建上限（防无限 thrash）
 
@@ -139,6 +144,19 @@ function ssFromPeriod(p) {
   return {
     smart_stop_long: finite(p.Smart_Stop_Long),
     smart_stop_short: finite(p.Smart_Stop_Short),
+  };
+}
+
+function e9FromPeriod(p) {
+  if (!p) return {};
+  return {
+    time: p.$time,
+    direction: finite(p.Direction),
+    atr: finite(p.ATR),
+    touch: finite(p.Touch_EMA9),
+    ema_9: finite(p.EMA_9),
+    long_stop: finite(p.Long_Stop),
+    short_stop: finite(p.Short_Stop),
   };
 }
 
@@ -189,18 +207,29 @@ async function main() {
   const args = _args;
   const creds = JSON.parse(fs.readFileSync(args.creds, 'utf8'));
 
-  const trendStateIndic = await TradingView.getIndicator(
-    TREND_STATE_ID, 'last', creds.sessionid, creds.sessionid_sign);
+  // 加密正文注入（2026-10-27 起 create_study 必须携带 text，见 pine_text.js）
+  const trendStateIndic = await loadIndicatorWithText(
+    TradingView, TREND_STATE_ID, creds);
   // 输入全部用指标默认值（ATR 10 / Factor 3.0 / Channel 1.0 / 回看 6 /
   // EMA差值>1×ATR），与图表上的指标所见即所得，不做 setOption 覆盖
-  const fvgIndic = await TradingView.getIndicator(
-    FVG_ID, 'last', creds.sessionid, creds.sessionid_sign);
+  const fvgIndic = await loadIndicatorWithText(
+    TradingView, FVG_ID, creds);
   // FVG 同样用指标默认输入（过滤器 Off / ST 3.0×10 等），与图表所见即所得
-  const ssIndic = await TradingView.getIndicator(
-    SMART_STOP_ID, 'last', creds.sessionid, creds.sessionid_sign);
+  const ssIndic = await loadIndicatorWithText(
+    TradingView, SMART_STOP_ID, creds);
   // smart_stop 同样用默认输入（ATR10 / 回看 3 / 钳制 1~2×ATR）
-  const attackIndic = await TradingView.getIndicator(
-    ATTACK_ZONE_ID, 'last', creds.sessionid, creds.sessionid_sign);
+  let ema9AutoIndic = null;
+  try {
+    ema9AutoIndic = await loadIndicatorWithText(TradingView, EMA9_AUTO_ID, creds);
+  } catch (e) {
+    console.error(`[ema9_auto] 指标加载失败，金字塔策略不可启动: ${(e.message || e).toString().slice(0, 240)}`);
+  }
+  let attackIndic = null;
+  try {
+    attackIndic = await loadIndicatorWithText(TradingView, ATTACK_ZONE_ID, creds);
+  } catch (e) {
+    console.error(`[attack] 指标加载失败，降级为无进攻区域数据，核心行情继续: ${(e.message || e).toString().slice(0, 240)}`);
+  }
   // 进攻区域同样用指标默认输入（双区间/方向过滤器均为图表默认值）
 
   const client = new TradingView.Client({
@@ -213,7 +242,7 @@ async function main() {
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  // 单 chart 创建（初始分批与巡检重建共用）：4 个 Study 同 session 挂载，
+  // 核心 3 个 Study 必须可用；attack 是可选增强，失败时不影响核心行情。
   // state[symbol] 对象跨重建复用（推送循环只认 state，无感）
   function spawnChart(symbol, rebuilds = 0) {
     const chart = new client.Session.Chart();
@@ -221,7 +250,8 @@ async function main() {
     const tsStudy = new chart.Study(trendStateIndic);
     const fvgStudy = new chart.Study(fvgIndic);
     const ssStudy = new chart.Study(ssIndic);
-    const attackStudy = new chart.Study(attackIndic);
+    const e9Study = ema9AutoIndic ? new chart.Study(ema9AutoIndic) : null;
+    const attackStudy = attackIndic ? new chart.Study(attackIndic) : null;
     entries[symbol] = {
       chart, studies: { attack: attackStudy },
       createdAt: Date.now(), rebuilds, rebuilding: false, gaveUp: false,
@@ -231,6 +261,8 @@ async function main() {
       const ent = entries[symbol];
       if (ent) ent.rebuilding = false;   // 首批数据到达 = 重建完成
       if (chart.periods && chart.periods.length) {
+        state[symbol].ema_9 = emaFromPeriods(chart.periods, 0, 9);
+        state[symbol].ema_9_c = emaFromPeriods(chart.periods, 1, 9);
         const b = chart.periods[0];   // periods 倒序 [0]=最新（实时，未收盘）
         state[symbol].bar = {
           time: b.time, open: b.open, high: b.max,
@@ -275,7 +307,14 @@ async function main() {
         if (ps[1]) state[symbol].fvg_c = fvgFromPeriod(ps[1], ps, 1);  // 确认（策略/选股用）
       }
     });
-    attackStudy.onUpdate(() => {
+    if (e9Study) e9Study.onUpdate(() => {
+      const ps = e9Study.periods;
+      if (ps && ps.length) {
+        state[symbol].e9 = e9FromPeriod(ps[0]);
+        if (ps[1]) state[symbol].e9_c = e9FromPeriod(ps[1]);
+      }
+    });
+    if (attackStudy) attackStudy.onUpdate(() => {
       // 进攻区域存独立字段（attack/attack_c），推送时直接下发——
       // 同 ss 的教训：不 Object.assign 进别的通道，防整对象覆盖竞态
       const ps = attackStudy.periods;
@@ -311,7 +350,7 @@ async function main() {
   // 分批发起订阅：一次性并发建 51 chart 会被 TV 限流（实测卡在部分标的
   // 且不自愈），每批 BATCH_SIZE 个、批间 sleep BATCH_DELAY_MS
   for (const symbol of args.symbols) {
-    state[symbol] = { bar: null, bar_c: null, bar_c2: null, ts: {}, ts_c: {}, fvg: {}, fvg_c: {}, ss: {}, ss_c: {}, attack: {}, attack_c: {} };
+    state[symbol] = { bar: null, bar_c: null, bar_c2: null, ts: {}, ts_c: {}, fvg: {}, fvg_c: {}, ss: {}, ss_c: {}, attack: {}, attack_c: {}, ema_9: null, ema_9_c: null, e9: {}, e9_c: {} };
   }
   for (let i = 0; i < args.symbols.length; i += BATCH_SIZE) {
     const batch = args.symbols.slice(i, i + BATCH_SIZE);
@@ -320,23 +359,30 @@ async function main() {
     if (i + BATCH_SIZE < args.symbols.length) await sleep(BATCH_DELAY_MS);
   }
 
-  // 巡检自愈：chart 创建超过 READY_GRACE_MS 仍无 bar 数据，或 attack study
-  // 超过 ATTACK_GRACE_MS 无 pmh 值 → 销毁重建（逐个间隔发起，别一次性全砸）
+  // 只有核心 K 线缺失才重建 chart。attack 缺值仅聚合告警，不能因可选
+  // 区间数据反复销毁同 session 的 K 线、trend、FVG 和 smart_stop。
   let sweeping = false;   // 单飞：一轮重建 54 chart×1.5s 远超巡检间隔，
                           // 不拦会叠扫→同一 chart 连环重建（实测 40ms 内 3 次）
+  let lastAttackWarn = 0;
   setInterval(() => {
     if (sweeping) return;
     sweeping = true;
     const now = Date.now();
     const dead = [];
+    const attackMissing = [];
     for (const [sym, e] of Object.entries(entries)) {
       if (e.rebuilding || e.gaveUp) continue;
       const age = now - e.createdAt;
       const hasBars = !!(e.chart.periods && e.chart.periods.length);
-      const aps = e.studies.attack.periods;
+      const attack = e.studies.attack;
+      const aps = attack ? attack.periods : null;
       const hasAttack = !!(aps && aps.length && finite(aps[0].premarketHigh != null ? aps[0].premarketHigh : aps[0].plot_1) !== null);
       if (age > READY_GRACE_MS && !hasBars) dead.push([sym, '无K线数据']);
-      else if (age > ATTACK_GRACE_MS && hasBars && !hasAttack) dead.push([sym, 'attack无值']);
+      else if (attackIndic && age > ATTACK_GRACE_MS && hasBars && !hasAttack) attackMissing.push(sym);
+    }
+    if (attackMissing.length && now - lastAttackWarn >= 300000) {
+      console.error(`[attack] ${attackMissing.length}/${args.symbols.length} 个标的无盘前高值；保持核心行情，不重建 chart`);
+      lastAttackWarn = now;
     }
     (async () => {
       try {
@@ -355,7 +401,7 @@ async function main() {
     const symbols = {};
     for (const [sym, s] of Object.entries(state)) {
       // smart_stop（ss/ss_c 独立通道）推送时合并进 ts/ts_c，消费方无感知
-      if (s.bar) symbols[sym] = { bar: s.bar, bar_c: s.bar_c, bar_c2: s.bar_c2, ts: { ...s.ts, ...s.ss }, ts_c: { ...s.ts_c, ...s.ss_c }, fvg: s.fvg, fvg_c: s.fvg_c, attack: s.attack, attack_c: s.attack_c };
+      if (s.bar) symbols[sym] = { bar: s.bar, bar_c: s.bar_c, bar_c2: s.bar_c2, ts: { ...s.ts, ...s.ss, ema_9: s.ema_9 }, ts_c: { ...s.ts_c, ...s.ss_c, ema_9: s.ema_9_c }, fvg: s.fvg, fvg_c: s.fvg_c, attack: s.attack, attack_c: s.attack_c, e9: s.e9, e9_c: s.e9_c };
     }
     if (Object.keys(symbols).length > 0) {
       process.stdout.write(JSON.stringify({
@@ -369,7 +415,7 @@ async function main() {
     process.stdout.write(JSON.stringify({ type: 'heartbeat', ts: Date.now() / 1000 }) + '\n');
   }, HEARTBEAT_MS);
 
-  console.error(`daemon 订阅就绪: ${args.symbols.length} 个标的 (5M K线 + trend_state + FVG Finder+ + smart_stop + 进攻区域；分批 ${BATCH_SIZE}×${BATCH_DELAY_MS}ms，巡检自愈已开启)`);
+  console.error(`daemon 订阅就绪: ${args.symbols.length} 个标的 (5M K线 + trend_state + FVG Finder+ + smart_stop；attack=${attackIndic ? '启用' : '降级'}；分批 ${BATCH_SIZE}×${BATCH_DELAY_MS}ms，巡检自愈已开启)`);
 }
 
 main().catch((e) => {

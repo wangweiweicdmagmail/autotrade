@@ -6,7 +6,7 @@
 幂等 upsert（重复缓存同一天是安全的）。
 
 字段（全部拍平）：time/open/high/low/close/volume
-  + trend_state 指标：trend_state/direction/ema_fast/ema_slow/supertrend/
+  + trend_state 指标：trend_state/direction/ema_fast/ema_9/ema_slow/supertrend/
     channel_edge/atr/divergence/st_duration_bars/st_push_count
   + smart_stop 指标：smart_stop_long/smart_stop_short
   + FVG 指标：fvg_cum_count/fvg_last_top/fvg_last_bottom/fvg_event/fvg_last_dir
@@ -33,7 +33,7 @@ DEFAULT_DB = Path(__file__).resolve().parent / "logs" / "research.db"
 ET = ZoneInfo("America/New_York")
 
 # ts/fvg 子对象字段 → 列名映射（列名 = 原字段名）
-_TS_FIELDS = ("trend_state", "direction", "ema_fast", "ema_slow", "supertrend",
+_TS_FIELDS = ("trend_state", "direction", "ema_fast", "ema_9", "ema_slow", "supertrend",
               "channel_edge", "atr", "divergence", "st_duration_bars",
               "st_push_count", "smart_stop_long", "smart_stop_short")
 _FVG_FIELDS = ("fvg_cum_count", "fvg_last_top", "fvg_last_bottom",
@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS bars (
   time   INTEGER NOT NULL,          -- bar 起点 epoch 秒（UTC）
   open REAL, high REAL, low REAL, close REAL, volume REAL,
   trend_state INTEGER, direction INTEGER,
-  ema_fast REAL, ema_slow REAL, supertrend REAL, channel_edge REAL,
+  ema_fast REAL, ema_9 REAL, ema_slow REAL, supertrend REAL, channel_edge REAL,
   atr REAL, divergence REAL,
   st_duration_bars INTEGER, st_push_count INTEGER,
   smart_stop_long REAL, smart_stop_short REAL,
@@ -87,6 +87,9 @@ def init(db_path: Path = DEFAULT_DB) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(db_path) as conn:
         conn.executescript(_SCHEMA)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(bars)")}
+        if "ema_9" not in columns:
+            conn.execute("ALTER TABLE bars ADD COLUMN ema_9 REAL")
 
 
 def upsert_bars(symbol: str, rows: list, db_path: Path = DEFAULT_DB) -> int:

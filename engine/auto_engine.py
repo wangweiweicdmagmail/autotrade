@@ -78,6 +78,7 @@ class StrategyInstance:
     qty: int = 0
     line: str = ""
     adopted: bool = False           # 收养的 OrderManager 本地 lot
+    activated: bool = False         # 本轮是否真正成交并进入 ACTIVE（未成交撤单不触发 2R 重入锁）
     breakeven_done: bool = False
     breakeven_attempt_at: float = 0.0
     created_bar_time: float = 0.0   # PENDING 挂单时的 bar 时间
@@ -121,6 +122,8 @@ class AutoStrategy(ABC):
         "require_same_dir_fvg": False,  # 要求最近 FVG 方向与 ST 方向一致
         "min_fvg_cum": 0,            # 同向 FVG 累积计数下限（0=不限制）
         "stop_atr_mult": 1.0,        # 进场止损 ATR 倍数（控制台启动时注入全局值，--param 可覆盖）
+        "ema9_auto_entry": True,     # 当前 5M 实时触及 EMA9 时直接挂可成交限价单，不等人工确认
+        "reentry_min_mfe_r": 2.0,    # EMA9 仓位达到过该 MFE 后，完结时才允许下一次触碰进场
     }
 
     @abstractmethod
@@ -170,7 +173,8 @@ class SimBroker:
 
     async def place_limit_stop(self, symbol: str, side: str, qty: int,
                                limit_px: float, stop_px: float,
-                               limit_type: str = "", reason: str = "") -> SimLot:
+                               limit_type: str = "", reason: str = "",
+                               meta: Optional[dict] = None) -> SimLot:
         self._seq += 1
         lot = SimLot(lot_id=f"sim-{self._seq:04d}", symbol=symbol, side=side,
                      qty=qty, entry_px=limit_px, stop_px=stop_px,
@@ -254,16 +258,21 @@ class LiveBroker:
 
     async def place_limit_stop(self, symbol: str, side: str, qty: int,
                                limit_px: float, stop_px: float,
-                               limit_type: str = "", reason: str = ""):
+                               limit_type: str = "", reason: str = "",
+                               meta: Optional[dict] = None):
         lot, err = await self._om.place_limit_stop_lot(
             symbol=symbol, side=side, qty=qty,
             limit_px=limit_px, stop_px=stop_px,
             limit_type=limit_type, reason=reason,
-            signal_snapshot={"auto_strategy": True},
+            signal_snapshot={**(meta or {}), "auto_strategy": True},
             trader="auto")   # 策略引擎下单归属标记（与人工单区分）
         if lot is None:
             raise RuntimeError(err)
         return lot
+
+    async def mark_seed(self, lot_id: str, risk_dist: float,
+                        initial_risk_usd: float) -> None:
+        self._om.mark_pyramid_seed(lot_id, risk_dist, initial_risk_usd)
 
     async def cancel(self, lot_id: str) -> bool:
         ok, _ = await self._om.cancel_lot(lot_id)
@@ -445,7 +454,9 @@ class StrategyEngine:
         plan = strategy.entry_trigger(ctx, symbol, price)
         if plan is None:
             return
-        if self._require_entry_confirmation:
+        ema9_auto = (plan.line == "ema9"
+                     and strategy.params.get("ema9_auto_entry", True))
+        if self._require_entry_confirmation and not ema9_auto:
             await self._propose_entry(inst, plan, ts_c, bar_c, fvg_c=fvg_c)
         else:
             await self._open(inst, strategy, plan, bar_c)
@@ -548,6 +559,7 @@ class StrategyEngine:
             "reason": plan.reason,
             "trend_state": ts_c.get("trend_state"),
             "ema_fast": ts_c.get("ema_fast"),
+            "ema_9": ts_c.get("ema_9"),
             "ema_slow": ts_c.get("ema_slow"),
             "atr": ts_c.get("atr"),
             "divergence": (round(abs(divergence), 3)
@@ -668,14 +680,17 @@ class StrategyEngine:
                 "status": "rejected"}, ""
 
     def _try_rearm(self, symbol: str, inst: StrategyInstance) -> None:
-        """实例 DONE 后重新武装：当日进场次数未达上限则回 WATCHING
-        （同一 symbol 一天最多 max_entries_per_day 次进场）。
-        收养实例不重新武装（无策略可进场）。"""
+        """实例 DONE 后重新武装；EMA9 成交轮次须先达到 reentry_min_mfe_r。
+        未成交撤单不受该门槛限制；收养实例不重新武装。"""
         strategy = self._strategies.get(symbol)
         if strategy is None or inst.adopted:
             return
         if inst.entries_today >= strategy.params["max_entries_per_day"]:
             return
+        if inst.activated and inst.line == "ema9":
+            min_mfe = float(strategy.params.get("reentry_min_mfe_r", 2.0))
+            if inst.mfe_r + 1e-9 < min_mfe:
+                return
         inst.state = WATCHING
         self._clear_proposal(inst)
         inst.side = ""
@@ -687,6 +702,7 @@ class StrategyEngine:
         inst.r_dist = 0.0
         inst.qty = 0
         inst.line = ""
+        inst.activated = False
         inst.breakeven_done = False
         inst.breakeven_attempt_at = 0.0
         inst.unrealized_r = 0.0
@@ -767,6 +783,7 @@ class StrategyEngine:
             # 成交检测（实盘 watcher 会置 ACTIVE；SimBroker on_price 已置）
             if lot is not None and lot.state == ACTIVE:
                 inst.state = ACTIVE
+                inst.activated = True
                 if inst.init_entry_px <= 0:
                     inst.init_entry_px = inst.entry_px
                 if inst.init_stop_px <= 0:

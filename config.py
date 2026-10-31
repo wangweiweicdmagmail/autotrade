@@ -74,7 +74,6 @@ WATCHLIST: List[str] = [
     "CAPITALCOM:NAS100",
     "NASDAQ:ARM",
     "NASDAQ:QQQ",
-    "OTC:RBLK",
     "NASDAQ:AVGO",
     "NASDAQ:AAPL",
     "NASDAQ:PLTR",
@@ -272,6 +271,11 @@ TOOL_ORDER_ID_STATE_PATH = "logs/tool_order_id.json"
 AUTO_CLOSE_ON_ST_FLIP = True
 STOP_GUARD_ENABLED = True
 
+# 持仓反向 FVG 守卫：持仓股 5M 收盘确认反向缺口（多仓遇空头 FVG、空仓遇多头
+# FVG）→ 浮亏立即市价平仓，浮盈立即保本 + 语音/界面提醒平仓锁利
+FVG_REVERSE_GUARD_ENABLED = True
+FVG_REVERSE_AUTO_CLOSE = True    # 浮亏自动市价平仓；False 降级为只提醒
+
 # 外部订单清理：号段外且不在旧工具白名单的挂单撤销、持仓平仓（默认按用户要求开启）
 # 外部订单/持仓处理：1=自动撤挂单+市价平残余持仓（默认，2026-10-23 用户恢复：
 # 非 autotrade 工具下单的仓位立即市价平仓）；0=告警模式（只检测+弹框提醒不动作）
@@ -292,6 +296,7 @@ def validate_config() -> None:
         "TOOL_ORDER_ID_BASE", "TOOL_ORDER_ID_MAX", "TOOL_ORDER_ID_STATE_PATH",
         "AUTO_CLOSE_ON_ST_FLIP", "STOP_GUARD_ENABLED",
         "EXTERNAL_ORDER_CLEANUP_ENABLED",
+        "FVG_REVERSE_GUARD_ENABLED", "FVG_REVERSE_AUTO_CLOSE",
     )
     missing = [name for name in required if name not in globals()]
     if missing:

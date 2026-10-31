@@ -102,6 +102,7 @@ Vue3 前端（宫格 + tab，实时计算限价/股数/金额/资金占比）
       "trend_state": 1,                // 1 单边多头 / -1 单边空头 / 0 震荡
       "direction": 1,                  // ST 方向：Up_Trend 有效=1 / Down_Trend 有效=-1 / 都无=0
       "ema_fast": 169.5,               // EMA20
+      "ema_9": 169.8,                  // EMA9（由同一 chart 的 5M 收盘价计算，Source=close/Offset=0）
       "ema_slow": 168.9,               // EMA100
       "supertrend": 169.64,            // Up/Down_Trend 中有效者
       "channel_edge": 169.84,          // Uptrend/Downtrend_Channel 中有效者（ST±1×ATR）
@@ -396,7 +397,7 @@ _heartbeat_loop（每 2s）
 | `_next_tool_order_id` | 集中分配 88 号段订单号，持久化并支持跨进程互斥 |
 | `fa_accounts` | 动态查询 dt_test 组成员，失败回退 config |
 | `positions` / `net_liquidation` | dt_test 组口径持仓/净值 |
-| `realized_pnl` / `daily_pnl` | 已实现盈亏 / 日盈亏 |
+| `realized_pnl` / `daily_pnl` | 已实现盈亏 / 日盈亏（周末与 09:30 ET 前显示 0；常规时段为当前净值−前一日权益，盘后保留） |
 | `last_price` / `cancel_order` | snapshot 现价 / 撤单 |
 
 （`place_limit_with_trail` / `place_bracket` 已随 TRAIL 路径删除。）
@@ -446,6 +447,7 @@ entry/stop/close ID 白名单兼容。快照查询失败返回 None，不得当�
 | `POST /api/auto/proposals/{id}/approve` | 人工批准开仓候选，批准后才创建 LMT+STP |
 | `POST /api/auto/proposals/{id}/reject` | 人工忽略候选（可选原因，同 bar 不重复提醒） |
 | `GET /api/performance` | 绩效统计（已平仓交易） |
+| `GET /api/returns/compare?start&end` | 日期范围内账户已实现日收益与 QQQ 收盘收益、累计曲线及超额收益 |
 | `GET /api/events` | 历史事件查询（JSONL 回溯） |
 | `POST /api/refresh` | 手动刷新 |
 | `WebSocket /ws` | 每 1s 广播 snapshot |
@@ -474,7 +476,7 @@ legacy TRAIL 路径 `POST /api/lots`。）
 - 每格：选股（下拉可搜索）+ 现价大字 + 限价/止损 + 计算（限价/股数/金额/资金占比）+
   FVG 摘要行（方向 + 累积计数 + 上下沿区间）+ 下单按钮；
 - 顶栏：DRY-RUN/LIVE 徽章、单笔风险输入（300）、仓位上限%（10-200%）、TV/IBKR 时钟、更新延时、日盈亏；
-- 底部 tab：**FVG 监控（默认）/ 选股 / 影子 / 自动策略 / 回测 / 运行日志 / 绩效 / 事件**（「信号」tab 已删除）；
+- 底部 tab：**FVG 监控（默认）/ 选股 / 影子 / 自动策略 / 回测 / 运行日志 / 收益对比 / 绩效 / 事件**（「信号」tab 已删除）；
   - FVG 监控（v2026-10-20 起）：三列——多头 FVG / 空头 FVG / **FVG 回踩（首次）**；
     事件行含时间、标的、缺口区间、ATR 倍数（缺口高 ÷ 同 bar ATR）、状态
     （未回踩/回踩中/已回补/已回踩）；槽位无事件显示空占位；15/30/60 分钟窗口；
@@ -499,6 +501,10 @@ legacy TRAIL 路径 `POST /api/lots`。）
     ST 延续/推进、FVG 方向/累积/上下沿、入场/止损、估算股数/市值/仓位占比，
     人工点击「确认开仓」或「忽略」；
   - 事件：历史事件查询（按类型过滤）；
+  - 收益对比：起止日期可选；账户日收益 = 平仓归档已实现盈亏 ÷ 日起始净值，
+    QQQ 日收益 = 常规时段收盘价 ÷ 前收盘 − 1；SVG 展示两条区间累计收益曲线、
+    超额收益和逐日明细。净值锚点落 `logs/equity_daily.json`，缺失锚点的历史
+    日期按平仓盈亏推算并标「估」；QQQ 日线缓存 `logs/qqq_daily.json`；
   - 绩效：已平仓交易统计。
 - 提醒：新开仓候选按 proposal_id 去重，常驻通知 + 汇总语音；保留自动平仓、
   裸仓、下单结果提醒。
@@ -628,11 +634,41 @@ localStorage，**master 审批条确认后**该客户端才能交易（未审批
 任一获取失败说明已有执行写进程在运行，禁止第二个实例重复撤改平同一订单。
 `logs/tool_order_id.json` 则负责 88 号段发号持久化与跨进程互斥。
 
-浏览器打开 http://127.0.0.1:8000。
+本机启动后自动打开 http://127.0.0.1:8000。首次启动先显示轻量加载页，
+`/api/startup` 每秒报告交易服务、IBKR、全股票池确认指标和图表工作区进度；
+全部就绪后才在原标签页进入主控制台。实盘必须等 TWS 连接，dry-run 不强制
+等待 TWS。首次就绪状态锁定，后续短暂断线仍由主页面内的健康告警处理，不退回
+加载页。控制台与选股联动的 TradingView 图表复用同一个 9222 调试 Chrome 进程，
+各占独立标签页；冷启动一次打开两个 URL，已有浏览器时只补缺失标签页。设置
+`CONSOLE_AUTO_OPEN_BROWSER=0` 可关闭自动打开浏览器（测试/无头运行）。
+
+本机 master 顶栏提供「关闭系统」按钮，`POST /api/system/shutdown` 仅允许回环
+地址调用并需二次确认。关闭顺序：永久关闭 IBKRGateway 交易门（13 个下单/改单/
+撤单入口拒绝新调用，等待进行中的写调用结束并断开 API）→ 停止全部跟单子进程
+→ 关闭 Trader Workstation（先正常退出，超时 TERM/KILL）→ uvicorn 优雅退出。
+关闭期间其他 API 写请求返回 503。此操作只停止软件后续控制，**不会撤销券商已有
+订单或止损**；需要恢复时重新运行启动脚本。
 
 ---
 
-## 12. 策略引擎与开仓人工确认（auto_engine）
+## 12. 策略引擎
+
+**当前生产策略（v2026-10-31）：`ema9_pyramid` 全自动金字塔。** 核心代码
+`engine/pyramid_engine.py`：使用 `ema9_autotrade` v7 的实时 `e9` 触线值，
+无需人工候选确认。首仓风险预算取启动时顶栏「单笔资金」R，第二/三次分别为
+2R/3、R/3，最多三次；每次达到首仓固定 R 的 2 倍后解锁下一次同向加仓。
+成交后按股数加权平均成本重新计算 2R，旧 MFE 清零；第三次加仓除整组
+均价 2R 外，还要求第二次仓位独立 MFE ≥1R（风险距离持久化在订单元数据），
+避免相邻 K 线在上一仓未盈利时连续加仓。整组止损随解锁移至平均成本。
+启动时以当前 `e9.direction` 锁定 `start_direction`，后续只接受该方向；
+真实仓位止损/全平后实例 DONE，不自动翻向或重开（未成交撤单可重试）。
+确认 `e9_c` 反向时整组平仓。Tab 展示
+建仓次数、均价、下一步条件、第二仓 MFE 和最大仓位百分比，支持单票停止加仓/
+整组平仓及订单筛选。手动 ACTIVE 仓可显式「转全自动」；策略等待首仓时，
+同向手动市价实际成交自动作为 `manual_seed` 首仓接管（仅整组为空、实际成交、
+合法止损），实际成本与首仓 R 用于后续管理，元数据持久化支持重启恢复。
+
+以下为历史 `trend_pullback` 设计，仅用于旧回测对照。
 
 策略负责一致地产生进场计划和执行后续管理，人负责从多个股票候选中挑选趋势与交易价值更好的标的。核心代码在 `engine/auto_engine.py` + `engine/strategies/`。
 
@@ -684,9 +720,14 @@ localStorage，**master 审批条确认后**该客户端才能交易（未审批
 
 **事件**：控制台写 `logs/events-YYYYMMDD.jsonl`，新增 `auto_entry_proposed / auto_entry_approved / auto_entry_rejected / auto_entry_expired`；实际下单仍由 `auto_order_placed` 表示。`auto_runner` 写 `logs/auto-YYYYMMDD.jsonl`。
 
-### 12.6 回测（backtest_auto.py）
+### 12.6 回测
 
-把历史 5M bar（含 trend_state 指标值）逐根喂给与实盘**同一个** StrategyEngine（+ SimBroker，确认模式关闭），验证「同一策略 + 同一数据 = 同一结果」。
+**当前回测 Tab**：`engine/backtest_session.py` 直接驱动与实盘同一个
+`PyramidEngine + SimBroker`，使用历史 `e9`（不再使用旧 StrategyEngine）。
+保留加载、单步、全跑；展示每次建仓风险预算、整组解锁/退出、平均成本、
+总盈亏和最大仓位百分比。首仓预算与净值分别取当前顶栏单笔资金和账户净值。
+
+以下为旧 `backtest_auto.py` 历史口径：把历史 5M bar（含 trend_state 指标值）逐根喂给 StrategyEngine（+ SimBroker，确认模式关闭），验证「同一策略 + 同一数据 = 同一结果」。
 
 ```bash
 python3 backtest_auto.py --strategy trend_pullback --symbol NASDAQ:NVDA --day 2026-10-16
@@ -702,9 +743,10 @@ python3 backtest_auto.py --strategy trend_pullback --symbol NASDAQ:NVDA --day 20
 
 进场规则（tick 触发，指标用 ts_c 确认值）：
 
-- `trend_state == 1`（单边多头）：实时成交价触及 `ema_fast` 或 `channel_edge`（price ≤ 线值）→ 做多；两线同触取更低价（更优入场）；
-- `trend_state == -1`（单边空头）：price ≥ 线值 → 做空；取更高价；
-- **FVG 入场线**（`use_fvg_line`，默认开）：fvg_c 确认值中，多头方向存在需求区 FVG（`fvg_last_dir == 1`）时 `fvg_last_top` 作为第三条入场线（price ≤ 上沿 → 限价 = 上沿）；空头方向存在供应区 FVG（`fvg_last_dir == -1`）时 `fvg_last_bottom` 作线（price ≥ 下沿 → 限价 = 下沿）；与 EMA/通道线同触时同样取更优价；
+- `direction == 1`（ST 多头）：实时成交价触及 `ema_fast`、`ema_9` 或 `channel_edge`（price ≤ 线值）→ 做多；多线同触取更低价（更优入场）；
+- `direction == -1`（ST 空头）：price ≥ 线值 → 做空；取更高价；
+- **EMA9 入场线**：与图表内置 `STD;EMA` 参数一致（Length=9 / Source=close / Offset=0），daemon 和历史导出由同一组 5M 收盘价计算；已与图表实际 EMA9 数值对拍；
+- **FVG 入场线**（`use_fvg_line`，默认开）：fvg_c 确认值中，多头方向存在需求区 FVG（`fvg_last_dir == 1`）时 `fvg_last_top` 作为第四条入场线（price ≤ 上沿 → 限价 = 上沿）；空头方向存在供应区 FVG（`fvg_last_dir == -1`）时 `fvg_last_bottom` 作线（price ≥ 下沿 → 限价 = 下沿）；与 EMA/通道线同触时同样取更优价；
 - **FVG 过滤**（可选，默认关）：`require_same_dir_fvg=true` 要求存在同向 FVG（`fvg_last_dir == direction`）才允许开仓；`min_fvg_cum=N`（N>0）要求 `fvg_cum_count >= N`；字段缺失一律视为不满足（拦截，不静默放行）；
 - 限价 = 线值；止损 = 限价 ∓ 1×ATR（ts_c.atr，ATR 缺失不进场）；方向 = ST 方向，无反向订单；
 - 时段闸：`entry_start_hm`（默认 09:45 ET）前、`entry_end_hm`（默认 15:00 ET）后不开新仓。
@@ -769,11 +811,15 @@ master /ws 快照（lot 全生命周期）
 握手即 EOF（连最小 uvicorn ws 也失败）——WS 客户端一律用
 `websockets.legacy.client.connect`（实测稳定）。
 
-**daemon 稳定性（v2026-10-24，4 Study × 54 标的实测 28s 全就绪）**：
+**daemon 稳定性（v2026-10-31：核心行情与 attack 隔离）**：
 - 分批启动（默认 6 chart/批 × 3s，`--batch-size`/`--batch-delay-ms` 可调）——
   一次性发起 54×(1 chart+4 study) 会被 TV 限流卡死且不自愈（实测两次复现）；
-- 巡检自愈：每 30s 检查，chart 超 90s 无数据或 attack study 无值 →
-  销毁重建（间隔 1.5s，单 chart 上限 10 次）；
+- 巡检自愈：每 30s 检查，仅 chart 超 90s 无核心 K 线时才销毁重建
+  （间隔 1.5s，单 chart 上限 10 次）；attack 无值只每 5 分钟聚合告警，
+  不再重建 chart。attack 正文加载失败时降级为无区间数据，trend/FVG/
+  smart_stop 与 K 线继续运行；
+- `pine_text.js` 缓存回退强制校验远端/缓存版本（忽略末尾 `.0`），版本错配
+  明确报错，禁止旧脚本正文拼新元数据导致 plot 静默缺失；
 - `realtime_collector` 两个管道坑：① stderr 接 PIPE 必须持续排空
   （`_stderr_drain`），否则 daemon console.error 写满 64KB 管道永久阻塞；
   ② `create_subprocess_exec` 必须 `limit=4MB`——tick JSON 单行 54 标的
@@ -888,7 +934,33 @@ FVG（多 fvg_event=1 / 空 -1）且同向 K 线 → 同一确认时刻候选 �
 
 ---
 
-## 13. 待完善 / 未验证
+## 18. 客户端看盘：「每人一格」+ 截图回传（v2026-10-27）
+
+其他交易员要看 master 同款 TV 图（私有指标 trend_state/FVG/smart_stop 只有
+master 的屏幕能渲染），且多客户端会同时看不同标的 → 按宫格分画面位：
+
+- **trader → pane 绑定**：master 固定 pane 0（只切不截图，面前就是屏幕）；
+  已审批客户端按首次使用分 pane 1..N（映射落盘 logs/tv_panes.json，
+  两小时未用可回收，布局缩小自动清越界映射）；pane 分完 → `pane_full`
+  「画面位已满」。布局由人工保证，启动时校验 pane 数并在快照
+  `status.tv_view`（panes/slots）展示（选股 tab 头部小字）。
+- **链路**：`POST /api/tv/view`（require_trader）→ master 直通
+  `_tv_show_symbol`；客户端 → `_tv_ensure_browser` → `_tv_assign_pane`
+  → 每 pane 一把 asyncio 锁 → `_TV_PANE_SHOW_JS` 切该格（已是目标标的
+  跳过切换 = 刷新 fast-path）→ `_TV_PANE_READY_JS` 轮询数据就绪（最多
+  12s + 1.2s 渲染稳定）→ `tv_cdp.screenshot(clip=pane rect)` 只截该格
+  → base64 JPEG 回传。
+- **前端**：`tvShow()` 统一改调 `/api/tv/view`；客户端收到图弹
+  「TV 图表」面板（el-dialog，10s 自动刷新 + 手动刷新，关闭停表）；
+  master 行为不变（无弹窗）。
+- 实测：单格布局正确报 pane_full；借 pane 0 验证全链路（切 TSLA →
+  截图含 SuperTrend/FVG 区域私有指标，2328×1540 @dpr2）。
+- 测试 tests/test_tv_view.py（分配/回收/满员/master 直通/fast-path/
+  未就绪透传，CDP 全 fake）。
+- 后续候选：TV widget 自绘（用采集数据在前端画 K 线，摆脱单屏限制）——
+  视截图版使用效果再定。
+
+---
 
 | 项 | 状态 |
 |---|---|

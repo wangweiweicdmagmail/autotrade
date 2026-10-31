@@ -32,6 +32,7 @@
 const fs = require('fs');
 const path = require('path');
 const TradingView = require('@mathieuc/tradingview');
+const { loadIndicatorWithText } = require('./pine_text.js');
 
 // ---------------------------------------------------------------------------
 // 参数解析
@@ -69,8 +70,8 @@ function parseArgs(argv) {
  */
 function collectSymbol(client, indicMap, symbol, args) {
   return new Promise((resolve) => {
-    // 按周期分组：tf -> [{ key, indic }]
-    const groups = {};
+    // 按周期分组：tf -> [{ key, indic }]；主周期始终建会话，支持空指标纯 K 线采集
+    const groups = { [args.timeframe]: [] };
     for (const [key, indic] of Object.entries(indicMap)) {
       const tf = indic.__timeframe || args.timeframe;
       (groups[tf] = groups[tf] || []).push({ key, indic });
@@ -181,12 +182,12 @@ async function main() {
   const creds = JSON.parse(fs.readFileSync(args.creds, 'utf8'));
   const indicSpecs = JSON.parse(fs.readFileSync(args.indicators, 'utf8'));
 
-  // 1) 加载指标描述符（私有脚本需 sessionid），应用 inputs 覆盖与周期
+  // 1) 加载指标描述符（私有脚本需 sessionid），应用 inputs 覆盖与周期；
+  //    加密正文注入（2026-10-27 起 create_study 必须携带 text，见 pine_text.js）
   const indicMap = {};
   await Promise.all(indicSpecs.map(async (spec) => {
     try {
-      const indic = await TradingView.getIndicator(
-        spec.id, 'last', creds.sessionid, creds.sessionid_sign);
+      let indic = await loadIndicatorWithText(TradingView, spec.id, creds);
       // inputs 覆盖：key 支持 in_N / inline 名 / internalID
       // （如 STD;Supertrend 的 Factor / ATR Length）
       for (const [k, v] of Object.entries(spec.inputs || {})) {

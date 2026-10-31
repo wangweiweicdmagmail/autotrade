@@ -1,83 +1,55 @@
-# -*- coding: utf-8 -*-
-"""
-回测工作台会话 (BacktestSession)
-=================================
+"""EMA9 金字塔单股单日步进回测，与实盘共用 PyramidEngine。"""
 
-会话式单股单日回测：加载数据后可**单步（逐 bar）**或**一次性全跑**，
-驱动与实盘同一个 StrategyEngine + SimBroker，并把引擎事件按 bar 时间
-归集成**每笔订单的全生命周期记录**：
-
-    挂单(时间/限价/止损/股数) → 成交(时间/价格) → 保本(时间/新止损)
-    → ST 跟踪(时间/旧→新止损，可多次) → 止损/平仓(时间/价格/原因)
-    → 最终盈亏 / RR / MFE_R
-
-与 backtest_auto.py 同一口径：bar 内 tick 用极值建模（多 low / 空 high），
-进场指标 = 上一根 bar 确认值，管理 = 本根收盘确认值。
-"""
-
-import logging
 from datetime import datetime
 from typing import List, Optional
 from zoneinfo import ZoneInfo
 
 import config
-from engine.auto_engine import ACTIVE, DONE, PENDING, SimBroker, StrategyEngine
-from engine.strategies import build_strategy
-from execution.risk import RiskConfig, RiskGate
-
-logger = logging.getLogger(__name__)
+from engine.auto_engine import ACTIVE, DONE, PENDING, SimBroker
+from engine.pyramid_engine import PyramidEngine
 
 ET = ZoneInfo("America/New_York")
-ENTRY_START_HM = 9 * 60 + 30
 
 
 def _hm(ts: float) -> str:
-    if not ts:
-        return ""
-    return datetime.fromtimestamp(ts, ET).strftime("%H:%M")
+    return datetime.fromtimestamp(ts, ET).strftime("%H:%M") if ts else ""
 
 
 class BacktestSession:
-    """单股单日的步进式回测会话。"""
-
     def __init__(self, rows: list, symbol: str, day: str,
                  strategy_name: str, params: dict) -> None:
+        if strategy_name != "ema9_pyramid":
+            raise ValueError("回测策略仅支持 ema9_pyramid")
         self.symbol = symbol
         self.day = day
         self.strategy_name = strategy_name
-        # 当日 RTH bar 及全局索引（取上一根用）
+        initial_risk = float(params.get("initial_risk_usd") or config.RISK_PER_TRADE_USD)
+        if initial_risk <= 0:
+            raise ValueError("首仓风险预算必须大于 0")
+        self.equity = float(params.get("equity") or 0)
+        self.params = {
+            "initial_risk_usd": initial_risk,
+            "risk_ratios": [1.0, 2.0 / 3.0, 1.0 / 3.0],
+            "max_entries": 3,
+            "equity": self.equity,
+        }
         self._day_rows = []
-        for i, row in enumerate(rows):
-            d = datetime.fromtimestamp(row["time"], ET)
-            if d.date().isoformat() == day:
-                hm = d.hour * 60 + d.minute
-                if ENTRY_START_HM <= hm < 16 * 60:
-                    self._day_rows.append((i, row, hm))
-        self._rows = rows
-        self._cursor = 0                    # 下一个待处理 bar 的下标
+        for row in rows:
+            dt = datetime.fromtimestamp(row["time"], ET)
+            if dt.date().isoformat() == day and 9 * 60 + 30 <= dt.hour * 60 + dt.minute < 16 * 60:
+                self._day_rows.append(row)
+        self._cursor = 0
         self._prev_row: Optional[dict] = None
-
-        strategy = build_strategy(strategy_name, **params)
-        self.params = strategy.params
         self.broker = SimBroker()
-        self._events: List[dict] = []       # 全量事件（带 bar_time）
+        self._events: List[dict] = []
         self._bar_time_now = 0.0
-        self.engine = StrategyEngine(
-            self.broker, risk_gate=self._make_risk(), gateway=None,
-            emit=self._on_event)
-        self.engine.start(strategy, [symbol])
+        start_direction = ((self._day_rows[0].get("e9") or {}).get("direction", 0)
+                           if self._day_rows else 0)
+        self.params["start_direction"] = start_direction
+        self.engine = PyramidEngine(self.broker, emit=self._on_event)
+        self.engine.start([symbol], initial_risk, {symbol: start_direction})
         self._done = False
         self._settled = False
-
-    @staticmethod
-    def _make_risk() -> RiskGate:
-        return RiskGate(RiskConfig(
-            per_trade_pct=config.RISK_PER_TRADE_PCT,
-            per_trade_usd=config.RISK_PER_TRADE_USD,
-            max_order_qty=config.RISK_MAX_ORDER_QTY,
-            max_open_positions=config.RISK_MAX_OPEN_POSITIONS,
-            daily_loss_limit_usd=config.RISK_DAILY_LOSS_LIMIT_USD,
-        ))
 
     def _on_event(self, etype: str, **data) -> None:
         self._events.append({"type": etype, "bar_time": self._bar_time_now,
@@ -91,45 +63,33 @@ class BacktestSession:
     def done(self) -> bool:
         return self._done
 
-    # ------------------------------------------------------------------
-    # 步进
-    # ------------------------------------------------------------------
-
     async def step(self, n: int = 1) -> dict:
-        """前进 n 根 bar（到末尾自动 EOD 了结）。返回增量事件 + 全量状态。"""
-        new_events_start = len(self._events)
+        start = len(self._events)
         for _ in range(max(1, n)):
             if self._done:
                 break
             await self._step_one()
-        return {"new_events": self._events[new_events_start:],
-                **self.state()}
+        return {"new_events": self._events[start:], **self.state()}
 
     async def run_all(self) -> dict:
-        """一次性跑完剩余全部 bar。"""
-        new_events_start = len(self._events)
+        start = len(self._events)
         while not self._done:
             await self._step_one()
-        return {"new_events": self._events[new_events_start:],
-                **self.state()}
+        return {"new_events": self._events[start:], **self.state()}
 
     async def _step_one(self) -> None:
         if self._cursor >= self.total_bars:
             await self._settle_eod()
             return
-        _, row, hm = self._day_rows[self._cursor]
+        row = self._day_rows[self._cursor]
         self._cursor += 1
         bar = {k: row[k] for k in ("time", "open", "high", "low", "close", "volume")}
-        ts = row.get("ts") or {}
         self._bar_time_now = bar["time"]
-        if self._prev_row is not None:
-            prev_bar = {k: self._prev_row[k] for k in
-                        ("time", "open", "high", "low", "close", "volume")}
-            prev_ts = self._prev_row.get("ts") or {}
-            await self.engine.on_bar_extremes(self.symbol, bar, prev_ts,
-                                              prev_bar, hm,
-                                              fvg_c=self._prev_row.get("fvg"))
-        await self.engine.on_bar(self.symbol, bar, ts)
+        dt = datetime.fromtimestamp(bar["time"], ET)
+        hm = dt.hour * 60 + dt.minute
+        await self.engine.on_price_extremes(
+            self.symbol, bar["low"], bar["high"], row.get("e9") or {}, hm)
+        await self.engine.on_bar(self.symbol, bar, row.get("e9") or {})
         self._prev_row = row
         if self._cursor >= self.total_bars:
             await self._settle_eod()
@@ -139,136 +99,136 @@ class BacktestSession:
             self._done = True
             return
         self._settled = True
-        last_close = self._prev_row["close"]
-        last_bt = self._prev_row["time"]
-        self._bar_time_now = last_bt
+        close = self._prev_row["close"]
         for inst in self.engine._instances.values():
-            if inst.state == DONE or not inst.lot_id:
-                continue
-            lot = self.broker.get(inst.lot_id)
-            if lot is None:
-                continue
-            if lot.state == ACTIVE:
-                await self.broker.close(inst.lot_id, last_close, "eod",
-                                        ts=last_bt)
-                self.engine._finish(inst, "eod")
-            elif lot.state == PENDING:
-                await self.broker.cancel(inst.lot_id)
-                self.engine._finish(inst, "eod_cancel")
+            for lot_id in list(inst.lot_ids):
+                lot = self.broker.get(lot_id)
+                if lot is None:
+                    continue
+                if lot.state == ACTIVE:
+                    await self.broker.close(lot_id, close, "eod", ts=self._prev_row["time"])
+                elif lot.state == PENDING:
+                    await self.broker.cancel(lot_id)
+            await self.engine._refresh(inst)
         self._done = True
 
-    # ------------------------------------------------------------------
-    # 订单生命周期（按 lot 归集事件 + 终态）
-    # ------------------------------------------------------------------
-
     def orders(self) -> List[dict]:
-        orders: dict = {}
+        orders = {}
         for ev in self._events:
-            lid = ev.get("lot_id")
-            if not lid:
+            lot_id = ev.get("lot_id")
+            if not lot_id:
                 continue
-            o = orders.setdefault(lid, {
-                "lot_id": lid, "symbol": ev.get("symbol", self.symbol),
-                "side": ev.get("side", ""), "qty": 0, "state": "",
-                "placed": None, "filled": None, "expired": None,
-                "breakeven": None, "trails": [], "closed": None,
+            order = orders.setdefault(lot_id, {
+                "lot_id": lot_id, "symbol": self.symbol, "side": ev.get("side", ""),
+                "qty": 0, "state": "", "placed": None, "filled": None,
+                "closed": None, "trails": [],
             })
-            t, hm = ev.get("bar_time", 0), ev.get("hm", "")
-            et = ev["type"]
-            if et == "auto_order_placed":
-                o["placed"] = {"t": t, "hm": hm, "limit": ev.get("limit_px"),
-                               "stop": ev.get("stop_px")}
-                o["qty"] = ev.get("qty", 0)
-                o["side"] = ev.get("side", o["side"])
-                o["state"] = "PENDING"
-            elif et == "auto_filled":
-                o["filled"] = {"t": t, "hm": hm, "px": ev.get("avg_fill")}
-                o["state"] = "ACTIVE"
-            elif et == "auto_expired":
-                o["expired"] = {"t": t, "hm": hm}
-                o["state"] = "EXPIRED"
-            elif et == "auto_breakeven":
-                o["breakeven"] = {"t": t, "hm": hm, "stop": ev.get("new_stop"),
-                                  "unrealized_r": ev.get("unrealized_r")}
-            elif et == "auto_trail":
-                o["trails"].append({"t": t, "hm": hm,
-                                    "old": ev.get("old_stop"),
-                                    "new": ev.get("new_stop")})
-            elif et in ("auto_reverse_close",):
-                o["closed"] = {"t": t, "hm": hm, "px": ev.get("ref_px"),
-                               "reason": "trend_reverse"}
-                o["state"] = "CLOSED"
-        # 终态合并（SimBroker 为准：止损/平仓/EOD）
+            if ev["type"] == "pyramid_order_placed":
+                order.update({
+                    "side": ev["side"], "qty": ev["qty"], "state": PENDING,
+                    "entries": ev["entries"], "risk_budget": ev["risk_budget"],
+                    "placed": {"t": ev["bar_time"], "hm": ev["hm"],
+                               "limit": ev["entry_px"], "stop": ev["stop_px"]},
+                })
         out = []
-        for lid, o in orders.items():
-            lot = self.broker.get(lid)
-            if lot is not None:
-                # 同根「成交+止损」的订单：引擎 auto_filled 事件来不及发，
-                # 用 lot 的成交记录补齐生命周期
-                if o["filled"] is None and lot.avg_fill > 0:
-                    o["filled"] = {"t": lot.fill_time, "hm": _hm(lot.fill_time),
+        for lot_id, order in orders.items():
+            lot = self.broker.get(lot_id)
+            if lot is None:
+                continue
+            if lot.avg_fill > 0:
+                order["filled"] = {"t": lot.fill_time, "hm": _hm(lot.fill_time),
                                    "px": lot.avg_fill}
-                o["state"] = lot.state
-                if lot.state == DONE:
-                    o["closed"] = {"t": lot.exit_time, "hm": _hm(lot.exit_time),
+            order["state"] = lot.state
+            if lot.state == DONE:
+                order["closed"] = {"t": lot.exit_time, "hm": _hm(lot.exit_time),
                                    "px": lot.exit_px, "reason": lot.exit_reason}
-                    # 风险基准 = 初始止损距离（跟踪移动不影响 RR 口径）
-                    risk_amt = abs(lot.entry_px - (lot.init_stop_px or lot.stop_px))
-                    denom = risk_amt * lot.qty if lot.qty > 0 else 0
-                    o["pnl"] = lot.realized_pnl
-                    o["rr"] = round(lot.realized_pnl / denom, 3) if denom else 0
-                    o["mfe_r"] = round(lot.mfe / denom, 2) if denom else 0
-            out.append(o)
-        out.sort(key=lambda x: (x.get("placed") or {}).get("t", 0))
+                risk = abs(lot.entry_px - (lot.init_stop_px or lot.stop_px))
+                denom = risk * lot.qty if lot.qty else 0
+                order["pnl"] = lot.realized_pnl
+                order["rr"] = round(lot.realized_pnl / denom, 3) if denom else 0
+                order["mfe_r"] = round(lot.mfe / denom, 2) if denom else 0
+            out.append(order)
+        out.sort(key=lambda o: (o.get("placed") or {}).get("t", 0))
         return out
 
-    # ------------------------------------------------------------------
-    # 状态快照
-    # ------------------------------------------------------------------
+    def _instances(self) -> list:
+        rows = self.engine.instances()
+        for row in rows:
+            row["max_position_pct"] = (round(row["max_notional"] / self.equity * 100, 2)
+                                       if self.equity > 0 else None)
+        return rows
+
+    def _timeline(self) -> list:
+        out = []
+        for ev in self._events:
+            etype = ev["type"]
+            if etype == "pyramid_signal":
+                action = ev["action"]
+                side = "多" if ev.get("side") == "long" else "空"
+                if action in ("initial", "add"):
+                    title = "首仓" if action == "initial" else f"第{ev['entries']}次加仓"
+                    detail = (f"{side} EMA9 {ev['entry_px']:.2f} · 本次{ev['qty']}股"
+                              f" · 预算${ev['risk_budget']:.2f} · 总{ev['qty_after']}股"
+                              f"@{ev['avg_after']:.2f} · 止损{ev['stop_px']:.2f}")
+                else:
+                    title = "下单失败" if action == "order_failed" else "忽略信号"
+                    detail = f"{side} EMA9 {ev['entry_px']:.2f} · {ev['reason']}"
+                    if ev.get("qty_before"):
+                        detail += (f" · 当前{ev['qty_before']}股@{ev['avg_before']:.2f}"
+                                   f" · MFE {ev['mfe_r']:.2f}R")
+                    if ev["reason"] == "第二次仓位未达到1R":
+                        detail += f" · 第二仓MFE {ev['second_mfe_r']:.2f}R"
+            elif etype == "pyramid_unlocked":
+                title = "2R解锁"
+                detail = (f"MFE {ev['mfe_r']:.2f}R · {ev['qty']}股"
+                          f"@{ev['avg_cost']:.2f} · 整组止损{ev['stop_px']:.2f}")
+            elif etype == "pyramid_close_requested":
+                title = "整组退出"
+                detail = (f"{ev['reason']} · {ev['qty']}股@{ev['avg_cost']:.2f}"
+                          f" · 退出价{ev['ref_px']:.2f}")
+            else:
+                continue
+            out.append({"time": ev["bar_time"], "hm": ev["hm"],
+                        "type": etype, "title": title, "detail": detail,
+                        "reason": ev.get("reason", "")})
+        return out
 
     def state(self) -> dict:
         cur = None
         if self._prev_row is not None:
-            ts = self._prev_row.get("ts") or {}
+            row = self._prev_row
+            e9 = row.get("e9") or {}
             cur = {
-                "time": self._prev_row["time"], "hm": _hm(self._prev_row["time"]),
-                "open": self._prev_row["open"], "high": self._prev_row["high"],
-                "low": self._prev_row["low"], "close": self._prev_row["close"],
-                "trend_state": ts.get("trend_state"),
-                "direction": ts.get("direction"),
-                "ema_fast": ts.get("ema_fast"),
-                "channel_edge": ts.get("channel_edge"),
-                "supertrend": ts.get("supertrend"),
-                "atr": ts.get("atr"),
-                "divergence": ts.get("divergence"),
-                "fvg": self._prev_row.get("fvg"),
+                "time": row["time"], "hm": _hm(row["time"]),
+                "open": row["open"], "high": row["high"],
+                "low": row["low"], "close": row["close"],
+                "direction": e9.get("direction"), "ema_9": e9.get("ema_9"),
+                "touch": e9.get("touch"), "atr": e9.get("atr"),
+                "long_stop": e9.get("long_stop"), "short_stop": e9.get("short_stop"),
             }
+        management = self._timeline()
         return {
             "symbol": self.symbol, "day": self.day,
             "strategy": self.strategy_name, "params": self.params,
             "cursor": self._cursor, "total_bars": self.total_bars,
-            "done": self._done,
-            "current_bar": cur,
-            "instances": self.engine.instances(),
-            "orders": self.orders(),
-            "summary": self._summary(),
+            "done": self._done, "current_bar": cur,
+            "instances": self._instances(), "orders": self.orders(),
+            "management": management, "summary": self._summary(),
         }
 
     def _summary(self) -> dict:
         closed = [o for o in self.orders() if o.get("closed")]
-        n = len(closed)
-        if not n:
-            return {"count": 0}
+        instances = self._instances()
+        if not closed:
+            return {"count": 0,
+                    "max_position_pct": max((i["max_position_pct"] or 0 for i in instances), default=0)}
         wins = [o for o in closed if o.get("pnl", 0) > 0]
-        stopped = [o for o in closed if o["closed"].get("reason") == "stop"]
-        no_1r = [o for o in stopped if o.get("mfe_r", 0) < 1]
         return {
-            "count": n,
-            "win_rate": round(len(wins) / n * 100, 1),
+            "count": len(closed),
+            "win_rate": round(len(wins) / len(closed) * 100, 1),
             "total_pnl": round(sum(o.get("pnl", 0) for o in closed), 2),
-            "avg_rr": round(sum(o.get("rr", 0) for o in closed) / n, 2),
-            "avg_mfe_r": round(sum(o.get("mfe_r", 0) for o in closed) / n, 2),
+            "avg_rr": round(sum(o.get("rr", 0) for o in closed) / len(closed), 2),
+            "avg_mfe_r": round(sum(o.get("mfe_r", 0) for o in closed) / len(closed), 2),
             "max_mfe_r": round(max(o.get("mfe_r", 0) for o in closed), 2),
-            "no_1r_count": len(no_1r),
-            "no_1r_pct": round(len(no_1r) / n * 100, 1),
+            "max_position_pct": max((i["max_position_pct"] or 0 for i in instances), default=0),
         }

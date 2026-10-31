@@ -33,9 +33,11 @@ function calcPosition(equity, riskUsd, limitPx, stopPx, maxPositionPct, maxOrder
 createApp({
   data() {
     return {
-      status: { dry_run: true, connected: false, halted: false, equity: null, daily_pnl: null, market_age: null, market_running: true, allow_short: true, total_risk_usd: 0, max_total_risk_usd: 0, total_position_pct: null },
+      status: { dry_run: true, connected: false, halted: false, equity: null, daily_pnl: null, market_age: null, market_transport_age: null, market_bar_age: null, market_stale: false, market_stale_reason: '', market_running: true, allow_short: true, total_risk_usd: 0, max_total_risk_usd: 0, total_position_pct: null, tv_view: null },
       market: {},
       lots: [],
+      orderSymbolFilter: '',
+      orderKindFilter: 'all',
       riskUsd: (() => {   // 单笔资金（最大风险，美元，localStorage 持久化）
         try { const v = parseFloat(localStorage.getItem('risk_usd')); return isFinite(v) && v > 0 ? v : 300; } catch (e) { return 300; }
       })(),
@@ -55,14 +57,30 @@ createApp({
       now: Date.now() / 1000,   // 前端实时时钟（每秒更新，驱动时钟走秒）
       selectRefs: {},           // el-select 实例引用（读内部 query）
       logs: [],                 // 运行日志（后端环形缓冲区）
-      bottomTab: 'fvg',         // 底部面板 tab：fvg(FVG监控，默认) / screen(选股) / auto / log ...
+      bottomTab: 'fvg',         // 主区=自动策略；底部 tab：fvg(FVG监控，默认) / orders / screen / log ...
+      bottomPanelHeight: (() => {
+        try { const v = parseInt(localStorage.getItem('bottom_panel_height'), 10); return v >= 180 && v <= 800 ? v : 420; } catch (e) { return 420; }
+      })(),
+      panelResizing: false,
       screen: { long: [], short: [] },  // 横截面选股（多头/空头两列）
       screenSort: 'divergence',   // divergence=EMA发散度 / duration=ST持续 / push=ST推进
       performance: null,          // 复盘绩效统计
+      returnsRange: (() => {
+        const fmt = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+        const end = new Date(), start = new Date();
+        start.setDate(end.getDate() - 29);
+        return [fmt(start), fmt(end)];
+      })(),
+      returnsData: null,
+      returnsLoading: false,
+      returnsError: '',
+      returnsRequestId: 0,
       scanAlerts: [],             // 持仓扫描提醒
       stopAlerts: [],             // 止损单守卫提醒（持仓缺少 STP/TRAIL 保护单）
       externalAlerts: [],         // 外部订单/持仓告警（IBKR 手动单，告警模式）
       autoCloseNotices: [],       // 自动平仓记录（语音/通知）
+      fvgReverseAlerts: [],       // 反向 FVG 守卫提醒（锁利/平仓失败）
+      fvgReverseNotices: [],      // 反向 FVG 自动平仓记录（语音/通知）
       lastScanAlert: {},          // 已提醒过的持仓扫描（按 scanned_at 去重）
       lastBreakeven: loadNotified('notified_breakeven'),   // 已播报过的保本（持久化，刷新不重播）
       slowBreakAlerts: [],        // 未快速突破提醒（开仓超时未保本）
@@ -70,6 +88,8 @@ createApp({
       lastStopAlert: {},          // 已提醒过的止损单缺失（按 checked_at 去重）
       lastExternalAlert: {},      // 已提醒过的外部订单/持仓（kind:ticker 去重，60s 节流）
       lastAutoCloseNotice: loadNotified('notified_autoclose'),  // 已播报过的自动平仓（持久化）
+      lastFvgReverseAlert: {},          // 已提醒过的反向 FVG（lot_id+alerted_at 去重）
+      lastFvgReverseNotice: loadNotified('notified_fvg_reverse'),  // 已播报过的反向FVG平仓（持久化）
       events: [],                 // 历史事件（持久日志回溯）
       eventFilter: 'all',         // 事件类型过滤
       shadow: { stats: {}, events: [] },   // 当日影子回测（统计 + 回踩事件）
@@ -97,6 +117,9 @@ createApp({
       fvgFeedCollapsed: false,     // 信号栏收起状态
       news: null,                  // 盘前新闻摘要（/api/news，30s 轮询 + 手动刷新）
       newsHot: {},                 // 快照 status.news.hot：ticker → gist（「新闻」徽标联动）
+      liveNewsTickers: [],          // 快照 status.news.live_tickers：近 15 分钟有新浪快讯的标的
+      liveNewsDialog: { visible: false, ticker: '', items: [], loading: false,
+                        error: '', updatedAt: null, requestId: 0 },
       newsBusy: false,             // 手动刷新中（10 分钟冷却由后端管）
       reportList: [],              // 盘前报告历史列表（/api/reports，日期倒序）
       reportDate: '',              // 当前查看的报告日期（YYYYMMDD）
@@ -105,6 +128,10 @@ createApp({
       reportWasRunning: false,     // 生成中→完成 跳变检测（完成即刷新列表+提示）
       srcInput: '',                // 视频源输入框（YouTube 链接）
       srcList: [],                 // 视频源列表（/api/report/sources）
+      // TV 看盘面板（客户端截图回传：每人一格，10s 自动刷新；master 不弹）
+      tvView: { visible: false, symbol: '', image: '', pane: null,
+                loading: false, error: '' },
+      tvViewTimer: null,           // 自动刷新定时器句柄
       // 悬浮交易台折叠状态（localStorage 持久化，小屏省空间）
       deckCollapsed: (() => { try { return localStorage.getItem('deck_collapsed') === '1'; } catch (e) { return false; } })(),
       fvgFreshIds: {},             // 会话内新到事件 id -> 到达时间（新鲜行高亮用）
@@ -114,6 +141,21 @@ createApp({
       breakoutSeenIds: {},         // 已通报过的突破信号（按 id 去重）
       breakoutInitDone: false,     // 突破信号首屏基线标记
       auto: { enabled: false, strategy: '', instances: [], proposals: [] },
+      expandedAutoOrders: {},
+      demoMode: (() => { try { return localStorage.getItem('demo_mode') === '1'; } catch (e) { return false; } })(),
+      demoAutoInstances: [
+        { inst_id: 'demo-nvda', symbol: 'NASDAQ:NVDA', strategy: 'ema9_pyramid', state: 'ACTIVE', side: 'short', source: 'manual_seed', entries: 2, avg_cost: 206.73, entry_px: 206.73, qty: 667, stop_px: 206.73, initial_risk_usd: 300, initial_r: 0.85, unlocked: true, breakeven_done: true, unrealized_r: 1.12, mfe_r: 2.18, second_mfe_r: 0.35, max_notional: 137820.69, max_position_pct: 63.28, lot_ids: ['demo-nvda-1', 'demo-nvda-2'] },
+        { inst_id: 'demo-qcom', symbol: 'NASDAQ:QCOM', strategy: 'ema9_pyramid', state: 'ACTIVE', side: 'short', source: 'auto', entries: 3, avg_cost: 166.61, entry_px: 166.61, qty: 494, stop_px: 166.61, initial_risk_usd: 300, initial_r: 1.37, unlocked: true, breakeven_done: true, unrealized_r: 2.35, mfe_r: 3.55, second_mfe_r: 2.10, max_notional: 81346.98, max_position_pct: 37.35, lot_ids: ['demo-qcom-1', 'demo-qcom-2', 'demo-qcom-3'] },
+        { inst_id: 'demo-amd', symbol: 'NASDAQ:AMD', strategy: 'ema9_pyramid', state: 'ACTIVE', side: 'long', source: 'manual_seed', entries: 1, avg_cost: 513.07, entry_px: 513.07, qty: 72, stop_px: 508.92, initial_risk_usd: 300, initial_r: 4.15, unlocked: false, breakeven_done: false, unrealized_r: -0.22, mfe_r: 1.55, second_mfe_r: 0, max_notional: 37244.52, max_position_pct: 17.10, lot_ids: ['demo-amd-1'] },
+      ],
+      demoOrderLots: [
+        { lot_id: 'demo-nvda-1', symbol: 'NASDAQ:NVDA', side: 'short', qty: 352, filled_qty: 352, state: 'ACTIVE', limit_type: 'market', trader: 'master', entry_px: 207.37, avg_fill: 207.37, stop_px: 206.73, last_px: 205.68, realized_pnl: 0, created_at: 1793368200, updated_at: 1793375400, reason: '手动首仓', signal_snapshot: { pyramid_seed: true } },
+        { lot_id: 'demo-nvda-2', symbol: 'NASDAQ:NVDA', side: 'short', qty: 315, filled_qty: 315, state: 'ACTIVE', limit_type: 'auto_ema9_pyramid', trader: 'auto', entry_px: 206.01, avg_fill: 206.01, stop_px: 206.73, last_px: 205.68, realized_pnl: 0, created_at: 1793375400, updated_at: 1793376600, reason: 'EMA9金字塔 第2次', signal_snapshot: { entry_index: 2 } },
+        { lot_id: 'demo-qcom-1', symbol: 'NASDAQ:QCOM', side: 'short', qty: 218, filled_qty: 218, state: 'ACTIVE', limit_type: 'auto_ema9_pyramid', trader: 'auto', entry_px: 168.52, avg_fill: 168.52, stop_px: 166.61, last_px: 163.86, realized_pnl: 0, created_at: 1793367000, updated_at: 1793370000, reason: 'EMA9金字塔 第1次', signal_snapshot: { entry_index: 1 } },
+        { lot_id: 'demo-qcom-2', symbol: 'NASDAQ:QCOM', side: 'short', qty: 172, filled_qty: 172, state: 'ACTIVE', limit_type: 'auto_ema9_pyramid', trader: 'auto', entry_px: 165.36, avg_fill: 165.36, stop_px: 166.61, last_px: 163.86, realized_pnl: 0, created_at: 1793370000, updated_at: 1793372000, reason: 'EMA9金字塔 第2次', signal_snapshot: { entry_index: 2 } },
+        { lot_id: 'demo-qcom-3', symbol: 'NASDAQ:QCOM', side: 'short', qty: 104, filled_qty: 104, state: 'ACTIVE', limit_type: 'auto_ema9_pyramid', trader: 'auto', entry_px: 164.67, avg_fill: 164.67, stop_px: 166.61, last_px: 163.86, realized_pnl: 0, created_at: 1793372000, updated_at: 1793373000, reason: 'EMA9金字塔 第3次', signal_snapshot: { entry_index: 3 } },
+        { lot_id: 'demo-amd-1', symbol: 'NASDAQ:AMD', side: 'long', qty: 72, filled_qty: 72, state: 'ACTIVE', limit_type: 'market', trader: 'master', entry_px: 513.07, avg_fill: 513.07, stop_px: 508.92, last_px: 512.15, realized_pnl: 0, created_at: 1793367000, updated_at: 1793368000, reason: '手动首仓', signal_snapshot: { pyramid_seed: true } },
+      ],
       autoSymbols: '',            // 自动策略启动表单：标的（空=全池）
       autoBusy: false,
       autoProposalBusy: {},       // proposal_id -> 是否正在提交决策
@@ -123,6 +165,7 @@ createApp({
       wbLoading: false,
       wbError: '',
       wb: null,                   // 回测会话状态（进度/实例/订单生命周期）
+      decisionCollapsed: {},       // 连续同原因忽略组：默认折叠，点击展开
       btSymbol: '',               // 历史回测表单：标的
       btDay: '',                  // 历史回测表单：交易日（默认昨日）
       btLoading: false,
@@ -133,6 +176,9 @@ createApp({
       ],
       placing: false,
       ws: null,
+      systemClosing: false,
+      systemClosed: false,
+      systemCloseError: '',
       // ---- 局域网多客户端身份 ----
       identity: 'init',       // init / register（需登记）/ pending（待确认）/ ok（master 或已审批 trader）
       identityNotice: '',     // 登记页提示（如 token 过期原因）
@@ -163,6 +209,9 @@ createApp({
       return Object.keys(this.market).sort((a, b) =>
         a.split(':').pop().localeCompare(b.split(':').pop()));
     },
+    logPanelStyle() {
+      return { height: `${this.bottomPanelHeight}px`, flex: `0 0 ${this.bottomPanelHeight}px` };
+    },
     sortedScreenLong() { return this.sortScreenRows(this.screen.long); },
     sortedScreenShort() { return this.sortScreenRows(this.screen.short); },
     slotRows() {
@@ -175,7 +224,16 @@ createApp({
       const rank = { PENDING: 0, CLOSING: 0, ACTIVE: 1 };
       const norm = (t) => t || 'master';   // 旧数据无 trader 视为 master
       const own = (l) => (this.traderName && norm(l.trader) === this.traderName) ? 0 : 1;
-      return [...this.lots].sort((a, b) => {
+      const sourceLots = this.demoMode ? this.demoOrderLots : this.lots;
+      const rows = sourceLots.filter(l => {
+        if (this.orderSymbolFilter && l.symbol !== this.orderSymbolFilter) return false;
+        const pyramid = l.limit_type === 'auto_ema9_pyramid'
+          || (l.signal_snapshot && l.signal_snapshot.pyramid_seed);
+        if (this.orderKindFilter === 'pyramid' && !pyramid) return false;
+        if (this.orderKindFilter === 'manual' && pyramid) return false;
+        return true;
+      });
+      return rows.sort((a, b) => {
         const ra = rank[a.state] ?? 2, rb = rank[b.state] ?? 2;
         if (ra !== rb) return ra - rb;
         if (ra < 2) {
@@ -253,6 +311,25 @@ createApp({
       if (this.shadowTypeFilter === 'all') return evs;
       return evs.filter(t => t.signal_type === this.shadowTypeFilter);
     },
+    decisionGroups() {
+      const groups = [];
+      for (const item of ((this.wb && this.wb.management) || [])) {
+        const prev = groups[groups.length - 1];
+        if (item.title === '忽略信号' && prev && prev.title === '忽略信号'
+            && prev.reason === item.reason) {
+          prev.items.push(item);
+          prev.end = item.hm;
+        } else {
+          groups.push({ ...item, items: [item], start: item.hm, end: item.hm });
+        }
+      }
+      return groups;
+    },
+    autoView() {
+      return this.demoMode
+        ? { enabled: true, strategy: 'ema9_pyramid', instances: this.demoAutoInstances, proposals: [] }
+        : this.auto;
+    },
     allowShort() { return this.status.allow_short !== false; },
     // 各服务器跟踪订单聚合（附加服务器名；follower 侧无映射的 master 单后端不会下发，无需补）
     copyOrders() {
@@ -272,6 +349,60 @@ createApp({
       }
       return out.sort((a, b) => (b.ts || 0) - (a.ts || 0));
     },
+    returnsChart() {
+      const empty = { ticks: [], labels: [], accountPaths: [], qqqPaths: [], accountEnd: null, qqqEnd: null };
+      const rows = (this.returnsData && this.returnsData.rows) || [];
+      if (!rows.length) return empty;
+      const values = rows.flatMap(r => [r.account_cumulative, r.qqq_cumulative])
+        .filter(v => typeof v === 'number' && isFinite(v));
+      if (!values.length) return empty;
+      let min = Math.min(0, ...values), max = Math.max(0, ...values);
+      const pad = Math.max((max - min) * 0.12, 0.005);
+      min -= pad;
+      max += pad;
+      const x = i => rows.length === 1 ? 521 : 62 + i * 918 / (rows.length - 1);
+      const y = v => 18 + (max - v) * 244 / (max - min);
+      const paths = key => {
+        const out = [];
+        let d = '';
+        rows.forEach((r, i) => {
+          const v = r[key];
+          if (typeof v !== 'number' || !isFinite(v)) {
+            if (d) out.push(d);
+            d = '';
+            return;
+          }
+          d += `${d ? ' L' : 'M'} ${x(i).toFixed(2)} ${y(v).toFixed(2)}`;
+        });
+        if (d) out.push(d);
+        return out;
+      };
+      const endPoint = key => {
+        for (let i = rows.length - 1; i >= 0; i--) {
+          const v = rows[i][key];
+          if (typeof v === 'number' && isFinite(v)) return { x: x(i), y: y(v) };
+        }
+        return null;
+      };
+      const labelIndexes = new Set();
+      const labelCount = Math.min(6, rows.length);
+      for (let i = 0; i < labelCount; i++) {
+        labelIndexes.add(Math.round(i * (rows.length - 1) / Math.max(1, labelCount - 1)));
+      }
+      return {
+        ticks: Array.from({ length: 5 }, (_, i) => {
+          const value = min + (max - min) * i / 4;
+          return { value, y: y(value) };
+        }),
+        labels: [...labelIndexes].sort((a, b) => a - b).map(i => ({
+          index: i, x: x(i), text: rows[i].date.slice(5),
+        })),
+        accountPaths: paths('account_cumulative'),
+        qqqPaths: paths('qqq_cumulative'),
+        accountEnd: endPoint('account_cumulative'),
+        qqqEnd: endPoint('qqq_cumulative'),
+      };
+    },
   },
 
   // 参数持久化：单笔资金/最大仓位/FVG 时间窗口改动即写 localStorage（各浏览器独立）
@@ -280,6 +411,7 @@ createApp({
     maxPositionPct(v) { try { localStorage.setItem('max_position_pct', String(v)); } catch (e) { /* 忽略 */ } },
     fvgWindow(v) { try { localStorage.setItem('fvg_window', String(v)); } catch (e) { /* 忽略 */ } },
     deckCollapsed(v) { try { localStorage.setItem('deck_collapsed', v ? '1' : '0'); } catch (e) { /* 忽略 */ } },
+    demoMode(v) { try { localStorage.setItem('demo_mode', v ? '1' : '0'); } catch (e) { /* 忽略 */ } },
   },
 
   mounted() {
@@ -328,6 +460,8 @@ createApp({
     if (this._outsideDeckHandler) {
       document.removeEventListener('click', this._outsideDeckHandler, true);
     }
+    document.removeEventListener('pointermove', this._panelResizeMove);
+    document.removeEventListener('pointerup', this._panelResizeEnd);
   },
 
   methods: {
@@ -336,6 +470,58 @@ createApp({
         const r = await fetch('/api/performance');
         if (r.ok) this.performance = await r.json();
       } catch (e) { /* 忽略 */ }
+    },
+
+    startPanelResize(event) {
+      event.preventDefault();
+      const startY = event.clientY;
+      const startHeight = this.bottomPanelHeight;
+      this.panelResizing = true;
+      this._panelResizeMove = e => {
+        const max = Math.max(240, window.innerHeight - 180);
+        this.bottomPanelHeight = Math.round(Math.min(max, Math.max(180, startHeight + startY - e.clientY)));
+      };
+      this._panelResizeEnd = () => {
+        this.panelResizing = false;
+        document.removeEventListener('pointermove', this._panelResizeMove);
+        document.removeEventListener('pointerup', this._panelResizeEnd);
+        try { localStorage.setItem('bottom_panel_height', String(this.bottomPanelHeight)); } catch (e) { /* 忽略 */ }
+      };
+      document.addEventListener('pointermove', this._panelResizeMove);
+      document.addEventListener('pointerup', this._panelResizeEnd);
+    },
+
+    onBottomTabChange(name) {
+      if (name === 'returns' && !this.returnsData && !this.returnsLoading) {
+        this.fetchReturnsComparison();
+      }
+    },
+
+    fmtPct(value, digits = 2) {
+      if (typeof value !== 'number' || !isFinite(value)) return '—';
+      const pct = value * 100;
+      return `${pct > 0 ? '+' : ''}${pct.toFixed(digits)}%`;
+    },
+
+    async fetchReturnsComparison() {
+      if (!Array.isArray(this.returnsRange) || this.returnsRange.length !== 2) {
+        this.returnsError = '请选择起始和结束日期';
+        return;
+      }
+      const requestId = ++this.returnsRequestId;
+      this.returnsLoading = true;
+      this.returnsError = '';
+      try {
+        const [start, end] = this.returnsRange;
+        const r = await fetch(`/api/returns/compare?start=${start}&end=${end}`);
+        const data = await r.json();
+        if (!r.ok) throw new Error(typeof data.detail === 'string' ? data.detail : '收益数据加载失败');
+        if (requestId === this.returnsRequestId) this.returnsData = data;
+      } catch (e) {
+        if (requestId === this.returnsRequestId) this.returnsError = e.message || String(e);
+      } finally {
+        if (requestId === this.returnsRequestId) this.returnsLoading = false;
+      }
     },
 
     async fetchEvents() {
@@ -367,6 +553,31 @@ createApp({
         this.$message.error(e.message || String(e));
       } finally {
         this.newsBusy = false;
+      }
+    },
+
+    hasLiveNews(ticker) {
+      return this.liveNewsTickers.includes((ticker || '').toUpperCase());
+    },
+    async openLiveNews(ticker) {
+      const d = this.liveNewsDialog;
+      const requestId = d.requestId + 1;
+      Object.assign(d, { visible: true, ticker: (ticker || '').toUpperCase(),
+                         loading: true, error: '', requestId });
+      try {
+        const r = await fetch(`/api/news/live?ticker=${encodeURIComponent(ticker)}&minutes=15`);
+        const payload = await r.json();
+        if (!r.ok) throw new Error(payload.detail || '实时新闻加载失败');
+        if (d.requestId !== requestId) return;
+        d.items = payload.items || [];
+        d.updatedAt = payload.updated_at;
+        d.error = payload.error || '';
+      } catch (e) {
+        if (d.requestId !== requestId) return;
+        d.items = [];
+        d.error = e.message || String(e);
+      } finally {
+        if (d.requestId === requestId) d.loading = false;
       }
     },
 
@@ -644,14 +855,89 @@ createApp({
       return am[t] || t;   // 未映射的类型原样显示（防御）
     },
 
+    autoNext(i) {
+      if (i.state === 'DONE') return '本轮已结束，不自动重开';
+      if (!i.entries) return '等EMA9或手动首仓';
+      if (i.entries >= 3) return '仅管理，等整组退出';
+      if (i.entries === 1 && !i.unlocked) return '等首仓达到2R';
+      if (i.entries === 2 && !i.unlocked) return '等整组均价达到2R';
+      if (i.entries === 2 && (i.second_mfe_r || 0) < 1) return '等第二仓达到1R';
+      return `等EMA9第${i.entries + 1}次触碰`;
+    },
+    autoPnl(i) {
+      if (!i.entries || !i.qty || !i.avg_cost) return null;
+      let px = 0;
+      if (this.demoMode) {
+        const rows = this.demoOrderLots.filter(l => (i.lot_ids || []).includes(l.lot_id));
+        px = rows.length ? (rows[0].last_px || rows[0].avg_fill) : 0;
+      } else {
+        px = (((this.market || {})[i.symbol] || {}).bar || {}).close || 0;
+      }
+      if (!px) return null;
+      const sign = i.side === 'long' ? 1 : -1;
+      return +((px - i.avg_cost) * sign * i.qty).toFixed(2);
+    },
+    viewAutoOrders(i) {
+      this.expandedAutoOrders[i.symbol] = !this.expandedAutoOrders[i.symbol];
+    },
+    autoLotRows(inst) {
+      const source = this.demoMode ? this.demoOrderLots : this.lots;
+      const ids = inst.lot_ids || [];
+      return source.filter(l => ids.length ? ids.includes(l.lot_id) : l.symbol === inst.symbol);
+    },
+    async stopAutoInstance(i, closePositions) {
+      if (this.demoMode) {
+        this.$message.info('演示模式不执行真实策略控制');
+        return;
+      }
+      try {
+        if (closePositions) {
+          await this.$confirm(`确认整组平掉 ${i.symbol.split(':').pop()}？`, '单票整组平仓', { type: 'warning' });
+        }
+        const r = await fetch(`/api/auto/instances/${encodeURIComponent(i.symbol)}/stop?close_positions=${closePositions}`,
+                              { method: 'POST', headers: this.tradeHeaders() });
+        const d = await r.json();
+        if (!r.ok) throw new Error(typeof d.detail === 'string' ? d.detail : '操作失败');
+        this.$message.success(closePositions ? '整组平仓已提交' : '已停止加仓');
+      } catch (e) {
+        if (e !== 'cancel') this.$message.error(e.message || String(e));
+      }
+    },
+    async adoptManualLot(row) {
+      if (this.demoMode) {
+        this.$message.info('演示模式不执行真实接管');
+        return;
+      }
+      try {
+        await this.$confirm(`将 ${row.symbol.split(':').pop()} 手动仓作为金字塔首仓接管？`,
+                            '手动仓转全自动', { type: 'warning' });
+        const r = await fetch('/api/auto/adopt', {
+          method: 'POST', headers: this.tradeHeaders(true),
+          body: JSON.stringify({ symbol: row.symbol, lot_id: row.lot_id,
+                                initial_risk_usd: this.riskUsd }),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(typeof d.detail === 'string' ? d.detail : '接管失败');
+        this.$message.success('已转全自动管理');
+        this.bottomTab = 'auto';
+      } catch (e) {
+        if (e !== 'cancel') this.$message.error(e.message || String(e));
+      }
+    },
+
     // 策略：启动 / 停止 / 开仓候选决策
     async startAuto() {
+      if (this.demoMode) {
+        this.$message.info('演示模式不会启动真实策略');
+        return;
+      }
       this.autoBusy = true;
       try {
         const symbols = this.autoSymbols.split(',').map(s => s.trim()).filter(Boolean);
         const r = await fetch('/api/auto/start', {
           method: 'POST', headers: this.tradeHeaders(true),
-          body: JSON.stringify({ strategy: 'trend_pullback', symbols, params: {} }),
+          body: JSON.stringify({ strategy: 'ema9_pyramid', symbols,
+                                params: { initial_risk_usd: this.riskUsd } }),
         });
         this.checkWrite403(r);
         const d = await r.json();
@@ -664,6 +950,10 @@ createApp({
       }
     },
     async stopAuto(closePositions) {
+      if (this.demoMode) {
+        this.$message.info('演示模式不执行真实策略控制');
+        return;
+      }
       try {
         if (closePositions) {
           await this.$confirm('确认停止策略并平掉全部存量持仓？', '停止并全平', { type: 'warning' });
@@ -809,14 +1099,25 @@ createApp({
     // follower 报错行整行淡红
     copyOrderRowClass({ row }) { return row.error ? 'copy-row-err' : ''; },
 
-    // 回测工作台（驱动与实盘同一个 StrategyEngine，仅数据源/网关换成回放+模拟）
+    isDecisionCollapsed(group, index) {
+      return group.items.length > 1 && this.decisionCollapsed[index] !== false;
+    },
+    toggleDecisionGroup(index) {
+      const current = this.decisionCollapsed[index] !== false;
+      this.decisionCollapsed[index] = !current;
+    },
+
+    // 回测工作台（与实盘同一个 PyramidEngine，仅数据源/网关换成回放+模拟）
     async wbLoad() {
       this.wbLoading = true;
       this.wbError = '';
+      this.decisionCollapsed = {};
       try {
         const r = await fetch('/api/bt/load', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ symbol: this.wbSymbol || 'NVDA', day: this.wbDay || '', strategy: 'trend_pullback', params: {} }),
+          body: JSON.stringify({ symbol: this.wbSymbol || 'NVDA', day: this.wbDay || '',
+                                strategy: 'ema9_pyramid',
+                                params: { initial_risk_usd: this.riskUsd, equity: this.equity } }),
         });
         const d = await r.json();
         if (!r.ok) throw new Error(typeof d.detail === 'string' ? d.detail : '加载失败');
@@ -945,6 +1246,7 @@ createApp({
             this.fvgPmFilter = !!msg.status.fvg_premarket_filter;
             // 盘前新闻徽标联动：hot ticker → gist（tooltip）
             this.newsHot = (msg.status.news && msg.status.news.hot) || {};
+            this.liveNewsTickers = (msg.status.news && msg.status.news.live_tickers) || [];
             if (!this.imessageDirty) {
               this.imessageRecipient = msg.status.imessage_recipient || '';
             }
@@ -960,6 +1262,8 @@ createApp({
           this.externalAlerts = msg.external_alerts || [];
           this.slowBreakAlerts = msg.slow_break_alerts || [];
           this.autoCloseNotices = msg.auto_close_notices || [];
+          this.fvgReverseAlerts = msg.fvg_reverse_alerts || [];
+          this.fvgReverseNotices = msg.fvg_reverse_notices || [];
           this.shadow = msg.shadow || { stats: {}, events: [] };
           this.auto = msg.auto || { enabled: false, strategy: '', instances: [], proposals: [] };
           this.fvgMonitor = msg.fvg_monitor || { slots: [], retests: [] };
@@ -974,6 +1278,8 @@ createApp({
           this.checkStopAlert();
           this.checkExternalAlert();
           this.checkAutoCloseNotice();
+          this.checkFvgReverseAlert();
+          this.checkFvgReverseNotice();
           this.checkAutoEntryProposals();
           this.checkFvgEvents();
           this.checkFvgWarnings();
@@ -983,7 +1289,11 @@ createApp({
           if (d != null && d > this.maxDelay) this.maxDelay = d;
         }
       };
-      ws.onclose = () => setTimeout(() => this.connectWS(), 2000);
+      ws.onclose = () => {
+        if (!this.systemClosing && !this.systemClosed) {
+          setTimeout(() => this.connectWS(), 2000);
+        }
+      };
       ws.onerror = () => ws.close();
     },
 
@@ -1093,6 +1403,61 @@ createApp({
       if (dirty) saveNotified('notified_autoclose', this.lastAutoCloseNotice);
     },
 
+    // 反向 FVG 自动平仓播报（镜像自动平仓通知，持久化刷新不重播）
+    checkFvgReverseNotice() {
+      let dirty = false;
+      for (const n of this.fvgReverseNotices) {
+        const ts = n.closed_at;
+        if (this.lastFvgReverseNotice[n.ticker] === ts) continue;
+        this.lastFvgReverseNotice[n.ticker] = ts;
+        dirty = true;
+        const spelled = n.ticker.split('').join(' ');
+        this.speak(`${spelled} 反向 F V G，浮亏 ${Math.abs(n.pnl || 0).toFixed(0)} 美元，已提交自动平仓`);
+        this.$notify({
+          title: '反向 FVG 自动平仓',
+          message: `${n.ticker} ${n.side === 'long' ? '多头' : '空头'} ${n.qty} 股浮亏（${n.pnl}），反向缺口确认，平仓价 ${n.price}，等待实际成交`,
+          type: 'warning', duration: 30000, position: 'bottom-right',
+        });
+      }
+      if (dirty) saveNotified('notified_fvg_reverse', this.lastFvgReverseNotice);
+    },
+
+    // 反向 FVG 守卫提醒：浮盈已保本 → 语音 + 弹框确认平仓锁利；
+    // 平仓失败 → 语音警告 + 弹框人工平仓（取消后下次快照继续提醒）
+    checkFvgReverseAlert() {
+      for (const a of this.fvgReverseAlerts) {
+        const key = `${a.lot_id}:${a.alerted_at}`;
+        if (this.lastFvgReverseAlert[key]) continue;
+        this.lastFvgReverseAlert[key] = true;
+        const spelled = (a.ticker || '').split('').join(' ');
+        if (a.kind === 'profit_lock') {
+          this.speak(`${spelled} 出现反向 F V G，已保本，建议平仓锁定利润`);
+          this.$confirm(
+            `${a.ticker} ${a.side === 'long' ? '多头' : '空头'} ${a.qty} 股浮盈 ${a.pnl} 美元，出现反向 FVG（已保本），确认平仓锁定利润？`,
+            '反向 FVG：锁定利润', {
+              type: 'warning',
+              confirmButtonText: '平仓锁利',
+              cancelButtonText: '暂不',
+              closeOnClickModal: false,
+            }
+          ).then(() => this.closePosition(a.symbol))
+            .catch(() => { /* 暂不：提醒记录保留，人工决定 */ });
+        } else {
+          this.speak(`警告 ${spelled} 反向 F V G，自动平仓失败，请人工平仓`);
+          this.$confirm(
+            `${a.ticker} ${a.side === 'long' ? '多头' : '空头'} ${a.qty} 股浮亏 ${a.pnl} 美元，反向 FVG 确认但自动平仓失败，立即人工平仓？`,
+            '反向 FVG：平仓失败', {
+              type: 'error',
+              confirmButtonText: '平仓',
+              cancelButtonText: '暂不',
+              closeOnClickModal: false,
+            }
+          ).then(() => this.closePosition(a.symbol))
+            .catch(() => { /* 暂不：后端下一根确认 bar 自动重试 */ });
+        }
+      }
+    },
+
     // 开仓候选：按 proposal_id 去重，同批候选只播报一次汇总提醒
     checkAutoEntryProposals() {
       const proposals = this.auto.proposals || [];
@@ -1108,8 +1473,11 @@ createApp({
       });
     },
 
-    // FVG 事件通报：未见过的 id → 常驻通知；仅 ratio ≥ 1×ATR 的进语音，小缺口只上通知列表
+    // FVG 确认事件保留在监控 Tab 和语音通报，不重复进入右侧信号栏
     checkFvgEvents() {
+      if (this.fvgFeed.some(c => !c.warn && c.kind !== 'breakout')) {
+        this.fvgFeed = this.fvgFeed.filter(c => c.warn || c.kind === 'breakout');
+      }
       const slots = (this.fvgMonitor && this.fvgMonitor.slots) || [];
       const all = [];
       for (const s of slots) all.push(...(s.long || []), ...(s.short || []));
@@ -1124,12 +1492,8 @@ createApp({
         return;
       }
       fresh.sort((a, b) => (b.ratio || 0) - (a.ratio || 0));
-      // ATR 倍数过滤：低于阈值的事件不进信号栏/语音（ratio 缺失无法判断大小，仍进信号栏但不进语音）
       const minRatio = this.fvgNotifyMinRatio;
       const notifiable = fresh.filter(ev => ev.ratio == null || ev.ratio >= minRatio);
-      // 进右侧信号栏（替代 ElNotification 平铺弹窗：开盘洪峰时可滚动、
-      // ATR 降序、逐条删除）
-      this.pushFvgFeed(notifiable, false);
       const voiced = notifiable.filter(ev => ev.ratio != null && ev.ratio >= minRatio);
       if (voiced.length) {
         const parts = voiced.map(ev =>
@@ -1160,8 +1524,7 @@ createApp({
       }
     },
 
-    // FVG 信号栏（右侧常驻）：确认事件与预警统一推入，ATR 倍数降序展示，
-    // 用户从上往下处理，叉号逐条删除（已删除的由 fvgSeenIds 保证不再回来）
+    // FVG 信号栏（右侧常驻）：仅推入预警，ATR 倍数降序展示；确认事件在监控 Tab 查看
     pushFvgFeed(evs, warn) {
       for (const ev of evs) {
         this.fvgFeed.push({
@@ -1504,7 +1867,8 @@ createApp({
       this.tvShow(r.symbol);
     },
 
-    // CDP 联动：POST /api/tv/show 切 TV 第一个 pane（幂等快速；TV 未开/失败静默）
+    // CDP 联动看盘：POST /api/tv/view。master → 只切 TV pane 0（无截图）；
+    // 客户端 → 分配专属 pane 切标的 + 截图回传，弹图表面板（10s 自动刷新）
     async tvShow(symbol) {
       // 冷启动（浏览器未开）要等 Chrome 启动 + TV 页加载，最长约 1 分钟：
       // 超过 1s 未返回就弹进度提示（不自动消失），拿到结果后关闭
@@ -1519,23 +1883,60 @@ createApp({
         }
       }, 1000);
       try {
-        const r = await fetch('/api/tv/show', {
-          method: 'POST', headers: this.tradeHeaders(true),
-          body: JSON.stringify({ symbol }),
-        });
-        const d = await r.json().catch(() => ({}));
+        const d = await this.tvViewRequest(symbol);
         if (waiting) waiting.close();
-        // 失败时把原因报出来（比如浏览器未以可控模式运行），否则用户以为没反应
-        if (!d.ok && d.reason && this.$notify) {
+        if (d && d.ok && !d.master && d.image) {
+          this.openTvView(symbol, d);          // 客户端：弹图表面板
+        } else if (d && !d.ok && d.reason && this.$notify) {
+          // 失败时把原因报出来（画面位已满/浏览器未可控等），否则用户以为没反应
           this.$notify({ title: 'TV 图表未切换', message: d.reason,
                          type: 'warning', duration: 5000 });
         }
+        // master：只切 pane 0，无截图不弹窗（原有行为）
       } catch (e) {
         if (waiting) waiting.close();
         /* 静默降级：不影响选股/下单 */
       } finally {
         clearTimeout(timer);
       }
+    },
+    async tvViewRequest(symbol) {
+      const r = await fetch('/api/tv/view', {
+        method: 'POST', headers: this.tradeHeaders(true),
+        body: JSON.stringify({ symbol }),
+      });
+      return await r.json().catch(() => ({}));
+    },
+    openTvView(symbol, d) {
+      this.tvView.visible = true;
+      this.tvView.symbol = symbol;
+      this.tvView.image = 'data:image/jpeg;base64,' + d.image;
+      this.tvView.pane = d.pane;
+      this.tvView.error = '';
+      this.stopTvViewRefresh();
+      this.tvViewTimer = setInterval(() => this.refreshTvView(), 10000);
+    },
+    async refreshTvView() {
+      if (!this.tvView.visible || this.tvView.loading) return;
+      this.tvView.loading = true;
+      try {
+        const d = await this.tvViewRequest(this.tvView.symbol);
+        if (d && d.ok && d.image) {
+          this.tvView.image = 'data:image/jpeg;base64,' + d.image;
+          this.tvView.error = '';
+        } else if (d && !d.ok) {
+          this.tvView.error = d.reason || '刷新失败';
+        }
+      } catch (e) { /* 网络抖动静默，下拍再试 */ } finally {
+        this.tvView.loading = false;
+      }
+    },
+    stopTvViewRefresh() {
+      if (this.tvViewTimer) { clearInterval(this.tvViewTimer); this.tvViewTimer = null; }
+    },
+    closeTvView() {
+      this.tvView.visible = false;
+      this.stopTvViewRefresh();
     },
 
     // 智能止损距离（与服务端 _smart_stop_dist 同口径）：优先读 smart_stop 指标
@@ -1727,6 +2128,32 @@ createApp({
         this.$message.error(e.message || String(e));
       } finally {
         this.placing = false;
+      }
+    },
+
+    async confirmShutdown() {
+      if (this.systemClosing || this.systemClosed) return;
+      try {
+        await this.$confirm(
+          '将停止控制台和全部跟单进程，并关闭 TWS。关闭后不会再控制 IBKR 交易；券商已有订单与止损不会自动撤销。',
+          '确认关闭系统',
+          { type: 'warning', confirmButtonText: '关闭系统', cancelButtonText: '取消',
+            confirmButtonClass: 'el-button--danger' });
+      } catch { return; }
+      this.systemClosing = true;
+      try {
+        const r = await fetch('/api/system/shutdown', { method: 'POST', headers: this.tradeHeaders() });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d.detail || '关闭系统失败');
+        this.systemClosed = true;
+        this.systemCloseError = (d.errors || []).join('；');
+        if (d.tws_closed === false && !this.systemCloseError) {
+          this.systemCloseError = 'TWS 未能自动关闭，请检查进程。';
+        }
+        if (this.ws) this.ws.close();
+      } catch (e) {
+        this.systemClosing = false;
+        this.$message.error(e.message || String(e));
       }
     },
 

@@ -4,9 +4,9 @@ trend_pullback：trend_state 回踩策略
 =====================================
 
 进场（tick 触发，指标用上一根已收盘 5M 的确认值 ts_c）：
-- trend_state == 1（单边多头）：实时成交价触及 ema_fast / channel_edge /
+- direction == 1（ST 多头）：实时成交价触及 ema_fast / ema_9 / channel_edge /
   fvg_last_top（price <= 线值）→ 做多候选；多线同触取更低价（更优入场）
-- trend_state == -1（单边空头）：price >= 线值（ema_fast / channel_edge /
+- direction == -1（ST 空头）：price >= 线值（ema_fast / ema_9 / channel_edge /
   fvg_last_bottom）→ 做空候选；取更高价
 - FVG 线 = 最近同向 FVG 的区沿（需求区上沿 / 供应区下沿），可用
   require_same_dir_fvg / min_fvg_cum 追加方向与累积计数过滤（缺失即拦截）
@@ -53,7 +53,8 @@ class TrendPullbackStrategy(AutoStrategy):
         side = "long" if direction == 1 else "short"
         # tick 价触及线值（多: price <= 线 / 空: price >= 线），多线同触取更优价
         touched = []
-        for key, name in (("ema_fast", "ema"), ("channel_edge", "channel")):
+        for key, name in (("ema_fast", "ema"), ("ema_9", "ema9"),
+                          ("channel_edge", "channel")):
             line = ts_c.get(key)
             if not line or line <= 0:
                 continue

@@ -14,10 +14,17 @@
     "comment": "5M 周期第二订阅指标（tv_cloud_daemon.js / dump_trend_state.js 与 trend_state 同 session 挂载）。⚠️ WS 订阅键名 = plot 标题剥离非 ASCII + 重名加后缀（实测），改 plot 标题键名会静默变化。映射：STFVG←'ST同向FVG累积计数'→fvg_cum_count / FVG←'最后FVG上沿'→fvg_last_top / FVG_2←'最后FVG下沿'→fvg_last_bottom / KFVG110←'当前K线FVG信号(1涨/-1跌/0无)'→fvg_event；fvg_last_dir 由 daemon 扫描历史中最后非零 fvg_event 推导。保存版另有 plot_4/5（_FVG_/_FVG__2，疑似回踩信号），忽略不用。指标输入用默认值（过滤器 Off / ST 3.0×10），与图表所见即所得"
   },
   {
+    "key": "ema9_autotrade",
+    "id": "USER;a17a52ae5b6642e0a3ddbba23edc9ff3",
+    "timeframe": "5",
+    "name": "EMA9-ST-ATR（金字塔自动策略）",
+    "comment": "v7：Direction/ATR/Touch_EMA9/EMA_9/Long_Stop/Short_Stop；实时 e9 用于触线建仓，e9_c 用于确认管理"
+  },
+  {
     "key": "attack_zone",
     "id": "USER;8ab4f534e5874b47b24a5ce5c49acace",
     "timeframe": "5",
-    "name": "5M 进攻区域- 方向过滤器,双区间（第三订阅指标）",
-    "comment": "5M 周期第三订阅指标（tv_cloud_daemon.js 与 ts/fvg/ss 同 session 挂载），plot 标题全 ASCII 无剥键问题（实测 plots: plot_0=Bar_Color / plot_1=premarketHigh / plot_2=premarketLow）。映射：Bar_Color(0/1)→bar_color / premarketHigh→pmh / premarketLow→pml。⚠️ na 值收到 1e100，daemon 的 finite() 统一转 null。premarketHigh/Low = 当天盘前区间（TV 侧自算 04:00–09:25 ET 口径，每根 bar 都 plot 同一组值），实测 BATS:META 2026-10-23 与 research.db 盘前区间精确一致——盘前突破信号的权威区间来源（console _breakout_loop 注入 BreakoutTracker，指标输入用默认值）"
+    "name": "5M 进攻区域-方向过滤器，三区间（第四订阅指标，可选）",
+    "comment": "5M 周期第四订阅指标（tv_cloud_daemon.js 与 ts/fvg/ss 同 session 挂载，加载失败时核心行情继续）。v16 实测 styles：plot_0=Bar_Color / plot_1=盘前高点 / plot_2=盘前低点 / plot_3=开盘前三根K线高点 / plot_4=开盘前三根K线低点；WS period 键名为 Bar_Color/plot_1/_2/K/K_2，daemon 同时兼容 premarketHigh/premarketLow。映射：plot_1/premarketHigh→pmh / _2/premarketLow→pml。⚠️ na 值收到 1e100，finite() 统一转 null。盘前区间口径 04:00–09:25 ET；attack 无值只告警，不重建核心 chart"
   }
 ]

@@ -2,8 +2,8 @@
  * trend_state 历史数据一次性导出 (dump_trend_state.js)
  * ====================================================
  *
- * 拉取指定标的的 5M K线 + trend_state 指标全量 plot 值（每根 bar 一套），
- * 供历史回测（backtest_trend.py）逐 bar 喂入。
+ * 拉取指定标的的 5M K线 + trend_state + ema9_autotrade 全量 plot 值，
+ * 供历史回测逐 bar 喂入；EMA9 金字塔使用每行 e9。
  *
  * 用法：
  *   node dump_trend_state.js --symbols NASDAQ:NVDA --range 500 --out /tmp/nvda.json
@@ -11,7 +11,7 @@
  * 输出（JSON 文件或 stdout）：
  *   {"NASDAQ:NVDA": [
  *     {"time":..., "open":..., "high":..., "low":..., "close":..., "volume":...,
- *      "ts": {"trend_state":1, "direction":1, "ema_fast":..., "ema_slow":...,
+ *      "ts": {"trend_state":1, "direction":1, "ema_fast":..., "ema_9":..., "ema_slow":...,
  *             "supertrend":..., "channel_edge":..., "atr":...,
  *             "st_duration_bars":..., "st_push_count":...},
  *      "fvg": {"fvg_cum_count":..., "fvg_last_top":..., "fvg_last_bottom":...,
@@ -28,10 +28,13 @@
 const fs = require('fs');
 const path = require('path');
 const TradingView = require('@mathieuc/tradingview');
+const { emaFromPeriods } = require('./ema.js');
+const { loadIndicatorWithText } = require('./pine_text.js');
 
 const TREND_STATE_ID = 'USER;e577100fe79942b4830783d1ceaad535';
 const FVG_ID = 'USER;5ec7d04179b3429ca9286db452352d85';
 const SMART_STOP_ID = 'USER;ca26e3ab587841e2adb38cfbfd0bec41';
+const EMA9_AUTO_ID = 'USER;a17a52ae5b6642e0a3ddbba23edc9ff3';
 
 function parseArgs(argv) {
   const args = {
@@ -113,12 +116,10 @@ async function main() {
     process.exit(1);
   }
   const creds = JSON.parse(fs.readFileSync(args.creds, 'utf8'));
-  const indic = await TradingView.getIndicator(
-    TREND_STATE_ID, 'last', creds.sessionid, creds.sessionid_sign);
-  const fvgIndic = await TradingView.getIndicator(
-    FVG_ID, 'last', creds.sessionid, creds.sessionid_sign);
-  const ssIndic = await TradingView.getIndicator(
-    SMART_STOP_ID, 'last', creds.sessionid, creds.sessionid_sign);
+  const indic = await loadIndicatorWithText(TradingView, TREND_STATE_ID, creds);
+  const fvgIndic = await loadIndicatorWithText(TradingView, FVG_ID, creds);
+  const ssIndic = await loadIndicatorWithText(TradingView, SMART_STOP_ID, creds);
+  const e9Indic = await loadIndicatorWithText(TradingView, EMA9_AUTO_ID, creds);
   const client = new TradingView.Client({
     token: creds.sessionid,
     signature: creds.sessionid_sign,
@@ -137,6 +138,7 @@ async function main() {
     const study = new chart.Study(indic);
     const fvgStudy = new chart.Study(fvgIndic);
     const ssStudy = new chart.Study(ssIndic);
+    const e9Study = new chart.Study(e9Indic);
     let done = false;
     const finish = () => {
       if (done) return;
@@ -144,23 +146,32 @@ async function main() {
       const tss = study.periods;
       const fss = fvgStudy.periods;
       const sss = ssStudy.periods;
+      const e9s = e9Study.periods;
       if (!bars || !bars.length || !tss || !tss.length || !fss || !fss.length
-          || !sss || !sss.length) return;
+          || !sss || !sss.length || !e9s || !e9s.length) return;
       done = true;
       // periods 均为倒序（[0] 最新），按索引对齐后转正序
       const rows = [];
-      const n = Math.min(bars.length, tss.length, fss.length, sss.length);
+      const n = Math.min(bars.length, tss.length, fss.length, sss.length, e9s.length);
       for (let i = n - 1; i >= 0; i--) {
         const b = bars[i];
         rows.push({
           time: b.time, open: b.open, high: b.max,
           low: b.min, close: b.close, volume: b.volume,
-          ts: Object.assign(tsFromPeriod(tss[i]), ssFromPeriod(sss[i])),
+          ts: Object.assign(tsFromPeriod(tss[i]), ssFromPeriod(sss[i]),
+                            { ema_9: emaFromPeriods(bars, i, 9) }),
           fvg: fvgFromPeriod(fss[i], fss, i),
+          e9: {
+            time: e9s[i].$time, direction: finite(e9s[i].Direction),
+            atr: finite(e9s[i].ATR), touch: finite(e9s[i].Touch_EMA9),
+            ema_9: finite(e9s[i].EMA_9),
+            long_stop: finite(e9s[i].Long_Stop),
+            short_stop: finite(e9s[i].Short_Stop),
+          },
         });
       }
       result[symbol] = rows;
-      console.error(`[${symbol}] 导出 ${rows.length} 根 5M bar（含 trend_state）`);
+      console.error(`[${symbol}] 导出 ${rows.length} 根 5M bar（含 trend_state + ema9_autotrade）`);
       if (--pending === 0) {
         const payload = JSON.stringify(result);
         // >64KB 时 process.exit 会截断未 flush 的 stdout，必须在回调里退出
@@ -175,6 +186,7 @@ async function main() {
     study.onUpdate(() => setTimeout(finish, 500));   // 等 chart/study 都就绪
     fvgStudy.onUpdate(() => setTimeout(finish, 500));
     ssStudy.onUpdate(() => setTimeout(finish, 500));
+    e9Study.onUpdate(() => setTimeout(finish, 500));
     chart.onUpdate(() => setTimeout(finish, 500));
     chart.onError((...e) => {
       console.error(`[${symbol}] err:`, JSON.stringify(e).slice(0, 200));

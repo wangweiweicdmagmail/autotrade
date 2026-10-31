@@ -2,7 +2,7 @@
 """健康巡检 + 裸仓巡检回归（console/app.py）。
 
 守的口径：
-- 数据陈旧：仅 ET 工作日 09:30–16:00 内 latest_bar_time 超过 600s 未前进
+- 数据陈旧：仅 ET 工作日 09:30–16:00 内传输中断、内容停止变化或 bar 超龄
   才 warning；恢复自动解除并通知；非交易时段/周末静默（活跃中的也静默
   摘除，绝不误报）。
 - TWS 断线：connected 跳变 False → critical；恢复 → 解除通知；首轮基线不报。
@@ -116,18 +116,25 @@ def test_tws_disconnect_and_recovery(app, monkeypatch):
 # ----------------------------------------------------------------------
 
 def test_data_stale_trading_hours(app, monkeypatch):
-    """交易时段内 >600s 未更新 → warning；恢复 → 解除通知。"""
+    """交易时段内传输/内容/bar 任一陈旧 → warning；恢复 → 解除通知。"""
     async def go():
         import time as _t
+        now = _t.time()
         monkeypatch.setattr(app, "gateway", FakeGateway(connected=True))
-        monkeypatch.setattr(app, "_is_trading_hours", lambda: True)
-        monkeypatch.setattr(app.collector, "latest_bar_time", _t.time() - 700)
+        monkeypatch.setattr(app.collector, "_is_trading_hours", lambda: True)
+        monkeypatch.setattr(app.collector, "_running", True)
+        monkeypatch.setattr(app.collector, "latest_bar_time", now - 700)
+        monkeypatch.setattr(app.collector, "_last_update", now - 700)
+        monkeypatch.setattr(app.collector, "_last_content_update", now - 700)
         await app._health_check_once(True)
         assert app.notifier.is_active("data_stale")
         a = next(x for x in app.notifier.active_alerts()
                  if x["key"] == "data_stale")
         assert a["level"] == "warning"
-        monkeypatch.setattr(app.collector, "latest_bar_time", _t.time())
+        now = _t.time()
+        monkeypatch.setattr(app.collector, "latest_bar_time", now)
+        monkeypatch.setattr(app.collector, "_last_update", now)
+        monkeypatch.setattr(app.collector, "_last_content_update", now)
         await app._health_check_once(True)
         assert not app.notifier.is_active("data_stale")
     run(go())
@@ -139,7 +146,7 @@ def test_data_stale_silent_off_hours_and_weekend(app, monkeypatch):
         import time as _t
         monkeypatch.setattr(app, "gateway", FakeGateway(connected=True))
         monkeypatch.setattr(app.collector, "latest_bar_time", _t.time() - 7000)
-        monkeypatch.setattr(app, "_is_trading_hours", lambda: False)  # 周末/夜间
+        monkeypatch.setattr(app.collector, "_is_trading_hours", lambda: False)
         await app._health_check_once(True)
         assert not app.notifier.is_active("data_stale")
         # 活跃中的告警进入非交易时段 → 静默摘除（无恢复通知）

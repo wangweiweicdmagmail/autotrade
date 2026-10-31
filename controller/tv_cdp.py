@@ -298,12 +298,18 @@ class TradingViewCDPController:
         """单独触发一次全格视图居中。"""
         return json.loads(await self.evaluate(_CENTER_JS))
 
-    async def screenshot(self, path: str, quality: int = 70) -> str:
-        """Page.captureScreenshot 截屏留痕（监控闭环用）。"""
+    async def screenshot(self, path: Optional[str] = None, quality: int = 70,
+                         clip: Optional[dict] = None) -> bytes:
+        """Page.captureScreenshot 截屏。clip={x,y,width,height,scale?}
+        （CSS 像素，页面坐标）只截指定区域；path 提供时落盘。
+        返回 JPEG bytes。"""
         import base64
-        result = await self._send_cdp("Page.captureScreenshot", {
-            "format": "jpeg", "quality": quality,
-        })
-        with open(path, "wb") as f:
-            f.write(base64.b64decode(result["data"]))
-        return path
+        params: dict = {"format": "jpeg", "quality": quality}
+        if clip:
+            params["clip"] = {"scale": 1, **clip}
+        result = await self._send_cdp("Page.captureScreenshot", params)
+        data = base64.b64decode(result["data"])
+        if path:
+            with open(path, "wb") as f:
+                f.write(data)
+        return data

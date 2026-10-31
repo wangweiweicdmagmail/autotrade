@@ -26,34 +26,36 @@
 """
 
 import asyncio
+import base64
 import collections
 import json
 import logging
 import os
 import re
+import signal
 import sys
 import time
 import uuid
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import Dict, List, Optional, Set
 
 # 允许从项目根目录 import config / execution
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import config
-from engine.auto_engine import LiveBroker, StrategyEngine
+from engine.auto_engine import LiveBroker
+from engine.pyramid_engine import PyramidEngine
 from engine.breakout_tracker import BreakoutTracker
 from engine import news_digest
 from engine.notifier import Notifier
 from engine.realtime_collector import RealtimeCollector
 from engine import shadow_report
 from engine.shadow_tracker import ShadowTracker
-from engine.strategies import build_strategy
 from execution.ibkr import IBKRGateway
 from execution.order_lot import OrderManager
 from execution.risk import RiskConfig, RiskGate
@@ -635,6 +637,7 @@ _midpoint_escalate_attempted: set = set()  # (lot_id, bar_time) 突破升级每 
 
 # TV 实时订阅采集器（5M K线 + trend_state 单指标）
 collector: RealtimeCollector = RealtimeCollector(config.WATCHLIST)
+order_mgr.market_health = collector.data_health
 
 # 净值/日盈亏缓存（避免每秒查 IBKR）
 _equity_cache = {"equity": None, "daily_pnl": None, "ts": 0.0}
@@ -657,17 +660,23 @@ _auto_breakeven_task: Optional[asyncio.Task] = None
 # 趋势反向自动平仓记录（前端语音/通知用，ticker -> 最近一次自动平仓）
 _auto_close_notices: dict = {}
 
+# 持仓反向 FVG 守卫（5M 收盘确认口径）：反向缺口确认时，浮亏 lot 立即市价
+# 平仓，浮盈 lot 立即保本 + 语音/界面提醒平仓锁利。只管本工具 ACTIVE lot。
+_fvg_reverse_alerts: dict = {}   # lot_id -> 提醒（profit_lock / close_failed）
+_fvg_reverse_notices: dict = {}  # ticker -> 最近一次反向 FVG 自动平仓（前端语音用）
+_fvg_reverse_acted: dict = {}    # f"{lot_id}:{int(bar_time)}" -> ts（每 lot 每 bar 一次）
+_fvg_reverse_task: Optional[asyncio.Task] = None
+
 # 影子回测跟踪器（回踩事件 → 逐 bar 回测推演 → 信号有效性统计）
 shadow_tracker: ShadowTracker = ShadowTracker()
 _shadow_task: Optional[asyncio.Task] = None
 _shadow_proposal_recorded: set = set()   # 已建档的策略候选 proposal_id（当天去重）
 
-# 策略引擎（开仓候选人工确认 + bar 收盘自动管理）
-auto_engine: StrategyEngine = StrategyEngine(
-    LiveBroker(order_mgr), risk_gate=risk_gate, gateway=gateway,
+# EMA9 金字塔全自动策略（2R 解锁 + 3-2-1 风险预算 + 整组仓位管理）
+auto_engine: PyramidEngine = PyramidEngine(
+    LiveBroker(order_mgr),
     emit=lambda t, **d: record_event(f"auto_{t}" if not t.startswith("auto_") else t, **d),
-    max_instances=config.AUTO_MAX_INSTANCES,
-    require_entry_confirmation=True)
+    max_instances=config.AUTO_MAX_INSTANCES)
 _auto_enabled: bool = False        # /api/auto/start 开启，stop 关闭
 _auto_task: Optional[asyncio.Task] = None
 _auto_last_bar: dict = {}          # symbol -> 已处理的 bar_c.time
@@ -698,8 +707,15 @@ _breakout_injected: dict = {}    # symbol -> 已注入盘前区间的 ET 交易�
 _breakout_task: Optional[asyncio.Task] = None
 _naked_position_task: Optional[asyncio.Task] = None   # 裸仓巡检（STP 缺失自动补挂）
 _health_watch_task: Optional[asyncio.Task] = None     # 健康巡检（TWS 断线/数据陈旧）
+_tv_check_task: Optional[asyncio.Task] = None         # 启动 TV 数据源检查（一次性）
 _report_task: Optional[asyncio.Task] = None           # 每日复盘（交易日 16:20 ET）
 _precheck_task: Optional[asyncio.Task] = None         # 盘前检查单（交易日 09:25 ET）
+_startup_task: Optional[asyncio.Task] = None          # 启动加载页 + 浏览器/全链路就绪
+_startup_state: dict = {
+    "started_at": time.time(), "core_ready": False, "browser_ready": False,
+    "browser_error": "", "ready": False,
+}
+_system_stopping = False
 
 
 # ---------------------------------------------------------------------------
@@ -1149,7 +1165,7 @@ async def _position_scan_loop() -> None:
     while True:
         await asyncio.sleep(60.0)
         try:
-            if not _is_trading_hours():
+            if not _is_trading_hours() or collector.data_health()["stale"]:
                 continue
             positions = await gateway.positions()   # {ticker: qty}；None=快照不可用
             if positions is None:
@@ -1344,14 +1360,55 @@ async def _naked_position_loop() -> None:
             logger.exception("裸仓巡检异常: %s", e)
 
 
+async def _tv_startup_check() -> None:
+    """启动首要任务：TV 数据源就绪检查，正常/异常都给出提示确认（一次性）。
+
+    就绪 = 快照标的数达到股票池且全部 ts_c 有 trend_state；
+    异常 = study 通道系统性故障（collector.study_health().systemic，
+    覆盖 2026-10-27 的 pine 协议故障模式）或 240s 超时未就绪。
+    正常 → info（前端横幅 + 事件，不打扰手机）；异常 → critical（含 iMessage）。
+    """
+    def _ready_counts() -> tuple:
+        snap = collector.latest() or {}
+        total = len(snap)
+        ready = sum(1 for v in snap.values()
+                    if isinstance(v.get("ts_c"), dict)
+                    and v["ts_c"].get("trend_state") is not None)
+        return total, ready
+
+    t0 = time.time()
+    deadline = t0 + 240.0    # 分批订阅 ~30-90s + 指标 warmup，宽限到 4 分钟
+    expected = len(config.WATCHLIST)
+    while time.time() < deadline:
+        health = collector.study_health()
+        if health.get("systemic"):
+            await notifier.notify(
+                "tv_startup", "critical", "TV 数据源异常",
+                f"启动检查发现 study 通道系统性故障（60s 内 study 报错 "
+                f"{health['study_errors_60s']} 条，ts_c 就绪 "
+                f"{health['ts_ready']}/{health['ts_total']}），请检查 daemon 日志")
+            return
+        total, ready = _ready_counts()
+        if total >= expected and ready >= total:
+            await notifier.notify(
+                "tv_startup", "info", "TV 数据源正常",
+                f"{ready}/{expected} 标的数据就绪，启动耗时 {time.time() - t0:.0f}s")
+            return
+        await asyncio.sleep(5.0)
+    total, ready = _ready_counts()
+    await notifier.notify(
+        "tv_startup", "critical", "TV 数据源异常",
+        f"启动 240s 后数据仍未就绪：ts_c {ready}/{total}（股票池 {expected}，"
+        f"daemon 运行中={collector.running}），请检查 daemon/网络")
+
+
 async def _health_check_once(was_connected: Optional[bool]) -> bool:
     """健康检查单拍（TWS 断线 + 数据陈旧），返回本轮 connected 状态。
 
     - TWS 断线：connected 跳变 False → critical「TWS 已断线，请人工重启
       7496」；恢复 → 解除通知。首轮只建基线不告警（启动瞬间未连接不报）。
-    - 数据陈旧：交易时段（ET 工作日 09:30–16:00）且 latest_bar_time 超过
-      600s 未前进 → warning；恢复自动解除并通知；非交易时段/周末静默
-      （挂着的话静默摘除，不发恢复通知）。"""
+    - 数据陈旧：交易时段内传输中断、内容停止变化或 bar 超龄 → warning；
+      恢复自动解除并通知；非交易时段/周末静默（挂着的话静默摘除，不发恢复通知）。"""
     connected = bool(gateway._connected)
     if was_connected is not None:
         if was_connected and not connected:
@@ -1359,17 +1416,29 @@ async def _health_check_once(was_connected: Optional[bool]) -> bool:
                                   "TWS 已断线，请人工重启 7496")
         elif not was_connected and connected:
             await notifier.recover("tws_down", "TWS 已恢复连接")
-    if _is_trading_hours():
-        bt = collector.latest_bar_time or 0
-        age = (time.time() - bt) if bt else float("inf")
-        if age > 600:
+    health = collector.data_health()
+    if health["trading_hours"]:
+        if health["stale"]:
+            content_age = health["content_age"]
+            age_txt = "∞" if content_age is None else f"{int(content_age)}s"
             await notifier.notify(
                 "data_stale", "warning", "行情数据陈旧",
-                f"TV 数据 {int(age)}s 未更新（>600s），请检查 daemon/网络")
+                f"TV 内容 {age_txt} 未变化（{health['reason']}），正在自动重建订阅")
         else:
             await notifier.recover("data_stale", "行情数据已恢复更新")
     else:
         notifier.clear("data_stale")   # 非交易时段/周末静默
+    # study（指标）通道：K线正常但指标全灭时 data_stale 检测不到
+    # （2026-10-27 协议故障实锤）。systemic 判定与宽限在 collector 内。
+    sh = collector.study_health()
+    if sh["systemic"]:
+        await notifier.notify(
+            "tv_study_dead", "critical", "TV 指标数据中断",
+            f"study_error 60s内 {sh['study_errors_60s']} 条，ts_c 就绪 "
+            f"{sh['ts_ready']}/{sh['ts_total']}（持续 {int(sh['ts_dead_for'])}s）。"
+            "运行 python3 service/tv_diag.py 分层定位")
+    else:
+        await notifier.recover("tv_study_dead", "指标数据已恢复")
     return connected
 
 
@@ -1704,7 +1773,8 @@ async def _auto_breakeven_loop() -> None:
     while True:
         await asyncio.sleep(1.0)
         try:
-            if not _is_trading_hours() or not gateway._connected:
+            if (not _is_trading_hours() or not gateway._connected
+                    or collector.data_health()["stale"]):
                 continue
             scan_tick += 1
             active = order_mgr.list_lots(active_only=True)
@@ -1756,6 +1826,129 @@ async def _auto_breakeven_loop() -> None:
             raise
         except Exception as e:
             logger.exception("自动保本循环异常: %s", e)
+
+
+def _fvg_reverse_action(side: str, fvg_event: int, avg_fill: Optional[float],
+                        price: Optional[float]) -> Optional[str]:
+    """反向 FVG 收盘确认后的动作判定（纯函数）：
+    同向缺口/数据缺失 → None；浮亏 → "close"；浮盈（含持平）→ "protect"。"""
+    if side == "long" and fvg_event != -1:
+        return None
+    if side == "short" and fvg_event != 1:
+        return None
+    if not avg_fill or not price or price <= 0:
+        return None
+    floating = (price - avg_fill) if side == "long" else (avg_fill - price)
+    return "close" if floating < 0 else "protect"
+
+
+async def _fvg_reverse_guard_loop() -> None:
+    """持仓反向 FVG 守卫（每秒，5M 收盘确认口径）：本工具 ACTIVE lot 的标的出现
+    反向缺口确认（fvg_c.time == bar_c.time 对齐）时——浮亏立即市价平仓，浮盈
+    立即保本 + 前端语音/弹框提醒平仓锁利。每 lot 每根确认 bar 只动作一次。"""
+    while True:
+        await asyncio.sleep(1.0)
+        try:
+            if not (config.FVG_REVERSE_GUARD_ENABLED and _is_trading_hours()
+                    and gateway._connected and not collector.data_health()["stale"]):
+                continue
+            market = collector.latest() or {}
+            active = [l for l in order_mgr.list_lots(active_only=True)
+                      if l.get("state") == "ACTIVE"]
+            for lot in active:
+                lot_id = lot.get("lot_id")
+                symbol = lot.get("symbol")
+                side = lot.get("side")
+                data = market.get(symbol) or {}
+                bar_c = data.get("bar_c") or {}
+                fvg_c = data.get("fvg_c") or {}
+                bt = bar_c.get("time") or 0
+                event = fvg_c.get("fvg_event")
+                if not bt or event not in (1, -1) or fvg_c.get("time") != bt:
+                    continue   # 无确认缺口，或 fvg_c 未追上 bar_c（等下一拍）
+                act_key = f"{lot_id}:{int(bt)}"
+                if act_key in _fvg_reverse_acted:
+                    continue
+                price = _tv_last_price(symbol) or bar_c.get("close")
+                avg_fill = lot.get("avg_fill") or lot.get("entry_px")
+                action = _fvg_reverse_action(side, event, avg_fill, price)
+                if action is None:
+                    continue
+                _fvg_reverse_acted[act_key] = time.time()
+                ticker = symbol.split(":")[-1]
+                qty = lot.get("filled_qty") or lot.get("qty")
+                fvg_top = fvg_c.get("fvg_last_top")
+                fvg_bottom = fvg_c.get("fvg_last_bottom")
+                pnl = ((price - avg_fill) if side == "long"
+                       else (avg_fill - price)) * qty
+                if action == "close" and config.FVG_REVERSE_AUTO_CLOSE:
+                    logger.warning("反向FVG守卫: %s %s 浮亏 %.2f，缺口 %.2f~%.2f，市价平仓",
+                                   symbol, side, pnl, fvg_bottom or 0, fvg_top or 0)
+                    ok, err = await order_mgr.close_lot(
+                        lot_id, ref_px=price, exit_reason="fvg_reverse")
+                    record_event("fvg_reverse_close", lot_id=lot_id, symbol=symbol,
+                                 ticker=ticker, side=side, qty=qty, price=price,
+                                 avg_fill=avg_fill, pnl=round(pnl, 2),
+                                 fvg_top=fvg_top, fvg_bottom=fvg_bottom,
+                                 ok=ok, error=err or "", status="requested")
+                    if ok:
+                        _fvg_reverse_alerts.pop(lot_id, None)
+                        _fvg_reverse_notices[ticker] = {
+                            "symbol": symbol, "ticker": ticker, "side": side,
+                            "qty": qty, "price": price, "pnl": round(pnl, 2),
+                            "closed_at": time.time(), "pending": True,
+                        }
+                        continue
+                    # 平仓失败 → 落提醒，下一根确认 bar 重试
+                    logger.warning("反向FVG守卫: %s 自动平仓失败: %s", symbol, err)
+                    _fvg_reverse_alerts[lot_id] = {
+                        "kind": "close_failed", "lot_id": lot_id,
+                        "symbol": symbol, "ticker": ticker, "side": side,
+                        "qty": qty, "price": price, "pnl": round(pnl, 2),
+                        "alerted_at": time.time(),
+                    }
+                    continue
+                if action == "close":
+                    # 自动平仓开关关闭 → 只提醒
+                    _fvg_reverse_alerts[lot_id] = {
+                        "kind": "close_failed", "lot_id": lot_id,
+                        "symbol": symbol, "ticker": ticker, "side": side,
+                        "qty": qty, "price": price, "pnl": round(pnl, 2),
+                        "alerted_at": time.time(),
+                    }
+                    continue
+                # protect：浮盈 → 立即保本 + 提醒锁利
+                if not lot.get("breakeven_reached"):
+                    ok, err = await order_mgr.breakeven(lot_id)
+                    if ok:
+                        logger.warning("反向FVG守卫: %s %s 浮盈 %.2f，已保本",
+                                       symbol, side, pnl)
+                        record_event("fvg_reverse_breakeven", lot_id=lot_id,
+                                     symbol=symbol, ticker=ticker, side=side,
+                                     qty=qty, price=price, pnl=round(pnl, 2),
+                                     new_stop=round(avg_fill, 2))
+                    else:
+                        logger.warning("反向FVG守卫: %s 保本失败: %s", symbol, err)
+                _fvg_reverse_alerts[lot_id] = {
+                    "kind": "profit_lock", "lot_id": lot_id,
+                    "symbol": symbol, "ticker": ticker, "side": side,
+                    "qty": qty, "price": price, "pnl": round(pnl, 2),
+                    "fvg_top": fvg_top, "fvg_bottom": fvg_bottom,
+                    "alerted_at": time.time(),
+                }
+                record_event("fvg_reverse_alert", lot_id=lot_id, symbol=symbol,
+                             ticker=ticker, side=side, qty=qty, price=price,
+                             pnl=round(pnl, 2), fvg_top=fvg_top,
+                             fvg_bottom=fvg_bottom)
+            # 已平仓的 lot 移出提醒（notice 保留供前端语音去重）
+            active_ids = {l.get("lot_id") for l in active}
+            for lid in list(_fvg_reverse_alerts):
+                if lid not in active_ids:
+                    _fvg_reverse_alerts.pop(lid, None)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("反向FVG守卫异常: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -2171,11 +2364,7 @@ async def _breakout_loop() -> None:
 
 
 async def _auto_loop() -> None:
-    """策略分发循环（每 1s；自动策略停止时仍管理已收养的本地 ACTIVE lot）：
-    - bar 收盘推进 → engine.on_bar（候选过期 + 跟踪/反向等持仓管理）
-    - tick 价 → engine.on_price（WATCHING 产生候选；ACTIVE 达到 2R 立即保本）
-    - 每 5s 收养人工 ACTIVE 仓（同一套保本/跟踪逻辑）
-    """
+    """EMA9 金字塔调度：实时 e9 触线建仓，确认 e9_c 管理整组仓位。"""
     from zoneinfo import ZoneInfo
     import datetime as _dt
     et = ZoneInfo("America/New_York")
@@ -2189,15 +2378,15 @@ async def _auto_loop() -> None:
             now = _dt.datetime.now(et)
             now_hm = now.hour * 60 + now.minute
             trading = _is_trading_hours()
+            if trading and collector.data_health()["stale"]:
+                continue
             for sym, data in market.items():
                 bar_c = data.get("bar_c") or {}
-                ts_c = data.get("ts_c") or data.get("ts") or {}
-                fvg_c = data.get("fvg_c") or data.get("fvg")
                 bt = bar_c.get("time") or 0
                 if bt and _auto_last_bar.get(sym) != bt:
                     _auto_last_bar[sym] = bt
                     try:
-                        await auto_engine.on_bar(sym, bar_c, ts_c)
+                        await auto_engine.on_bar(sym, bar_c, data.get("e9_c") or {})
                     except Exception:
                         logger.exception("auto on_bar 异常 %s", sym)
                 if trading:
@@ -2206,8 +2395,7 @@ async def _auto_loop() -> None:
                     if low or high:
                         try:
                             await auto_engine.on_price_extremes(
-                                sym, low, high, ts_c, bar_c, now_hm,
-                                fvg_c=fvg_c)
+                                sym, low, high, data.get("e9") or {}, now_hm)
                         except Exception:
                             logger.exception("auto on_price 异常 %s", sym)
             adopt_tick += 1
@@ -2215,13 +2403,12 @@ async def _auto_loop() -> None:
                 adopt_tick = 0
                 try:
                     adopted = await auto_engine.adopt_manual_lots(
-                        order_mgr.list_lots(active_only=True))
+                        order_mgr.list_lots(active_only=True), signals=market)
                     for sym in adopted:
                         data = market.get(sym) or {}
                         bar_c = data.get("bar_c") or {}
                         if bar_c:
-                            ts_c = data.get("ts_c") or data.get("ts") or {}
-                            await auto_engine.on_bar(sym, bar_c, ts_c)
+                            await auto_engine.on_bar(sym, bar_c, data.get("e9_c") or {})
                 except Exception:
                     logger.exception("auto 收养扫描异常")
             # 统一影子建档：自动策略开仓候选（ST/EMA 回踩限价单，触及才成交）
@@ -2595,13 +2782,19 @@ async def build_snapshot() -> dict:
             "fvg_premarket_filter": _fvg_premarket_filter(),  # FVG 监控盘前过滤开关
             "news": _news_status(),  # 盘前新闻小摘要（徽标联动 hot ticker→gist）
             "imessage_recipient": str(_settings.get("imessage_recipient") or ""),  # iMessage 告警收件人（未配置跳过）
-            "market_age": (None if collector._last_update == 0
+            "market_age": (None if collector._last_content_update == 0
                            else round(collector.age(), 1)),
+            "market_transport_age": collector.data_health()["transport_age"],
+            "market_bar_age": collector.data_health()["bar_age"],
+            "market_stale": collector.data_health()["stale"],
+            "market_stale_reason": collector.data_health()["reason"],
             "market_running": collector.running,
             "data_time": collector.latest_bar_time,   # TV 数据时钟（最新 K 线时间）
             "server_time": time.time(),               # 本地时钟
             "ibkr_time": gateway.ibkr_time,           # IBKR 服务器时钟
             "bar_update_delay": collector.bar_update_delay,  # K线收盘→收到 的延时（秒）
+            "tv_study": collector.study_health(),  # 指标通道健康（systemic=全体故障）
+            "tv_view": _tv_view_info,             # TV 画面位（panes/slots，启动校验）
         },
         "market": collector.latest(),
         "positions": order_mgr.aggregate(),
@@ -2618,14 +2811,18 @@ async def build_snapshot() -> dict:
                                     key=lambda x: x.get("alerted_at", 0), reverse=True),
         "auto_close_notices": sorted(_auto_close_notices.values(),
                                      key=lambda x: x.get("closed_at", 0), reverse=True),
+        # 持仓反向 FVG 守卫：提醒（锁利/平仓失败）+ 自动平仓记录
+        "fvg_reverse_alerts": sorted(_fvg_reverse_alerts.values(),
+                                     key=lambda x: x.get("alerted_at", 0), reverse=True),
+        "fvg_reverse_notices": sorted(_fvg_reverse_notices.values(),
+                                      key=lambda x: x.get("closed_at", 0), reverse=True),
         "shadow": {"stats": shadow_tracker.stats(),
                    "events": shadow_tracker.events(100)},
         "fvg_monitor": _fvg_monitor_snapshot(),
         "breakout_signals": list(_breakout_signals),   # 盘前突破信号（前端信号栏）
         "alerts": notifier.active_alerts(),            # 活跃告警（前端横幅+声音）
         "auto": {"enabled": _auto_enabled, "strategy": _auto_strategy_name,
-                 "instances": auto_engine.instances(),
-                 "proposals": auto_engine.proposals()},
+                 "instances": _auto_instances(), "proposals": []},
         "clients": _clients_snapshot(),
         "copy": _copy_snapshot(),
     }
@@ -2741,19 +2938,58 @@ def _on_lot_revived(d: dict) -> None:
         "stop_px", "limit_type", "note")})
 
 
+def _startup_status() -> dict:
+    snap = collector.latest() or {}
+    total = len(snap)
+    confirmed = sum(1 for v in snap.values()
+                    if isinstance(v.get("ts_c"), dict)
+                    and v["ts_c"].get("trend_state") is not None)
+    expected = len(config.WATCHLIST)
+    market_ready = collector.running and total >= expected and confirmed >= total
+    ibkr_required = bool(gateway.enabled)
+    ibkr_ready = bool(gateway._connected) or not ibkr_required
+    core_ready = bool(_startup_state["core_ready"])
+    browser_ready = bool(_startup_state["browser_ready"])
+    stages = [
+        {"key": "core", "label": "交易服务", "ready": core_ready,
+         "detail": "风控、订单与后台任务已启动" if core_ready else "正在启动"},
+        {"key": "ibkr", "label": "IBKR", "ready": ibkr_ready,
+         "detail": ("TWS 已连接" if gateway._connected else
+                    "DRY-RUN 模式" if not ibkr_required else "等待 TWS 连接（7496）")},
+        {"key": "market", "label": "行情与指标", "ready": market_ready,
+         "detail": f"确认指标 {confirmed}/{expected}"},
+        {"key": "browser", "label": "图表工作区", "ready": browser_ready,
+         "detail": ("控制台与 TradingView 双标签页已就绪" if browser_ready
+                    else _startup_state["browser_error"] or "正在准备浏览器标签页")},
+    ]
+    errors = []
+    if _startup_state["browser_error"] and not browser_ready:
+        errors.append(_startup_state["browser_error"])
+    if collector.study_health().get("systemic") and not market_ready:
+        errors.append("TradingView 指标通道异常，请运行 python3 service/tv_diag.py 检查")
+    return {
+        "ready": bool(_startup_state["ready"]), "stages": stages,
+        "error": "；".join(errors), "elapsed": round(time.time() - _startup_state["started_at"]),
+        "all_ready": all(s["ready"] for s in stages),
+    }
+
+
 @app.on_event("startup")
 async def on_startup() -> None:
     global _broadcast_task, _eod_task, _scan_task, _stop_guard_task, _reconcile_task
     global _shadow_task, _auto_task, _midpoint_reprice_task, _external_cleanup_task
     global _slow_break_task, _auto_breakeven_task, _fvg_task, _retest_reprice_task
     global _breakout_task, _naked_position_task, _health_watch_task
-    global _report_task, _precheck_task
+    global _report_task, _precheck_task, _fvg_reverse_task, _tv_check_task, _startup_task
+    global _system_stopping
+    _system_stopping = False
     config.validate_config()
     if not acquire_writer_lock("logs/autotrade_writer.lock"):
         raise RuntimeError("另一个 autotrade 执行写进程正在运行，禁止重复管理订单")
     connected = await gateway.connect()
     if config.EXECUTION_ENABLED and not connected:
-        logger.error("EXECUTION_ENABLED=1 但 IBKR 未连接，下单将失败")
+        logger.error("EXECUTION_ENABLED=1 但 IBKR 未连接，将持续重连，就绪后进入主页面")
+        gateway._start_reconnect()
     elif not connected:
         logger.info("IBKR 未连接，运行于纯 dry-run（虚拟成交）")
     order_mgr.on_lot_closed = _on_lot_closed
@@ -2776,11 +3012,15 @@ async def on_startup() -> None:
     _retest_reprice_task = asyncio.create_task(_retest_limit_reprice_loop())
     _external_cleanup_task = asyncio.create_task(_external_cleanup_loop())
     _fvg_task = asyncio.create_task(_fvg_monitor_loop())
+    _fvg_reverse_task = asyncio.create_task(_fvg_reverse_guard_loop())
     _breakout_task = asyncio.create_task(_breakout_loop())
     _naked_position_task = asyncio.create_task(_naked_position_loop())
     _health_watch_task = asyncio.create_task(_health_watch_loop())
+    _tv_check_task = asyncio.create_task(_tv_startup_check())
     _report_task = asyncio.create_task(_report_loop())
     _precheck_task = asyncio.create_task(_precheck_loop())
+    _startup_state["core_ready"] = True
+    _startup_task = asyncio.create_task(_startup_prepare())
 
 
 @app.on_event("shutdown")
@@ -2789,14 +3029,116 @@ async def on_shutdown() -> None:
               _stop_guard_task, _reconcile_task, _shadow_task, _auto_task,
               _midpoint_reprice_task, _retest_reprice_task,
               _external_cleanup_task, _slow_break_task,
-              _auto_breakeven_task, _fvg_task, _breakout_task,
+              _auto_breakeven_task, _fvg_task, _fvg_reverse_task, _breakout_task,
               _naked_position_task, _health_watch_task, _report_task,
-              _precheck_task):
+              _precheck_task, _tv_check_task, _startup_task):
         if t:
             t.cancel()
     await copy_supervisor.stop_all()
     await collector.stop()
     await gateway.disconnect()
+
+
+_TWS_PROCESS_PATTERN = "/Trader Workstation/Trader Workstation.app/Contents/MacOS/JavaApplicationStub"
+
+
+async def _tws_pids() -> List[int]:
+    proc = await asyncio.create_subprocess_exec(
+        "pgrep", "-f", _TWS_PROCESS_PATTERN,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    out, _ = await proc.communicate()
+    return sorted(int(pid) for pid in out.decode().split())
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+async def _wait_tws_exit(pids: List[int], timeout: float) -> List[int]:
+    deadline = time.monotonic() + timeout
+    remaining = [pid for pid in pids if _pid_alive(pid)]
+    while remaining and time.monotonic() < deadline:
+        await asyncio.sleep(0.25)
+        remaining = [pid for pid in remaining if _pid_alive(pid)]
+    return remaining
+
+
+async def _close_tws_process() -> bool:
+    """关闭 TWS 主进程；先正常退出，超时后 TERM/KILL 确保不残留。"""
+    pids = await _tws_pids()
+    if not pids:
+        return True
+    try:
+        await _osascript('tell application "Trader Workstation" to quit')
+    except Exception as e:
+        logger.warning("TWS 正常退出请求失败，将直接结束进程: %s", e)
+    remaining = await _wait_tws_exit(pids, 8.0)
+    if remaining:
+        for pid in remaining:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        remaining = await _wait_tws_exit(remaining, 3.0)
+    if remaining:
+        for pid in remaining:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        remaining = await _wait_tws_exit(remaining, 2.0)
+    if remaining:
+        logger.error("TWS 进程仍未退出: %s", remaining)
+        return False
+    logger.info("TWS 进程已关闭")
+    return True
+
+
+def _schedule_console_exit() -> None:
+    async def _exit() -> None:
+        await asyncio.sleep(0.5)   # 先让 shutdown 响应到达浏览器
+        os.kill(os.getpid(), signal.SIGTERM)
+    asyncio.create_task(_exit())
+
+
+@app.post("/api/system/shutdown")
+async def api_system_shutdown(request: Request) -> dict:
+    """仅本机：关交易门 → 停跟单 → 关 TWS → 退出控制台。"""
+    global _system_stopping
+    if not _is_local(request):
+        raise HTTPException(403, "仅本机（master）可关闭系统")
+    if _system_stopping:
+        return {"ok": True, "stopping": True, "tws_closed": None, "errors": []}
+    _system_stopping = True
+    logger.warning("收到手动关闭系统请求，停止全部 IBKR 控制")
+    record_event("system_shutdown_requested")
+    errors = []
+    try:
+        await gateway.disable_control()
+    except Exception as e:
+        logger.exception("关闭 IBKR 交易门异常")
+        errors.append(f"IBKR API: {e}")
+    try:
+        await copy_supervisor.stop_all()
+    except Exception as e:
+        logger.exception("停止跟单进程异常")
+        errors.append(f"跟单进程: {e}")
+    try:
+        tws_closed = await _close_tws_process()
+    except Exception as e:
+        logger.exception("关闭 TWS 异常")
+        tws_closed = False
+        errors.append(f"TWS: {e}")
+    record_event("system_shutdown_ready", tws_closed=tws_closed, errors=errors)
+    _schedule_console_exit()
+    return {"ok": tws_closed and not errors, "stopping": True,
+            "tws_closed": tws_closed, "errors": errors}
 
 
 # ---------------------------------------------------------------------------
@@ -3160,7 +3502,27 @@ async def _tv_activate_window() -> None:
                     r.read()
 
         await asyncio.to_thread(_activate)
-        # 置前整个应用：9222 监听进程 → .app 路径 → open -a
+        # 置前整个应用：9222 监听进程 pid → System Events frontmost。
+        # 注意不能用 open -a：TV 调试 Chrome 与日常 Chrome 是同名 .app 的
+        # 两个实例，open -a 无法区分，会激活错对象导致窗口只闪一下就回落。
+        proc = await asyncio.create_subprocess_exec(
+            "lsof", "-nP", "-iTCP:9222", "-sTCP:LISTEN", "-t",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await proc.communicate()
+        pids = out.decode().split()
+        if pids:
+            try:
+                await _osascript(
+                    'tell application "System Events" to set frontmost of '
+                    f'(first process whose unix id is {int(pids[0])}) to true')
+                return
+            except PermissionError:
+                await notifier.notify(
+                    "a11y_permission", "warning", "TV 窗口置前需要辅助功能权限",
+                    "系统设置 → 隐私与安全性 → 辅助功能，授权运行控制台的终端 App")
+            except Exception as e:
+                logger.info("pid 精确置前失败，降级 open -a: %s", e)
+        # 兜底：.app 路径 open -a（同名多实例时不精确，仅作退路）
         proc = await asyncio.create_subprocess_exec(
             "bash", "-c",
             "ps -o comm= -p $(lsof -nP -iTCP:9222 -sTCP:LISTEN -t | head -1) 2>/dev/null",
@@ -3176,11 +3538,26 @@ async def _tv_activate_window() -> None:
         logger.info("TV 窗口置前失败（静默）: %s", e)
 
 
+async def _osascript(script: str, *args: str) -> str:
+    proc = await asyncio.create_subprocess_exec(
+        "osascript", "-e", script, *args,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    out, err = await proc.communicate()
+    if proc.returncode != 0:
+        msg = err.decode(errors="replace").strip()
+        if "-1719" in msg or "辅助功能" in msg or "assistive" in msg.lower():
+            raise PermissionError(msg)
+        raise RuntimeError(msg)
+    return out.decode().strip()
+
+
 _TV_CHART_URL = "https://cn.tradingview.com/chart/I2KwX1s0/"  # auto_trade 保存布局
 # 独立调试 profile（已登录 TV）。必须显式指定：① Chrome ≥136 起默认
 # user-data-dir 下 --remote-debugging-port 被忽略（安全策略），端口永远起不来；
 # ② 独立 profile 与日常 Chrome 互不干扰（各自单实例），且免登录。
 _TV_CHROME_PROFILE = str(Path.home() / ".tv-chrome-profile")
+_CONSOLE_URL = os.getenv("CONSOLE_URL", "http://127.0.0.1:8000/")
+_CONSOLE_AUTO_OPEN_BROWSER = os.getenv("CONSOLE_AUTO_OPEN_BROWSER", "1") != "0"
 
 
 async def _cdp_alive() -> bool:
@@ -3204,7 +3581,7 @@ async def _tv_ensure_browser() -> Optional[str]:
     """确保可控浏览器存在。返回 None = 就绪；否则返回失败原因。
     三种情况：① 9222 不通 → 启动 Chrome（带调试端口 + TV 图表页）；
     ② 端口活但图表页被关了（macOS 关窗不退进程，target 列表为空）
-    → /json/new 新开一个图表标签页；③ 图表页在 → 直接就绪。"""
+    → /json/new 新开一个图表标签页；③ 图表页在 → 复用。最后都等 widget 就绪。"""
     from controller import tv_cdp as _cdp_mod
     from controller.tv_cdp import TradingViewCDPController
     endpoint = _cdp_mod.config.CDP_HTTP_ENDPOINT
@@ -3227,13 +3604,12 @@ async def _tv_ensure_browser() -> Optional[str]:
             r.read()
 
     if await _cdp_alive():
-        if await asyncio.to_thread(_chart_page_up):
-            return None
-        logger.info("CDP 在线但无图表页，新开 TradingView 标签页 ...")
-        try:
-            await asyncio.to_thread(_open_chart_tab)
-        except Exception as e:
-            return f"新开图表标签页失败: {e}"
+        if not await asyncio.to_thread(_chart_page_up):
+            logger.info("CDP 在线但无图表页，新开 TradingView 标签页 ...")
+            try:
+                await asyncio.to_thread(_open_chart_tab)
+            except Exception as e:
+                return f"新开图表标签页失败: {e}"
     else:
         logger.info("CDP 离线，启动浏览器打开 TradingView ...")
         await asyncio.create_subprocess_exec(
@@ -3274,6 +3650,106 @@ async def _tv_ensure_browser() -> Optional[str]:
         return "图表页已打开但 widget 未就绪（页面可能未登录或加载过慢）"
     except Exception as e:
         return f"浏览器就绪检查异常: {e}"
+
+
+def _cdp_page_id(url_prefix: str) -> Optional[str]:
+    from controller import tv_cdp as _cdp_mod
+    import urllib.request
+    endpoint = _cdp_mod.config.CDP_HTTP_ENDPOINT
+    try:
+        with urllib.request.urlopen(f"{endpoint}/json", timeout=2) as r:
+            targets = json.loads(r.read())
+        page = next((t for t in targets if t.get("type") == "page"
+                     and t.get("url", "").startswith(url_prefix)), None)
+        return page.get("id") if page else None
+    except Exception:
+        return None
+
+
+async def _cdp_open_tab(url: str) -> None:
+    from controller import tv_cdp as _cdp_mod
+    import urllib.request
+    endpoint = _cdp_mod.config.CDP_HTTP_ENDPOINT
+
+    def _open() -> None:
+        req = urllib.request.Request(f"{endpoint}/json/new?{url}", method="PUT")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            r.read()
+
+    await asyncio.to_thread(_open)
+
+
+async def _activate_console_tab() -> None:
+    page_id = await asyncio.to_thread(_cdp_page_id, _CONSOLE_URL)
+    if not page_id:
+        return
+    from controller import tv_cdp as _cdp_mod
+    import urllib.request
+    endpoint = _cdp_mod.config.CDP_HTTP_ENDPOINT
+
+    def _activate() -> None:
+        with urllib.request.urlopen(f"{endpoint}/json/activate/{page_id}", timeout=3) as r:
+            r.read()
+
+    await asyncio.to_thread(_activate)
+
+
+async def _workspace_ensure_browser() -> Optional[str]:
+    """同一调试 Chrome 内准备控制台和 TV 两个独立标签页。"""
+    if not await _cdp_alive():
+        logger.info("启动交易工作区浏览器（控制台 + TradingView）...")
+        proc = await asyncio.create_subprocess_exec(
+            "open", "-na", "Google Chrome", "--args",
+            "--remote-debugging-port=9222",
+            f"--user-data-dir={_TV_CHROME_PROFILE}", "--no-first-run",
+            _TV_CHART_URL, _CONSOLE_URL,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        await proc.wait()
+        for _ in range(15):
+            await asyncio.sleep(2)
+            if await _cdp_alive():
+                break
+        else:
+            return "调试 Chrome 的 9222 端口 30s 未就绪"
+    elif not await asyncio.to_thread(_cdp_page_id, _CONSOLE_URL):
+        await _cdp_open_tab(_CONSOLE_URL)
+    not_ready = await _tv_ensure_browser()
+    if not_ready:
+        return not_ready
+    if not await asyncio.to_thread(_cdp_page_id, _CONSOLE_URL):
+        await _cdp_open_tab(_CONSOLE_URL)
+    try:
+        await _activate_console_tab()
+    except Exception as e:
+        logger.info("控制台标签页置前失败（静默）: %s", e)
+    return None
+
+
+async def _startup_prepare() -> None:
+    """打开工作区并等待全链路首次就绪；就绪锁定后不再因断线退回加载页。"""
+    await asyncio.sleep(0.5)   # 让 uvicorn 完成 startup 并开始接收加载页请求
+    if _CONSOLE_AUTO_OPEN_BROWSER:
+        while not _startup_state["browser_ready"]:
+            try:
+                error = await _workspace_ensure_browser()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.exception("启动浏览器工作区异常")
+                error = str(e)
+            _startup_state["browser_error"] = error or ""
+            if not error:
+                _startup_state["browser_ready"] = True
+                break
+            await asyncio.sleep(5)
+    else:
+        _startup_state["browser_ready"] = True
+    while not _startup_state["ready"]:
+        if _startup_status()["all_ready"]:
+            _startup_state["ready"] = True
+            logger.info("控制台全链路就绪，加载页自动进入主页面")
+            return
+        await asyncio.sleep(1)
 
 
 async def _tv_show_symbol(symbol: str) -> dict:
@@ -3325,6 +3801,269 @@ async def api_tv_show(req: TvShowRequest,
     return await _tv_show_symbol(symbol)
 
 
+# ---------------------------------------------------------------------------
+# 客户端看盘（v2026-10-27）：「每人一格」+ 截图回传
+# master 的 TV 屏幕是唯一能渲染私有指标（trend_state/FVG/smart_stop）的画面。
+# master 固定 pane 0（现状不变）；每个已审批客户端按首次使用分配 pane 1..N，
+# 点击标的 → 切自己那格 → 等数据就绪 → 按该格 rect 裁剪截图 → base64 回传，
+# 前端弹窗看图（10s 自动刷新）。pane 分完 → 明确报「画面位已满」。
+# ---------------------------------------------------------------------------
+
+# pane 收集公共片段（与 _TV_SHOW_JS 同口径：双路径取 widget、rect 过滤
+# 不可见、(y,x) 行优先视觉排序）
+_TV_PANES_COLLECT_JS = r"""
+  const readSym = cw => {
+    try { const s = cw.symbol();
+      return String((s && typeof s.value === 'function') ? s.value() : s);
+    } catch (e) {}
+    try { return String(cw.model().mainSeries().symbol()); } catch (e) {}
+    return '';
+  };
+  const rectOf = cw => {
+    try {
+      if (cw._mainDiv && cw._mainDiv.getBoundingClientRect) {
+        const b = cw._mainDiv.getBoundingClientRect();
+        return { x: b.x, y: b.y, w: b.width, h: b.height };
+      }
+    } catch (e) {}
+    return null;
+  };
+  let cws = [];
+  const api = window.TradingViewApi && window.TradingViewApi._chartWidgetCollection;
+  if (api && typeof api.getAll === 'function') cws = api.getAll() || [];
+  if (!cws.length) {
+    const col = window._exposed_chartWidgetCollection;
+    if (col && col._chartWidgetsDefs) {
+      cws = col._chartWidgetsDefs.map(d => d.chartWidget);
+    }
+  }
+  const panes = cws.map(cw => ({ cw, rect: rectOf(cw) }))
+    .filter(p => p.rect && p.rect.w > 50 && p.rect.h > 50)
+    .sort((a, b) => (a.rect.y - b.rect.y) || (a.rect.x - b.rect.x));
+"""
+
+_TV_PANES_JS = "\n(() => {" + _TV_PANES_COLLECT_JS + r"""
+  return JSON.stringify(panes.map(p => ({ symbol: readSym(p.cw),
+                                          rect: p.rect })));
+})()
+"""
+
+# 切指定 pane 到目标标的：已是该标的则跳过切换（客户端刷新截图的 fast-path，
+# setSymbol 会触发数据重载，能不动就不动）
+_TV_PANE_SHOW_JS = "\n(async () => {" + _TV_PANES_COLLECT_JS + r"""
+  const idx = %PANE%;
+  if (!panes.length) return JSON.stringify({ fatal: 'no visible pane' });
+  if (idx >= panes.length) return JSON.stringify({ fatal: 'pane 不足',
+                                                   panes: panes.length });
+  const target = %SYMBOL%;
+  const ticker = String(target).split(':').pop().toUpperCase();
+  const cw = panes[idx].cw;
+  const before = readSym(cw);
+  const needSwitch = String(before).split(':').pop().toUpperCase() !== ticker;
+  if (needSwitch) {
+    if (typeof cw.setSymbol === 'function') cw.setSymbol(target);
+    else if (cw.model && cw.model().mainSeries) {
+      cw.model().mainSeries().setSymbol(target);
+    } else return JSON.stringify({ fatal: 'widget 无 setSymbol', before });
+    await new Promise(r => setTimeout(r, 300));
+  }
+  const after = readSym(cw);
+  const got = String(after).split(':').pop().toUpperCase();
+  return JSON.stringify({ before, after, ok: got === ticker,
+                          switched: needSwitch, rect: panes[idx].rect,
+                          panes: panes.length });
+})()
+"""
+
+# 数据就绪探针：pane symbol 已是目标 且 K 线 bars 已加载（切标的后 TV
+# 拉数据要 5~20s，轮询到就绪再截图，避免截到旧图/loading）
+_TV_PANE_READY_JS = "\n(() => {" + _TV_PANES_COLLECT_JS + r"""
+  const idx = %PANE%;
+  const ticker = %TICKER%;
+  if (idx >= panes.length) return 'false';
+  const cw = panes[idx].cw;
+  try {
+    const s = cw.symbol();
+    const cur = String((s && typeof s.value === 'function') ? s.value() : s)
+      .split(':').pop().toUpperCase();
+    if (cur !== ticker) return 'false';
+    const bars = cw.model().mainSeries().bars();
+    return String(!!(bars && bars.size() > 5));
+  } catch (e) { return 'false'; }
+})()
+"""
+
+_TV_PANES_PATH = (Path(__file__).resolve().parent.parent
+                  / "logs" / "tv_panes.json")
+_TV_PANE_STALE_S = 2 * 3600   # 两小时没用的客户端画面位可回收再分配
+_tv_pane_locks: Dict[int, asyncio.Lock] = {}
+_tv_view_info: dict = {"panes": 0, "slots": 0, "checked_at": 0.0}
+
+
+def _tv_load_pane_map() -> dict:
+    """trader → {pane, last_used} 映射；缺文件/损坏返回 {}。"""
+    try:
+        payload = json.loads(_TV_PANES_PATH.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            return payload
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as e:
+        logger.warning("tv_panes.json 加载失败: %s", e)
+    return {}
+
+
+def _tv_save_pane_map(m: dict) -> None:
+    try:
+        _TV_PANES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _TV_PANES_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(m, ensure_ascii=False, indent=1),
+                       encoding="utf-8")
+        os.replace(tmp, _TV_PANES_PATH)
+    except OSError:
+        logger.exception("tv_panes.json 落盘失败")
+
+
+def _tv_assign_pane(trader: str, pane_count: int) -> Optional[int]:
+    """给客户端分配画面位：已有映射且仍有效 → 复用；否则取最小空位
+    （pane 0 是 master 的）；全满时先回收两小时未用的旧映射，仍无位 → None。"""
+    now = time.time()
+    m = _tv_load_pane_map()
+    row = m.get(trader)
+    if isinstance(row, dict) and 0 < int(row.get("pane", 0)) < pane_count:
+        row["last_used"] = now
+        _tv_save_pane_map(m)
+        return int(row["pane"])
+    # 失效映射清掉（布局缩小后 pane 越界的、自己的旧映射）
+    m = {k: v for k, v in m.items()
+         if isinstance(v, dict) and 0 < int(v.get("pane", 0)) < pane_count}
+    used = {int(v["pane"]) for v in m.values()}
+    for idx in range(1, pane_count):
+        if idx not in used:
+            m[trader] = {"pane": idx, "last_used": now}
+            _tv_save_pane_map(m)
+            return idx
+    # 回收最久未用的（超过 _TV_PANE_STALE_S）
+    stale = sorted(m.items(), key=lambda kv: kv[1].get("last_used", 0))
+    if stale and now - stale[0][1].get("last_used", 0) > _TV_PANE_STALE_S:
+        old_trader, old = stale[0]
+        idx = int(old["pane"])
+        del m[old_trader]
+        m[trader] = {"pane": idx, "last_used": now}
+        _tv_save_pane_map(m)
+        logger.info("TV 画面位回收：%s 的 pane %d 转给 %s", old_trader, idx,
+                    trader)
+        return idx
+    _tv_save_pane_map(m)
+    return None
+
+
+async def _tv_list_panes() -> Optional[list]:
+    """读当前可见 pane 列表 [{symbol, rect}]（视觉行优先）；失败返回 None。"""
+    from controller.tv_cdp import TradingViewCDPController
+    try:
+        async with TradingViewCDPController() as tv:
+            return json.loads(await asyncio.wait_for(
+                tv.evaluate(_TV_PANES_JS), timeout=10))
+    except Exception as e:
+        logger.info("TV pane 列表读取失败（静默）: %s", e)
+        return None
+
+
+async def _tv_view_for_trader(symbol: str, trader: str) -> dict:
+    """客户端看盘主流程：确保浏览器 → 分配画面位 → 切该 pane → 等数据就绪
+    → 按 pane rect 裁剪截图回传。每 pane 一把锁防并发切换同一格。"""
+    from controller.tv_cdp import TradingViewCDPController
+    not_ready = await _tv_ensure_browser()
+    if not_ready:
+        return {"ok": False, "reason": not_ready}
+    panes = await _tv_list_panes()
+    if not panes:
+        return {"ok": False, "reason": "TV 无可用画面（图表未加载或宫格为空）"}
+    idx = _tv_assign_pane(trader, len(panes))
+    if idx is None:
+        return {"ok": False, "code": "pane_full",
+                "reason": f"画面位已满（TV 当前 {len(panes)} 格，master 占 1 格，"
+                          "客户端画面位已全部分完）"}
+    lock = _tv_pane_locks.setdefault(idx, asyncio.Lock())
+    async with lock:
+        report = {}
+        try:
+            async with TradingViewCDPController() as tv:
+                show_js = (_TV_PANE_SHOW_JS
+                           .replace("%PANE%", str(idx))
+                           .replace("%SYMBOL%", json.dumps(symbol)))
+                # 冷启动竞态（同 _tv_show_symbol）：布局恢复会覆盖 setSymbol，重试
+                for attempt in range(3):
+                    report = json.loads(await asyncio.wait_for(
+                        tv.evaluate(show_js), timeout=10))
+                    if report.get("fatal") or report.get("ok"):
+                        break
+                    if attempt < 2:
+                        await asyncio.sleep(2)
+                if report.get("fatal"):
+                    return {"ok": False, "reason": report["fatal"]}
+                if not report.get("ok"):
+                    return {"ok": False,
+                            "reason": f"读回不一致: {report.get('after')}"}
+                if report.get("switched"):
+                    ticker = symbol.split(":")[-1].upper()
+                    ready_js = (_TV_PANE_READY_JS
+                                .replace("%PANE%", str(idx))
+                                .replace("%TICKER%", json.dumps(ticker)))
+                    for _ in range(12):      # 最多等 12s 数据就绪
+                        ok = await asyncio.wait_for(
+                            tv.evaluate(ready_js), timeout=5)
+                        if str(ok) == "true":
+                            break
+                        await asyncio.sleep(1)
+                    await asyncio.sleep(1.2)   # 渲染稳定一帧再截
+                rect = report["rect"]
+                shot = await asyncio.wait_for(tv.screenshot(
+                    quality=70,
+                    clip={"x": rect["x"], "y": rect["y"],
+                          "width": rect["w"], "height": rect["h"]}),
+                    timeout=15)
+        except Exception as e:
+            logger.info("TV 客户端看盘失败（%s pane %d）: %s", trader, idx, e)
+            return {"ok": False, "reason": str(e)}
+    logger.info("TV 看盘：%s → pane %d 切到 %s（截图 %d KB）",
+                trader, idx, report.get("after"), len(shot) // 1024)
+    return {"ok": True, "pane": idx, "shown": report.get("after"),
+            "image": base64.b64encode(shot).decode("ascii")}
+
+
+@app.post("/api/tv/view")
+async def api_tv_view(req: TvShowRequest,
+                      trader: str = Depends(require_trader)) -> dict:
+    """看盘统一入口：master → 只切 pane 0 不截图（面前就是屏幕）；
+    已审批客户端 → 专属 pane 切标的 + 截图回传。"""
+    symbol = req.symbol.strip()
+    if not symbol:
+        raise HTTPException(400, "symbol 不能为空")
+    if trader == "master":
+        return {**await _tv_show_symbol(symbol), "master": True}
+    return await _tv_view_for_trader(symbol, trader)
+
+
+@app.on_event("startup")
+async def _tv_view_startup_check():
+    """启动校验 TV 画面位（布局由人工保证，这里只盘点并在快照里展示）。"""
+    async def _check():
+        global _tv_view_info
+        if not await _cdp_alive():
+            _tv_view_info = {"panes": 0, "slots": 0,
+                             "checked_at": time.time(), "note": "CDP 离线"}
+            return
+        panes = await _tv_list_panes()
+        n = len(panes or [])
+        _tv_view_info = {"panes": n, "slots": max(0, n - 1),
+                         "checked_at": time.time()}
+        logger.info("TV 画面位校验：%d 格（master 1 + 客户端位 %d）",
+                    n, max(0, n - 1))
+    asyncio.create_task(_check())
+
+
 @app.post("/api/settings")
 async def api_update_settings(req: SettingsRequest,
                               trader: str = Depends(require_trader)) -> dict:
@@ -3372,8 +4111,13 @@ async def api_logs(limit: int = 200) -> list:
 @app.get("/api/market")
 async def api_market() -> dict:
     """TV 实时数据快照（5M K线 + trend_state）+ FVG 监控槽位（前端首屏用）。"""
+    health = collector.data_health()
     return {"symbols": collector.latest(),
-            "age": None if collector._last_update == 0 else round(collector.age(), 1),
+            "age": health["content_age"],
+            "transport_age": health["transport_age"],
+            "bar_age": health["bar_age"],
+            "stale": health["stale"],
+            "stale_reason": health["reason"],
             "running": collector.running,
             "fvg_monitor": _fvg_monitor_snapshot()}
 
@@ -3423,22 +4167,22 @@ async def api_precheck_last() -> dict:
 
 
 class AutoStartRequest(BaseModel):
-    strategy: str = "trend_pullback"
+    strategy: str = "ema9_pyramid"
     symbols: List[str] = Field(default_factory=list,
                                description="空 = 全 WATCHLIST（受实例上限约束）")
-    params: dict = Field(default_factory=dict, description="覆盖策略参数")
+    params: dict = Field(default_factory=dict, description="initial_risk_usd=当前单笔资金")
 
 
 @app.post("/api/auto/start")
 async def api_auto_start(req: AutoStartRequest,
                          trader: str = Depends(require_trader)) -> dict:
-    """启动策略实例（≤ AUTO_MAX_INSTANCES）：tick 产生候选，人工确认开仓，
-    bar 收盘自动管理（保本/ST 跟踪/反向）。"""
+    """EMA9 实时触线全自动建仓；首仓 R，后续 2R/3、R/3，最多三次。"""
     global _auto_enabled, _auto_strategy_name, _auto_last_bar
+    if req.strategy != "ema9_pyramid":
+        raise HTTPException(400, "自动策略仅支持 ema9_pyramid")
     symbols = [s.strip().upper() for s in req.symbols if s.strip()]
     if not symbols:
         symbols = list(config.WATCHLIST)
-    # 补交易所前缀（允许裸 ticker）
     fixed = []
     for s in symbols:
         if ":" not in s:
@@ -3447,20 +4191,31 @@ async def api_auto_start(req: AutoStartRequest,
         else:
             fixed.append(s)
     try:
-        # 默认把当前全局止损 ATR 倍数传入策略（req.params 可显式覆盖）
-        strategy = build_strategy(req.strategy,
-                                  **{"stop_atr_mult": _stop_atr_mult(),
-                                     **req.params})
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    started = auto_engine.start(strategy, fixed)
+        initial_risk = float(req.params.get("initial_risk_usd")
+                             or config.RISK_PER_TRADE_USD)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "首仓风险预算格式无效")
+    if initial_risk <= 0:
+        raise HTTPException(400, "首仓风险预算必须大于 0")
+    market = collector.latest() or {}
+    missing = [s for s in fixed
+               if not (((market.get(s) or {}).get("e9") or {}).get("ema_9"))]
+    if missing:
+        raise HTTPException(409, "EMA9 v7 指标未就绪: " + ",".join(missing))
+    no_direction = [s for s in fixed
+                    if ((market.get(s) or {}).get("e9") or {}).get("direction") not in (1, -1)]
+    if no_direction:
+        raise HTTPException(409, "启动时方向不明确，无法锁定策略方向: " + ",".join(no_direction))
+    directions = {s: int(((market.get(s) or {}).get("e9") or {}).get("direction"))
+                  for s in fixed}
+    started = auto_engine.start(fixed, initial_risk, directions)
     _auto_enabled = True
     _auto_strategy_name = req.strategy
-    record_event("auto_start", strategy=req.strategy, symbols=started,
-                 params=strategy.params)
-    logger.info("全自动策略启动 %s: %s（实例上限 %d）",
-                req.strategy, started, config.AUTO_MAX_INSTANCES)
-    return {"ok": True, "started": started, "params": strategy.params,
+    params = {"initial_risk_usd": initial_risk, "start_directions": directions,
+              "risk_ratios": [1.0, 2.0 / 3.0, 1.0 / 3.0], "max_entries": 3}
+    record_event("auto_start", strategy=req.strategy, symbols=started, params=params)
+    logger.info("EMA9 金字塔启动: %s（首仓风险 %.2f）", started, initial_risk)
+    return {"ok": True, "started": started, "params": params,
             "skipped": [s for s in fixed if s not in started]}
 
 
@@ -3470,45 +4225,102 @@ async def api_auto_stop(close_positions: bool = False,
     """停止全自动策略：不再开新仓；存量实例默认继续管理（可选全部平仓）。"""
     global _auto_enabled
     _auto_enabled = False
+    auto_engine.enabled = False
     stopped = []
+    market = collector.latest() or {}
     for inst in auto_engine.instances():
         if inst["state"] == "DONE":
             continue
         auto_engine.stop_symbol(inst["symbol"], close_position=close_positions)
-        if close_positions and inst["lot_id"]:
-            await order_mgr.close_lot(inst["lot_id"], exit_reason="auto_stop")
+        if close_positions:
+            ref = ((market.get(inst["symbol"]) or {}).get("bar") or {}).get("close") or 0
+            await auto_engine._stop_close(
+                auto_engine._instances[inst["symbol"]], ref, "manual_stop")
         stopped.append(inst["symbol"])
     record_event("auto_stop", symbols=stopped, close_positions=close_positions)
     return {"ok": True, "stopped": stopped, "close_positions": close_positions}
 
 
+def _auto_instances() -> list:
+    rows = auto_engine.instances()
+    equity = _equity_cache.get("equity") or 0
+    for row in rows:
+        row["max_position_pct"] = (round(row["max_notional"] / equity * 100, 2)
+                                   if equity > 0 else None)
+    return rows
+
+
 @app.get("/api/auto/status")
 async def api_auto_status() -> dict:
-    """策略状态：开关/策略名/待确认候选/全部实例（含收养的人工仓）。"""
+    """金字塔策略状态：首仓预算、建仓次数、平均成本、解锁与最大仓位。"""
     return {"enabled": _auto_enabled, "strategy": _auto_strategy_name,
             "max_instances": config.AUTO_MAX_INSTANCES,
-            "instances": auto_engine.instances(),
-            "proposals": auto_engine.proposals()}
+            "instances": _auto_instances(), "proposals": []}
+
+
+class AutoAdoptRequest(BaseModel):
+    symbol: str
+    lot_id: str
+    initial_risk_usd: float = 0
+
+
+@app.post("/api/auto/adopt")
+async def api_auto_adopt(req: AutoAdoptRequest,
+                         trader: str = Depends(require_trader)) -> dict:
+    """把已成交手动仓作为金字塔首仓接管。"""
+    global _auto_enabled, _auto_strategy_name
+    symbol = req.symbol.strip().upper()
+    if ":" not in symbol:
+        match = [s for s in config.WATCHLIST if s.split(":")[-1] == symbol]
+        if match:
+            symbol = match[0]
+    lot = next((r for r in order_mgr.list_lots(active_only=True)
+                if r["lot_id"] == req.lot_id and r["symbol"] == symbol), None)
+    if lot is None:
+        raise HTTPException(404, "未找到该股票的 ACTIVE 手动仓")
+    existing = auto_engine._instances.get(symbol)
+    risk = (req.initial_risk_usd
+            or (existing.initial_risk_usd if existing else 0)
+            or config.RISK_PER_TRADE_USD)
+    e9 = ((collector.latest() or {}).get(symbol) or {}).get("e9") or {}
+    try:
+        inst = await auto_engine.adopt_seed(symbol, lot, risk, e9, enabled=True)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    _auto_enabled = True
+    _auto_strategy_name = "ema9_pyramid"
+    record_event("auto_manual_adopted", symbol=symbol, lot_id=req.lot_id,
+                 initial_risk_usd=risk)
+    return {"ok": True, "instance": inst.view()}
+
+
+@app.post("/api/auto/instances/{symbol}/stop")
+async def api_auto_instance_stop(symbol: str, close_positions: bool = False,
+                                 trader: str = Depends(require_trader)) -> dict:
+    """单票停止加仓，或仅整组平仓该股票。"""
+    symbol = symbol.strip().upper()
+    if ":" not in symbol:
+        match = [s for s in config.WATCHLIST if s.split(":")[-1] == symbol]
+        if match:
+            symbol = match[0]
+    inst = auto_engine._instances.get(symbol)
+    if inst is None:
+        raise HTTPException(404, "策略实例不存在")
+    auto_engine.stop_symbol(symbol, close_position=close_positions)
+    if close_positions:
+        ref = (((collector.latest() or {}).get(symbol) or {})
+               .get("bar") or {}).get("close") or 0
+        await auto_engine._stop_close(inst, ref, "manual_stop")
+    record_event("auto_instance_stop", symbol=symbol,
+                 close_positions=close_positions)
+    return {"ok": True, "symbol": symbol, "close_positions": close_positions}
 
 
 @app.post("/api/auto/proposals/{proposal_id}/approve")
 async def api_auto_proposal_approve(
         proposal_id: str,
         trader: str = Depends(require_trader)) -> dict:
-    """批准服务端保存的开仓候选，价格与方向不接受浏览器覆盖。"""
-    if not _auto_enabled:
-        raise HTTPException(409, "策略已停止，候选不可批准")
-    proposal = next((p for p in auto_engine.proposals()
-                     if p["proposal_id"] == proposal_id), None)
-    if proposal is None:
-        raise HTTPException(404, "候选不存在或已处理")
-    symbol = proposal["symbol"]
-    bar_c = ((collector.latest() or {}).get(symbol, {})
-             .get("bar_c") or {})
-    result, error = await auto_engine.approve_entry(proposal_id, bar_c=bar_c)
-    if error:
-        raise HTTPException(409, error)
-    return {"ok": True, **result}
+    raise HTTPException(410, "EMA9 金字塔为全自动策略，无人工候选")
 
 
 class AutoRejectRequest(BaseModel):
@@ -3520,12 +4332,7 @@ async def api_auto_proposal_reject(
         proposal_id: str,
         req: Optional[AutoRejectRequest] = None,
         trader: str = Depends(require_trader)) -> dict:
-    """忽略开仓候选，同一 bar 不重复提醒。"""
-    result, error = await auto_engine.reject_entry(
-        proposal_id, reason=(req.reason if req else ""))
-    if error:
-        raise HTTPException(409, error)
-    return {"ok": True, **result}
+    raise HTTPException(410, "EMA9 金字塔为全自动策略，无人工候选")
 
 
 # ---------------------------------------------------------------------------
@@ -3540,7 +4347,7 @@ _bt_session: Optional[BacktestSession] = None
 class BtLoadRequest(BaseModel):
     symbol: str = Field(..., description="如 NVDA / NASDAQ:NVDA")
     day: str = ""                     # YYYY-MM-DD，默认上个交易日
-    strategy: str = "trend_pullback"
+    strategy: str = "ema9_pyramid"
     params: dict = Field(default_factory=dict)
     bars: int = 500
 
@@ -3691,6 +4498,65 @@ async def api_performance() -> dict:
         "by_side": _group("side"),
         "by_symbol": _group("symbol"),
         "records": closed,
+    }
+
+
+@app.get("/api/returns/compare")
+async def api_returns_compare(start: str = "", end: str = "") -> dict:
+    """按日期范围对比账户已实现日收益与 QQQ 收盘收益。"""
+    from datetime import datetime as _dt
+    from engine import returns_comparison as rc
+
+    try:
+        start_day, end_day = rc.parse_range(start, end)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    logs_dir = Path(__file__).resolve().parent.parent / "logs"
+    daily_pnl, anchors = await asyncio.to_thread(rc.load_account_daily, logs_dir)
+
+    status = await get_status_cached()
+    now_et = _dt.now(rc.ET)
+    equity = status.get("equity")
+    today_pnl = status.get("daily_pnl")
+    if (gateway._daily_pnl_session_active(now_et)
+            and isinstance(equity, (int, float))
+            and isinstance(today_pnl, (int, float))):
+        sod_equity = equity - today_pnl
+        if sod_equity > 0:
+            today = now_et.date().isoformat()
+            anchors[today] = sod_equity
+            await asyncio.to_thread(rc.save_equity_anchor, logs_dir, today, sod_equity)
+
+    qqq_closes, fetched_at = await asyncio.to_thread(rc.load_qqq_daily, logs_dir)
+    needs_fetch = (not qqq_closes or time.time() - fetched_at > 6 * 3600
+                   or min(qqq_closes) > start_day.isoformat())
+    warnings = []
+    if needs_fetch:
+        try:
+            bars = await rc.fetch_qqq_daily(
+                Path(__file__).resolve().parent.parent,
+                (end_day - start_day).days + 30)
+            await asyncio.to_thread(rc.save_qqq_daily, logs_dir, bars)
+            for row in bars:
+                day = _dt.fromtimestamp(row["time"], rc.ET).date().isoformat()
+                qqq_closes[day] = float(row["close"])
+        except Exception as e:
+            logger.warning("QQQ 日线刷新失败，使用本地缓存: %s", e)
+            warnings.append(f"QQQ 日线刷新失败，当前展示本地缓存：{e}")
+
+    rows, summary = rc.build_rows(start_day, end_day, daily_pnl, anchors, qqq_closes)
+    if any(row["account_estimated"] for row in rows):
+        warnings.append("部分日起始净值由最近净值锚点和平仓盈亏推算，未计入出入金及未归档交易")
+    if not qqq_closes:
+        warnings.append("暂无 QQQ 行情数据")
+    return {
+        "start": start_day.isoformat(),
+        "end": end_day.isoformat(),
+        "symbol": rc.QQQ_SYMBOL,
+        "account_basis": "realized_pnl",
+        "rows": rows,
+        "summary": summary,
+        "warnings": warnings,
     }
 
 
@@ -3944,9 +4810,15 @@ async def ws_endpoint(ws: WebSocket) -> None:
 # 静态前端
 # ---------------------------------------------------------------------------
 
+@app.get("/api/startup", include_in_schema=False)
+async def api_startup() -> dict:
+    return _startup_status()
+
+
 @app.get("/", include_in_schema=False)
 async def index() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
+    name = "index.html" if _startup_state["ready"] else "loading.html"
+    return FileResponse(STATIC_DIR / name, headers={"Cache-Control": "no-store"})
 
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -3954,7 +4826,10 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 @app.middleware("http")
 async def _no_cache_static(request, call_next):
-    """静态文件禁止缓存，避免前端改动后浏览器仍用旧版本。"""
+    """静态文件禁缓存；系统关闭期间拒绝一切新的写请求。"""
+    if (_system_stopping and request.method not in ("GET", "HEAD", "OPTIONS")
+            and request.url.path != "/api/system/shutdown"):
+        return JSONResponse({"detail": "系统正在关闭，已停止交易控制"}, status_code=503)
     response = await call_next(request)
     if request.url.path.startswith("/static"):
         response.headers["Cache-Control"] = "no-cache"
@@ -3970,6 +4845,9 @@ import datetime as _dt
 from zoneinfo import ZoneInfo as _ZoneInfo
 
 _ZI_ET = _ZoneInfo("America/New_York")
+
+from engine.live_news import LiveNewsService
+_live_news = LiveNewsService()
 
 _news_task: Optional[asyncio.Task] = None
 _news_cache: dict = {}              # ET 日期串(YYYYMMDD) -> payload（含落盘文件懒加载）
@@ -3993,11 +4871,12 @@ def _news_today() -> Optional[dict]:
 
 
 def _news_status() -> dict:
-    """快照 status.news 小摘要：徽标联动只需要 hot 的 ticker→gist。"""
+    """盘前热点 + 新浪实时快讯标签状态（实时部分只读内存缓存）。"""
+    live = _live_news.status()
     p = _news_today()
     if not p:
         return {"generated_at": None, "theme_count": 0, "hot_count": 0,
-                "hot": {}}
+                "hot": {}, **live}
     summary = p.get("summary") or {}
     hot = {k: (v.get("gist") or "") if isinstance(v, dict) else ""
            for k, v in (summary.get("hot_symbols") or {}).items()}
@@ -4005,7 +4884,8 @@ def _news_status() -> dict:
     return {"generated_at": p.get("generated_at"),
             "generated_at_et": p.get("generated_at_et"),
             "theme_count": len(themes), "hot_count": len(hot),
-            "hot": hot, "degraded": summary == {} and not p.get("summary")}
+            "hot": hot, "degraded": summary == {} and not p.get("summary"),
+            **live}
 
 
 async def _news_generate(reason: str) -> Optional[dict]:
@@ -4058,12 +4938,22 @@ async def _news_loop() -> None:
 async def _news_startup() -> None:
     global _news_task
     _news_task = asyncio.create_task(_news_loop())
+    await _live_news.start()
 
 
 @app.on_event("shutdown")
 async def _news_shutdown() -> None:
     if _news_task:
         _news_task.cancel()
+    await _live_news.stop()
+
+
+@app.get("/api/news/live")
+async def api_live_news(ticker: str, minutes: int = 15) -> dict:
+    """新浪 7×24 个股快讯，默认最近 15 分钟。"""
+    if not ticker.strip():
+        raise HTTPException(400, "ticker 不能为空")
+    return _live_news.news(ticker, minutes=minutes)
 
 
 @app.get("/api/news")

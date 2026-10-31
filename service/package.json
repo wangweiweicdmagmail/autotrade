@@ -8,6 +8,6 @@
     "collect": "node tv_cloud.js"
   },
   "dependencies": {
-    "@mathieuc/tradingview": "^3.0.1"
+    "@mathieuc/tradingview": "3.5.2"
   }
 }

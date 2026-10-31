@@ -289,6 +289,39 @@ dry-run 下仍会连接 TWS（只读：持仓、净值），连接失败仅告�
 
 ### 云端数据线
 
+**故障速查（数据通道是本项目命脉，先跑诊断再动手）**：
+
+1. `python3 service/tv_diag.py` —— 一键分层诊断（凭据文件 → 凭据有效性 →
+   正文提取 → WS 端到端真实采集 → 运行态就绪率），哪层失败直接给修复命令。
+2. 分层修复速查：凭据失效 → `python3 service/dump_creds.py`（需 TV Chrome
+   登录态）；正文失效 → 主路径 pine_text.js 每次启动自动取最新，备用
+   `python3 service/refresh_pine_texts.py`；疑似 TV 再改协议 → 先查上游
+   <https://github.com/Mathieu2301/Tradingview-API/issues>，再用
+   `python3 service/sniff_tv_ws.py` 抓浏览器真实包逐字段对比（浏览器永远是对的）。
+3. 运行期监控：console 健康巡检每 5s 检查 study 通道（错误风暴 >20 条/60s
+   或 ts_c 就绪率 <50% 持续 120s）→ critical 告警 + iMessage（配置收件人后
+   手机直达）+ 快照 `status.tv_study`；恢复自动解除。data_stale 只管 K线，
+   tv_study_dead 管指标，两者互补。
+4. 依赖纪律：`@mathieuc/tradingview` 锁死 3.5.2（exact pin）；升级前先在
+   测试目录验证 `node service/tv_cloud.js --symbols NASDAQ:QQQ` 四指标出数。
+
+- **TV 服务端协议变更（2026-10-27）**：`create_study` 必须携带脚本加密正文
+  `text` 字段；translate 端点不再返回 `result.ilTemplate`（正文挪到
+  `metaInfo.inputs` 里 `id="text"` 的 defval，见上游 TradingView-API
+  issue #354），否则**所有** study（含内置、匿名连接）报 `Can't parse pine`。
+  旧长连接被豁免（当日 12:48 起的进程正常到被杀）。
+  **最终修复（service/pine_text.js，零 node_modules 补丁）**：加载指标时
+  自抓 translate 提取 text defval，用库导出的 `TradingView.PineIndicator`
+  重建实例注入——每次启动都拿最新正文，TV 重新登录密钥轮换也不怕；
+  提取失败仅回退**同版本** `pine_texts.json` 缓存；版本错配明确报错，禁止旧正文拼新
+  元数据。tv_cloud.js / tv_cloud_daemon.js 统一走 `loadIndicatorWithText()`。
+  `python3 service/refresh_pine_texts.py` 是一键刷新工具：translate 无正文时自动
+  抓官方 create_study 帧，校验 pineId/pineVersion，原子更新缓存并做真实订阅验证，
+  失败自动回滚；加 `--restart` 会在验证后重启实盘并检查 attack 53/53。
+  daemon 中 attack 为可选增强：加载失败只降级区间数据，不影响核心行情；
+  attack 无值只聚合告警，不再销毁重建整个 chart。依赖锁死 `@mathieuc/tradingview@3.5.2`
+  （package.json exact pin；v4 是 ESM 破坏性重写，移植版存于
+  service/tv_cloud_daemon_v4_port.js 备用，未启用）。
 - **凭据**：`service/creds.json` 内含 sessionid/sessionid_sign，从 CDP 提取
   （`window.user.auth_token` JWT 或 sessionid cookie）。提取脚本
   `/tmp/dump_creds.py`。sessionid 有效期未知，过期需重新提取。

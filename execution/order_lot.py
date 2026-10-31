@@ -174,6 +174,8 @@ class OrderManager:
         self.on_lot_revived = None     # 对账复活回调 fn(lot_dict)，由上层（console）注入
         # 价格提供者（console 注入 TV 现价；None 时回退 gateway.last_price）
         self.price_provider = None
+        # 行情健康提供者（console 注入；回测/离线测试可为 None）
+        self.market_health = None
         self._load()
 
     async def _ref_px(self, symbol: str) -> Optional[float]:
@@ -281,6 +283,16 @@ class OrderManager:
         side = side.strip().lower()
         if side not in ("long", "short"):
             return None, f"方向非法: {side}（应为 long / short）"
+        if self.market_health is not None:
+            try:
+                health = self.market_health()
+            except Exception as e:
+                logger.error("行情健康检查失败，拒绝开仓 %s %s: %s", symbol, side, e)
+                return None, "行情健康检查失败，禁止新开仓；人工平仓/撤单不受影响"
+            if not health.get("trade_allowed", False):
+                reason = health.get("reason") or "unknown"
+                logger.warning("🚫 行情陈旧，拒绝开仓 %s %s: %s", symbol, side, reason)
+                return None, f"行情数据陈旧（{reason}），禁止新开仓；请等待数据恢复"
         # 延迟行情标的黑名单：无 IBKR 实时行情订阅（10089），拒绝交易
         ticker = symbol.split(":")[-1].upper()
         if ticker in config.TRADE_BLOCKLIST:
@@ -1733,6 +1745,18 @@ class OrderManager:
 
     def get(self, lot_id: str) -> Optional[OrderLot]:
         return self._lots.get(lot_id)
+
+    def mark_pyramid_seed(self, lot_id: str, risk_dist: float,
+                          initial_risk_usd: float) -> None:
+        lot = self._lots.get(lot_id)
+        if lot is None:
+            return
+        lot.signal_snapshot = {**lot.signal_snapshot,
+                               "pyramid_seed": True,
+                               "entry_risk_dist": float(risk_dist),
+                               "initial_risk_usd": float(initial_risk_usd),
+                               "entry_index": 1}
+        self._save()
 
     async def reprice_midpoint_lot(self, lot_id: str, new_limit: float,
                                    new_stop: float, bar_time: float,
