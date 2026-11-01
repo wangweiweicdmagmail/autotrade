@@ -96,12 +96,12 @@ def test_live_news_api_and_snapshot_status(console_app, monkeypatch):
             assert ticker == "MSFT" and minutes == 15
             return {"ticker": ticker, "minutes": minutes, "items": [], "count": 0}
 
-    monkeypatch.setattr(app, "_live_news", FakeService())
-    monkeypatch.setattr(app, "_news_today", lambda: None)
-    status = app._news_status()
+    monkeypatch.setattr(app.news, "_live_news", FakeService())
+    monkeypatch.setattr(app.news, "_news_today", lambda: None)
+    status = app.news._news_status()
     assert status["live_tickers"] == ["MSFT"]
     assert status["live_updated_at"] == 123.0
-    payload = run(app.api_live_news("MSFT"))
+    payload = run(app.news.api_live_news("MSFT"))
     assert payload["ticker"] == "MSFT" and payload["count"] == 0
 
 

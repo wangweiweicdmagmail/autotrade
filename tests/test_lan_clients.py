@@ -16,7 +16,7 @@ from .conftest import run
 
 @pytest.fixture
 def app(console_app, monkeypatch):
-    monkeypatch.setattr(console_app, "_clients", {"tokens": {}})
+    monkeypatch.setattr(console_app.clients, "_clients", {"tokens": {}})
     return console_app
 
 
@@ -71,11 +71,11 @@ def test_register_approve_flow(app, clients, tmp_path):
     assert r.json()["approved"] is True
 
     # 落盘结构 + 模拟重启加载保持有效
-    saved = json.loads(app._CLIENTS_PATH.read_text(encoding="utf-8"))
+    saved = json.loads(app.clients._CLIENTS_PATH.read_text(encoding="utf-8"))
     assert saved["tokens"][tok]["approved"] is True
     assert saved["tokens"][tok]["approved_at"] > 0
-    app._clients.clear()
-    app._clients.update(app._load_clients())
+    app.clients._clients.clear()
+    app.clients._clients.update(app.clients._load_clients())
     r = remote.post("/api/lots/lot-x/cancel", headers={"X-Trader-Token": tok})
     assert r.status_code == 400   # 400=业务错误非 403，token 仍有效
 
@@ -108,7 +108,7 @@ def test_snapshot_clients_section(app, clients):
     local, remote = clients
     tok = remote.post("/api/clients/register", json={"name": "alice"}).json()["token"]
     local.post(f"/api/clients/{tok}/approve")
-    snap = run(app.build_snapshot())
+    snap = run(app.snapshot.build_snapshot())
     c = snap["clients"]
     assert any(x["name"] == "alice" and len(x["token_prefix"]) == 6
                for x in c["approved"])

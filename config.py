@@ -283,6 +283,10 @@ EXTERNAL_ORDER_CLEANUP_ENABLED = _os.environ.get("EXTERNAL_ORDER_CLEANUP_ENABLED
 
 # 全自动策略：单引擎并行实例上限（理论无上限，实际最多 5 个）
 AUTO_MAX_INSTANCES = 5
+# 金字塔策略的加仓解锁与自动保本独立设置；运行时可在控制台修改并持久化
+PYRAMID_AUTO_BREAKEVEN = True
+PYRAMID_BREAKEVEN_R = 3.0
+PYRAMID_ADD_UNLOCK_R = 2.0
 
 # 未快速突破提醒：开仓后超过该秒数仍未保本 → 语音提醒「是否减仓」（默认 15 分钟）
 SLOW_BREAK_SECONDS = 900

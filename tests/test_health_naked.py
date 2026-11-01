@@ -95,18 +95,18 @@ def test_tws_disconnect_and_recovery(app, monkeypatch):
     async def go():
         gw = FakeGateway(connected=False)
         monkeypatch.setattr(app, "gateway", gw)
-        monkeypatch.setattr(app, "_is_trading_hours", lambda: False)
+        monkeypatch.setattr(app.system, "_is_trading_hours", lambda: False)
         # 首轮：基线，不报
-        r = await app._health_check_once(None)
+        r = await app.monitoring._health_check_once(None)
         assert r is False and not app.notifier.is_active("tws_down")
         # 断线跳变
-        r = await app._health_check_once(True)
+        r = await app.monitoring._health_check_once(True)
         assert app.notifier.is_active("tws_down")
         a = next(x for x in app.notifier.active_alerts() if x["key"] == "tws_down")
         assert a["level"] == "critical" and "7496" in a["msg"]
         # 恢复
         gw._connected = True
-        r = await app._health_check_once(False)
+        r = await app.monitoring._health_check_once(False)
         assert r is True and not app.notifier.is_active("tws_down")
     run(go())
 
@@ -126,7 +126,7 @@ def test_data_stale_trading_hours(app, monkeypatch):
         monkeypatch.setattr(app.collector, "latest_bar_time", now - 700)
         monkeypatch.setattr(app.collector, "_last_update", now - 700)
         monkeypatch.setattr(app.collector, "_last_content_update", now - 700)
-        await app._health_check_once(True)
+        await app.monitoring._health_check_once(True)
         assert app.notifier.is_active("data_stale")
         a = next(x for x in app.notifier.active_alerts()
                  if x["key"] == "data_stale")
@@ -135,7 +135,7 @@ def test_data_stale_trading_hours(app, monkeypatch):
         monkeypatch.setattr(app.collector, "latest_bar_time", now)
         monkeypatch.setattr(app.collector, "_last_update", now)
         monkeypatch.setattr(app.collector, "_last_content_update", now)
-        await app._health_check_once(True)
+        await app.monitoring._health_check_once(True)
         assert not app.notifier.is_active("data_stale")
     run(go())
 
@@ -147,13 +147,13 @@ def test_data_stale_silent_off_hours_and_weekend(app, monkeypatch):
         monkeypatch.setattr(app, "gateway", FakeGateway(connected=True))
         monkeypatch.setattr(app.collector, "latest_bar_time", _t.time() - 7000)
         monkeypatch.setattr(app.collector, "_is_trading_hours", lambda: False)
-        await app._health_check_once(True)
+        await app.monitoring._health_check_once(True)
         assert not app.notifier.is_active("data_stale")
         # 活跃中的告警进入非交易时段 → 静默摘除（无恢复通知）
         app.notifier._active["data_stale"] = {
             "key": "data_stale", "level": "warning", "title": "行情数据陈旧",
             "msg": "x", "since": _t.time()}
-        await app._health_check_once(True)
+        await app.monitoring._health_check_once(True)
         assert not app.notifier.is_active("data_stale")
     run(go())
 
@@ -168,7 +168,7 @@ def test_naked_alive_noop(app, monkeypatch):
         lot = FakeLot(alive=True)
         monkeypatch.setattr(app, "gateway", FakeGateway())
         monkeypatch.setattr(app, "order_mgr", FakeOrderMgr([lot]))
-        await app._naked_position_check_once({})
+        await app.monitoring._naked_position_check_once({})
         assert not app.notifier.active_alerts()
         assert app.order_mgr.restore_calls == []
     run(go())
@@ -181,13 +181,13 @@ def test_naked_missing_autorestore_recovers(app, monkeypatch):
         monkeypatch.setattr(app, "gateway", FakeGateway())
         monkeypatch.setattr(app, "order_mgr", FakeOrderMgr([lot], restore_ok=True))
         fails = {}
-        await app._naked_position_check_once(fails)
+        await app.monitoring._naked_position_check_once(fails)
         key = f"naked:{lot.lot_id}"
         assert app.order_mgr.restore_calls == [lot.lot_id]
         assert not app.notifier.is_active(key)   # 已恢复
         assert fails == {}
         # 补挂后下一拍存活 → 完全静默
-        await app._naked_position_check_once(fails)
+        await app.monitoring._naked_position_check_once(fails)
         assert not app.notifier.active_alerts()
     run(go())
 
@@ -199,12 +199,12 @@ def test_naked_restore_fail_3x_escalates_market_close(app, monkeypatch):
         lot = FakeLot(alive=False)
         monkeypatch.setattr(app, "gateway", FakeGateway())
         monkeypatch.setattr(app, "order_mgr", FakeOrderMgr([lot], restore_ok=False))
-        monkeypatch.setattr(app, "_tv_last_price", lambda s: 101.0)
+        monkeypatch.setattr(app.accounts, "_tv_last_price", lambda s: 101.0)
         fails = {}
         for _ in range(2):
-            await app._naked_position_check_once(fails)
+            await app.monitoring._naked_position_check_once(fails)
             assert app.order_mgr.close_calls == []   # 前两次只补挂不平仓
-        await app._naked_position_check_once(fails)  # 第 3 次 → 升级
+        await app.monitoring._naked_position_check_once(fails)  # 第 3 次 → 升级
         assert app.order_mgr.close_calls == [(lot.lot_id, 101.0, "naked_guard")]
         keys = {a["key"] for a in app.notifier.active_alerts()}
         assert f"naked:{lot.lot_id}:force_closed" in keys
@@ -222,7 +222,7 @@ def test_naked_snapshot_incomplete_skips(app, monkeypatch):
         gw._trades = None   # 快照不完整
         monkeypatch.setattr(app, "gateway", gw)
         monkeypatch.setattr(app, "order_mgr", FakeOrderMgr([lot]))
-        await app._naked_position_check_once({})
+        await app.monitoring._naked_position_check_once({})
         assert not app.notifier.active_alerts()
         assert app.order_mgr.restore_calls == []
     run(go())
@@ -235,7 +235,7 @@ def test_naked_skipped_when_disconnected_or_dry_run(app, monkeypatch):
         monkeypatch.setattr(app, "order_mgr", FakeOrderMgr([lot]))
         for gw in (FakeGateway(connected=False), FakeGateway(enabled=False)):
             monkeypatch.setattr(app, "gateway", gw)
-            await app._naked_position_check_once({})
+            await app.monitoring._naked_position_check_once({})
         assert not app.notifier.active_alerts()
         assert app.order_mgr.restore_calls == []
     run(go())
@@ -251,7 +251,7 @@ def test_naked_alive_via_snapshot_handle_lost(app, monkeypatch):
         monkeypatch.setattr(app, "gateway",
                             FakeGateway(trades={lot.trail_order_id: alive_trade}))
         monkeypatch.setattr(app, "order_mgr", FakeOrderMgr([lot]))
-        await app._naked_position_check_once({})
+        await app.monitoring._naked_position_check_once({})
         assert not app.notifier.active_alerts()
         assert app.order_mgr.restore_calls == []
     run(go())

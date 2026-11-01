@@ -1,0 +1,160 @@
+"""snapshot application functions and owned state. No console.app dependency."""
+
+from fastapi import WebSocket
+from fastapi import WebSocketDisconnect
+import asyncio
+import config
+import time
+from console.shared import logger
+
+
+class SnapshotService:
+    def __init__(self, context):
+        self.context = context
+
+    async def build_snapshot(self) -> dict:
+        status = await self.context.accounts.get_status_cached()
+        open_symbols = len(
+            {l["symbol"] for l in self.context.order_mgr.list_lots(active_only=True)}
+        )
+        return {
+            "type": "snapshot",
+            "ts": time.time(),
+            "status": {
+                "execution_enabled": bool(self.context.gateway.enabled),
+                "connected": bool(self.context.gateway._connected),
+                "dry_run": not bool(self.context.gateway.enabled),
+                "equity": status["equity"],
+                "daily_pnl": status["daily_pnl"],
+                "halted": self.context.risk_gate.is_halted(),
+                "open_symbols": open_symbols,
+                "total_risk_usd": self.context.order_mgr.risk_exposure()["total"],
+                "max_total_risk_usd": config.RISK_MAX_TOTAL_RISK_USD,
+                "total_position_pct": self.context.accounts._total_position_pct(
+                    status["equity"]
+                ),
+                "max_order_qty": config.RISK_MAX_ORDER_QTY,
+                "allow_short": config.ALLOW_SHORT,
+                "fvg_chase_max_ratio": config.FVG_CHASE_MAX_ATR_RATIO,
+                "stop_atr_mult": self.context.settings._stop_atr_mult(),
+                "pyramid_auto_breakeven": self.context.settings._pyramid_auto_breakeven(),
+                "pyramid_breakeven_r": self.context.settings._pyramid_breakeven_r(),
+                "pyramid_add_unlock_r": self.context.settings._pyramid_add_unlock_r(),
+                "screen_premarket_filter": self.context.settings._screen_premarket_filter(),
+                "fvg_premarket_filter": self.context.settings._fvg_premarket_filter(),
+                "news": self.context.news._news_status(),
+                "imessage_recipient": str(
+                    self.context.settings._settings.get("imessage_recipient") or ""
+                ),
+                "market_age": None
+                if self.context.collector._last_content_update == 0
+                else round(self.context.collector.age(), 1),
+                "market_transport_age": self.context.collector.data_health()[
+                    "transport_age"
+                ],
+                "market_bar_age": self.context.collector.data_health()["bar_age"],
+                "market_stale": self.context.collector.data_health()["stale"],
+                "market_stale_reason": self.context.collector.data_health()["reason"],
+                "market_running": self.context.collector.running,
+                "data_time": self.context.collector.latest_bar_time,
+                "server_time": time.time(),
+                "ibkr_time": self.context.gateway.ibkr_time,
+                "bar_update_delay": self.context.collector.bar_update_delay,
+                "tv_study": self.context.collector.study_health(),
+                "tv_view": self.context.desktop._tv_view_info,
+            },
+            "market": self.context.collector.latest(),
+            "positions": self.context.order_mgr.aggregate(),
+            "lots": self.context.order_mgr.list_lots(),
+            "logs": list(self.context.events._log_buffer),
+            "screen": self.context.signals.compute_screen(),
+            "scan_alerts": sorted(
+                self.context.monitoring._scan_alerts.values(),
+                key=lambda x: x.get("scanned_at", 0),
+                reverse=True,
+            ),
+            "stop_alerts": sorted(
+                self.context.monitoring._stop_alerts.values(),
+                key=lambda x: x.get("checked_at", 0),
+                reverse=True,
+            ),
+            "external_alerts": list(self.context.monitoring._external_alerts),
+            "slow_break_alerts": sorted(
+                self.context.monitoring._slow_break_alerts.values(),
+                key=lambda x: x.get("alerted_at", 0),
+                reverse=True,
+            ),
+            "auto_close_notices": sorted(
+                self.context.monitoring._auto_close_notices.values(),
+                key=lambda x: x.get("closed_at", 0),
+                reverse=True,
+            ),
+            "auto_notices": sorted(
+                self.context.automatic._auto_notices.values(),
+                key=lambda x: (x.get("ts", 0), x.get("id", "")),
+                reverse=True,
+            ),
+            "fvg_reverse_alerts": sorted(
+                self.context.monitoring._fvg_reverse_alerts.values(),
+                key=lambda x: x.get("alerted_at", 0),
+                reverse=True,
+            ),
+            "fvg_reverse_notices": sorted(
+                self.context.monitoring._fvg_reverse_notices.values(),
+                key=lambda x: x.get("closed_at", 0),
+                reverse=True,
+            ),
+            "shadow": {
+                "stats": self.context.shadow_tracker.stats(),
+                "events": self.context.shadow_tracker.events(100),
+            },
+            "fvg_monitor": self.context.signals._fvg_monitor_snapshot(),
+            "breakout_signals": list(self.context.signals._breakout_signals),
+            "alerts": self.context.notifier.active_alerts(),
+            "auto": {
+                "enabled": self.context.automatic._auto_enabled,
+                "strategy": self.context.automatic._auto_strategy_name,
+                "models": self.context.auto_service.registry.describe(),
+                "instances": self.context.automatic._auto_instances(),
+                "proposals": [],
+            },
+            "clients": self.context.clients._clients_snapshot(),
+            "copy": self.context.copy._copy_snapshot(),
+        }
+
+    async def _broadcast_loop(self) -> None:
+        """每 1s 广播一次快照（含 TV 实时数据）。"""
+        while True:
+            try:
+                self.context.accounts._refresh_marks_from_tv()
+                snapshot = await self.context.snapshot.build_snapshot()
+                dead = []
+                for ws in list(self.context.snapshot._ws_clients):
+                    try:
+                        await ws.send_json(snapshot)
+                    except Exception:
+                        dead.append(ws)
+                for ws in dead:
+                    self.context.snapshot._ws_clients.discard(ws)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.exception("广播循环异常: %s", e)
+            await asyncio.sleep(1.0)
+
+    async def api_status(self) -> dict:
+        return (await self.context.snapshot.build_snapshot())["status"]
+
+    async def ws_endpoint(self, ws: WebSocket) -> None:
+        await ws.accept()
+        self.context.snapshot._ws_clients.add(ws)
+        try:
+            await ws.send_json(await self.context.snapshot.build_snapshot())
+            while True:
+                await ws.receive_text()
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            pass
+        finally:
+            self.context.snapshot._ws_clients.discard(ws)

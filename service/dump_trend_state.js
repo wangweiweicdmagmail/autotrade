@@ -34,7 +34,8 @@ const { loadIndicatorWithText } = require('./pine_text.js');
 const TREND_STATE_ID = 'USER;e577100fe79942b4830783d1ceaad535';
 const FVG_ID = 'USER;5ec7d04179b3429ca9286db452352d85';
 const SMART_STOP_ID = 'USER;ca26e3ab587841e2adb38cfbfd0bec41';
-const EMA9_AUTO_ID = 'USER;a17a52ae5b6642e0a3ddbba23edc9ff3';
+const { loadPineModels, outputFromPeriod } = require('./pine_models.js');
+const PINE_MODELS = loadPineModels();
 
 function parseArgs(argv) {
   const args = {
@@ -119,7 +120,9 @@ async function main() {
   const indic = await loadIndicatorWithText(TradingView, TREND_STATE_ID, creds);
   const fvgIndic = await loadIndicatorWithText(TradingView, FVG_ID, creds);
   const ssIndic = await loadIndicatorWithText(TradingView, SMART_STOP_ID, creds);
-  const e9Indic = await loadIndicatorWithText(TradingView, EMA9_AUTO_ID, creds);
+  const modelIndicators = await Promise.all(PINE_MODELS.map(async model => ({
+    model, indicator: await loadIndicatorWithText(TradingView, model.indicator_id, creds),
+  })));
   const client = new TradingView.Client({
     token: creds.sessionid,
     signature: creds.sessionid_sign,
@@ -138,7 +141,7 @@ async function main() {
     const study = new chart.Study(indic);
     const fvgStudy = new chart.Study(fvgIndic);
     const ssStudy = new chart.Study(ssIndic);
-    const e9Study = new chart.Study(e9Indic);
+    const modelStudies = modelIndicators.map(({ model, indicator }) => ({ model, study: new chart.Study(indicator) }));
     let done = false;
     const finish = () => {
       if (done) return;
@@ -146,13 +149,13 @@ async function main() {
       const tss = study.periods;
       const fss = fvgStudy.periods;
       const sss = ssStudy.periods;
-      const e9s = e9Study.periods;
+      const modelPeriods = modelStudies.map(({ model, study }) => ({ model, periods: study.periods }));
       if (!bars || !bars.length || !tss || !tss.length || !fss || !fss.length
-          || !sss || !sss.length || !e9s || !e9s.length) return;
+          || !sss || !sss.length || modelPeriods.some(({ periods }) => !periods || !periods.length)) return;
       done = true;
       // periods 均为倒序（[0] 最新），按索引对齐后转正序
       const rows = [];
-      const n = Math.min(bars.length, tss.length, fss.length, sss.length, e9s.length);
+      const n = Math.min(bars.length, tss.length, fss.length, sss.length, ...modelPeriods.map(({ periods }) => periods.length));
       for (let i = n - 1; i >= 0; i--) {
         const b = bars[i];
         rows.push({
@@ -161,13 +164,9 @@ async function main() {
           ts: Object.assign(tsFromPeriod(tss[i]), ssFromPeriod(sss[i]),
                             { ema_9: emaFromPeriods(bars, i, 9) }),
           fvg: fvgFromPeriod(fss[i], fss, i),
-          e9: {
-            time: e9s[i].$time, direction: finite(e9s[i].Direction),
-            atr: finite(e9s[i].ATR), touch: finite(e9s[i].Touch_EMA9),
-            ema_9: finite(e9s[i].EMA_9),
-            long_stop: finite(e9s[i].Long_Stop),
-            short_stop: finite(e9s[i].Short_Stop),
-          },
+          ...Object.fromEntries(modelPeriods.map(({ model, periods }) => [
+            model.realtime_key, outputFromPeriod(model, periods[i]),
+          ])),
         });
       }
       result[symbol] = rows;
@@ -186,7 +185,7 @@ async function main() {
     study.onUpdate(() => setTimeout(finish, 500));   // 等 chart/study 都就绪
     fvgStudy.onUpdate(() => setTimeout(finish, 500));
     ssStudy.onUpdate(() => setTimeout(finish, 500));
-    e9Study.onUpdate(() => setTimeout(finish, 500));
+    for (const { study } of modelStudies) study.onUpdate(() => setTimeout(finish, 500));
     chart.onUpdate(() => setTimeout(finish, 500));
     chart.onError((...e) => {
       console.error(`[${symbol}] err:`, JSON.stringify(e).slice(0, 200));

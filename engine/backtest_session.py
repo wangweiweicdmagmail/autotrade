@@ -5,8 +5,10 @@ from typing import List, Optional
 from zoneinfo import ZoneInfo
 
 import config
-from engine.auto_engine import ACTIVE, DONE, PENDING, SimBroker
-from engine.pyramid_engine import PyramidEngine
+from engine.states import ACTIVE, DONE, PENDING
+from engine.brokers import SimBroker
+from engine.pine_execution import PineExecutionEngine
+from engine.pine_models import PineModelRegistry
 
 ET = ZoneInfo("America/New_York")
 
@@ -17,21 +19,31 @@ def _hm(ts: float) -> str:
 
 class BacktestSession:
     def __init__(self, rows: list, symbol: str, day: str,
-                 strategy_name: str, params: dict) -> None:
-        if strategy_name != "ema9_pyramid":
-            raise ValueError("回测策略仅支持 ema9_pyramid")
+                 strategy_name: str, params: dict, *, registry=None) -> None:
+        self.model = (registry or PineModelRegistry.load()).get(strategy_name)
         self.symbol = symbol
         self.day = day
         self.strategy_name = strategy_name
         initial_risk = float(params.get("initial_risk_usd") or config.RISK_PER_TRADE_USD)
         if initial_risk <= 0:
             raise ValueError("首仓风险预算必须大于 0")
+        auto_breakeven = bool(params.get("pyramid_auto_breakeven",
+                                         (config.PYRAMID_AUTO_BREAKEVEN if strategy_name == "ema9_pyramid" else self.model.profile.auto_breakeven)))
+        breakeven_r = float(params.get("pyramid_breakeven_r",
+                                       config.PYRAMID_BREAKEVEN_R))
+        add_unlock_r = float(params.get("pyramid_add_unlock_r",
+                                        config.PYRAMID_ADD_UNLOCK_R))
+        if breakeven_r <= 0 or add_unlock_r <= 0:
+            raise ValueError("保本和加仓解锁 R 门槛必须大于 0")
         self.equity = float(params.get("equity") or 0)
         self.params = {
             "initial_risk_usd": initial_risk,
-            "risk_ratios": [1.0, 2.0 / 3.0, 1.0 / 3.0],
-            "max_entries": 3,
+            "risk_ratios": list(self.model.profile.risk_ratios),
+            "max_entries": len(self.model.profile.risk_ratios),
             "equity": self.equity,
+            "pyramid_auto_breakeven": auto_breakeven,
+            "pyramid_breakeven_r": breakeven_r,
+            "pyramid_add_unlock_r": add_unlock_r,
         }
         self._day_rows = []
         for row in rows:
@@ -43,10 +55,12 @@ class BacktestSession:
         self.broker = SimBroker()
         self._events: List[dict] = []
         self._bar_time_now = 0.0
-        start_direction = ((self._day_rows[0].get("e9") or {}).get("direction", 0)
-                           if self._day_rows else 0)
+        start_direction = (self.model.from_market(self._day_rows[0]).direction if self._day_rows else 0)
         self.params["start_direction"] = start_direction
-        self.engine = PyramidEngine(self.broker, emit=self._on_event)
+        self.engine = PineExecutionEngine(
+            self.broker, emit=self._on_event, model=self.model,
+            breakeven_enabled=auto_breakeven,
+            breakeven_r=breakeven_r, add_unlock_r=add_unlock_r)
         self.engine.start([symbol], initial_risk, {symbol: start_direction})
         self._done = False
         self._settled = False
@@ -88,8 +102,8 @@ class BacktestSession:
         dt = datetime.fromtimestamp(bar["time"], ET)
         hm = dt.hour * 60 + dt.minute
         await self.engine.on_price_extremes(
-            self.symbol, bar["low"], bar["high"], row.get("e9") or {}, hm)
-        await self.engine.on_bar(self.symbol, bar, row.get("e9") or {})
+            self.symbol, bar["low"], bar["high"], row.get(self.model.realtime_key) or {}, hm)
+        await self.engine.on_bar(self.symbol, bar, row.get(self.model.realtime_key) or {})
         self._prev_row = row
         if self._cursor >= self.total_bars:
             await self._settle_eod()
@@ -179,7 +193,11 @@ class BacktestSession:
                     if ev["reason"] == "第二次仓位未达到1R":
                         detail += f" · 第二仓MFE {ev['second_mfe_r']:.2f}R"
             elif etype == "pyramid_unlocked":
-                title = "2R解锁"
+                title = f"{ev['unlock_r']:g}R解锁"
+                detail = (f"MFE {ev['mfe_r']:.2f}R · {ev['qty']}股"
+                          f"@{ev['avg_cost']:.2f} · 当前止损{ev['stop_px']:.2f}")
+            elif etype == "pyramid_breakeven":
+                title = f"{ev['breakeven_r']:g}R保本"
                 detail = (f"MFE {ev['mfe_r']:.2f}R · {ev['qty']}股"
                           f"@{ev['avg_cost']:.2f} · 整组止损{ev['stop_px']:.2f}")
             elif etype == "pyramid_close_requested":
@@ -197,13 +215,13 @@ class BacktestSession:
         cur = None
         if self._prev_row is not None:
             row = self._prev_row
-            e9 = row.get("e9") or {}
+            e9 = self.model.from_market(row).execution_values()
             cur = {
                 "time": row["time"], "hm": _hm(row["time"]),
                 "open": row["open"], "high": row["high"],
                 "low": row["low"], "close": row["close"],
-                "direction": e9.get("direction"), "ema_9": e9.get("ema_9"),
-                "touch": e9.get("touch"), "atr": e9.get("atr"),
+                "direction": e9.get("direction"), "ema_9": e9.get("entry_price"), "entry_price": e9.get("entry_price"),
+                "touch": e9.get("entry_signal"), "atr": e9.get("atr"),
                 "long_stop": e9.get("long_stop"), "short_stop": e9.get("short_stop"),
             }
         management = self._timeline()

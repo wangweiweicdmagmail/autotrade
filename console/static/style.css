@@ -51,6 +51,12 @@ html, body {
 .sub { color: var(--muted); font-size: 13px; }
 .statusbar { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 7px; }
 .status-row { display: flex; align-items: center; justify-content: flex-end; gap: 10px 12px; flex-wrap: wrap; }
+@media (max-width: 900px) {
+  .topbar { flex-direction: column; gap: 8px; }
+  .statusbar { width: 100%; }
+  .status-row { justify-content: flex-start; }
+  .brand-line { white-space: normal; flex-wrap: wrap; }
+}
 .stat-item { color: var(--muted); font-size: 13px; }
 .stat-item b { color: var(--text); margin-left: 4px; }
 .risk-input { display: flex; align-items: center; gap: 6px; }
@@ -88,8 +94,12 @@ html, body {
 .order-title { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
 .order-title > span:first-child { margin-right: auto; }
 .auto-main { flex: 1; min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
-.auto-main-scroll { flex: 1; min-height: 0; overflow: auto; padding: 4px; }
+.auto-main-scroll { flex: 1; min-height: 160px; overflow: auto; padding: 4px; }
+.auto-main > .shadow-bt-form { flex-shrink: 0; }
 .auto-instance-group { margin-bottom: 6px; }
+.auto-meta { display: block; margin-top: 3px; font-size: 11px; line-height: 1.4; color: var(--muted); font-weight: 400; overflow-wrap: anywhere; }
+.auto-risk-strip { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: -5px 0 6px; padding: 6px 10px; background: var(--bg); border: 1px solid var(--panel-border); border-top: 0; border-radius: 0 0 6px 6px; color: var(--muted); font-size: 12px; }
+.auto-recovery-warning { color: #e6a23c; border-color: #e6a23c55; }
 .auto-order-detail { margin: -4px 0 6px; padding: 6px; background: var(--bg); border: 1px solid var(--panel-border); border-top: 0; border-radius: 0 0 6px 6px; }
 .auto-order-head { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; }
 .auto-order-row { display: grid; grid-template-columns: .8fr .75fr .5fr .75fr .65fr .8fr 2fr; column-gap: 8px; align-items: center; padding: 5px 6px; border-top: 1px solid var(--panel-border); font-size: 12px; }
@@ -223,6 +233,8 @@ html, body {
 /* 影子回测面板 */
 .shadow-dist-head { color: var(--muted); font-size: 11px; border-bottom: 1px solid var(--panel-border); }
 .shadow-bt-form { display: flex; align-items: center; gap: 8px; padding: 4px 6px 8px; flex-wrap: wrap; }
+.auto-params { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.auto-add-label { margin-left: 8px; }
 .shadow-bt-err { color: #f56c6c; font-size: 12px; }
 
 /* 回测工作台 */

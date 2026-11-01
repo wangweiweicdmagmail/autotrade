@@ -7,6 +7,7 @@ chase 定价（_fvg_chase_prices）：偏离 FVG 边沿 >0.5×ATR 拒绝、无�
 拒绝、ATR 缺失拒绝、正常限价=现价×1.005/止损=现价−ATR（全局倍数）。
 collector/order_mgr 全 mock，不落盘。
 """
+from console import schemas
 import asyncio
 import time
 
@@ -53,19 +54,19 @@ def app(console_app, monkeypatch):
     monkeypatch.setattr(console_app, "collector", FakeCollector())
     om = FakeOrderMgr()
     monkeypatch.setattr(console_app, "order_mgr", om)
-    console_app._fvg_events.clear()
-    console_app._fvg_retests.clear()
-    console_app._fvg_last_bar.clear()
-    console_app._fvg_pending.clear()
-    console_app._fvg_warnings.clear()
-    console_app._fvg_warned.clear()
+    console_app.signals._fvg_events.clear()
+    console_app.signals._fvg_retests.clear()
+    console_app.signals._fvg_last_bar.clear()
+    console_app.signals._fvg_pending.clear()
+    console_app.signals._fvg_warnings.clear()
+    console_app.signals._fvg_warned.clear()
     yield console_app
-    console_app._fvg_events.clear()
-    console_app._fvg_retests.clear()
-    console_app._fvg_last_bar.clear()
-    console_app._fvg_pending.clear()
-    console_app._fvg_warnings.clear()
-    console_app._fvg_warned.clear()
+    console_app.signals._fvg_events.clear()
+    console_app.signals._fvg_retests.clear()
+    console_app.signals._fvg_last_bar.clear()
+    console_app.signals._fvg_pending.clear()
+    console_app.signals._fvg_warnings.clear()
+    console_app.signals._fvg_warned.clear()
 
 
 def seed_fvg(app, sym, bt, side, top, bottom, atr):
@@ -75,8 +76,8 @@ def seed_fvg(app, sym, bt, side, top, bottom, atr):
                   "fvg_last_top": top, "fvg_last_bottom": bottom},
         "ts_c": {"atr": atr},
     }
-    assert app._fvg_record_event(sym, bt, data)
-    app._fvg_last_bar[sym] = bt   # 防止监控循环重复固化
+    assert app.signals._fvg_record_event(sym, bt, data)
+    app.signals._fvg_last_bar[sym] = bt   # 防止监控循环重复固化
 
 
 def test_first_retest_once_per_fvg(app):
@@ -91,10 +92,10 @@ def test_first_retest_once_per_fvg(app):
                          "bar": {"time": T1, "low": 93.5, "high": 94.5,
                                  "close": 94.0}}
 
-        task = asyncio.create_task(app._fvg_monitor_loop())
+        task = asyncio.create_task(app.signals._fvg_monitor_loop())
         try:
             await asyncio.sleep(1.4)
-            assert len(app._fvg_retests) == 0, "未触区不应有回踩记录"
+            assert len(app.signals._fvg_retests) == 0, "未触区不应有回踩记录"
 
             # 多头 bar.low 首次 <= top / 空头 bar.high 首次 >= bottom
             market[SYM_L]["bar"] = {"time": T2, "low": 104.8, "high": 106.0,
@@ -102,15 +103,15 @@ def test_first_retest_once_per_fvg(app):
             market[SYM_S]["bar"] = {"time": T2, "low": 93.8, "high": 95.3,
                                     "close": 94.8}
             await asyncio.sleep(1.4)
-            assert len(app._fvg_retests) == 2, list(app._fvg_retests)
-            rt_l = next(r for r in app._fvg_retests if r["side"] == "long")
-            rt_s = next(r for r in app._fvg_retests if r["side"] == "short")
+            assert len(app.signals._fvg_retests) == 2, list(app.signals._fvg_retests)
+            rt_l = next(r for r in app.signals._fvg_retests if r["side"] == "long")
+            rt_s = next(r for r in app.signals._fvg_retests if r["side"] == "short")
             assert rt_l["id"] == f"{SYM_L}:{T0}:long:rt" and rt_l["retest_px"] == 104.8
             assert rt_l["retest_time"] == T2 and rt_l["bar_time"] == T0
             assert rt_l["top"] == 105.0 and rt_l["bottom"] == 104.0
             assert rt_s["id"] == f"{SYM_S}:{T0}:short:rt" and rt_s["retest_px"] == 95.3
-            ev_l = next(e for e in app._fvg_events if e["side"] == "long")
-            ev_s = next(e for e in app._fvg_events if e["side"] == "short")
+            ev_l = next(e for e in app.signals._fvg_events if e["side"] == "long")
+            ev_s = next(e for e in app.signals._fvg_events if e["side"] == "short")
             assert ev_l["retested"] is True and ev_s["retested"] is True
 
             # 再次回踩不再报（终身一次）
@@ -119,12 +120,12 @@ def test_first_retest_once_per_fvg(app):
             market[SYM_S]["bar"] = {"time": T3, "low": 94.0, "high": 95.8,
                                     "close": 95.5}
             await asyncio.sleep(1.4)
-            assert len(app._fvg_retests) == 2, "终身只报一次"
+            assert len(app.signals._fvg_retests) == 2, "终身只报一次"
 
             # 快照：retests 倒序 + slots 事件带 retested
             market[SYM_L]["bar_c"] = {"time": T3}
             market[SYM_S]["bar_c"] = {"time": T3}
-            snap = app._fvg_monitor_snapshot()
+            snap = app.signals._fvg_monitor_snapshot()
             assert len(snap["retests"]) == 2
             assert snap["retests"][0]["retest_time"] >= snap["retests"][1]["retest_time"]
             slot = next(s for s in snap["slots"] if s["bar_time"] == T0)
@@ -149,10 +150,10 @@ def chase_market(close, atr, side="long"):
 
 
 async def chase_req(app, side="long", force=False):
-    req = app.LimitStopOrderRequest(
+    req = schemas.LimitStopOrderRequest(
         symbol=SYM_L, side=side, qty=10, limit_px=1.0, stop_px=1.0,
         limit_type="chase", force=force, reason="t")
-    return await app.api_place_limit_stop(req, trader="master")
+    return await app.trading.api_place_limit_stop(req, trader="master")
 
 
 def test_chase_normal_pricing(app):

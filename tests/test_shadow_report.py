@@ -260,7 +260,7 @@ def test_report_schedule_timing(console_app, monkeypatch, tmp_path, db):
     """调度：周末不跑；16:19 不跑；16:20 触发且当天只一次；落盘 tmp +
     事件 + iMessage 摘要通道。"""
     app = console_app
-    monkeypatch.setattr(app, "_REPORTS_DIR", tmp_path)
+    monkeypatch.setattr(app.reports, "_REPORTS_DIR", tmp_path)
     sent = []
     import engine.notifier as nmod
     n = nmod.Notifier(record_event=lambda *a, **k: None,
@@ -275,19 +275,19 @@ def test_report_schedule_timing(console_app, monkeypatch, tmp_path, db):
     n._exec = fake_exec
     monkeypatch.setattr(app, "notifier", n)
     events = []
-    monkeypatch.setattr(app, "record_event",
+    monkeypatch.setattr(app.events, "record_event",
                         lambda t, **d: events.append({"type": t, **d}))
 
     done = set()
     # 周六 16:30 → 不跑
     sat = datetime(2026, 10, 24, 16, 30, tzinfo=ET)
-    assert run(app._report_check_once(sat, done, db_path=db)) is False
+    assert run(app.reports._report_check_once(sat, done, db_path=db)) is False
     # 周五 16:19 → 不跑
     fri_early = datetime(2026, 10, 23, 16, 19, tzinfo=ET)
-    assert run(app._report_check_once(fri_early, done, db_path=db)) is False
+    assert run(app.reports._report_check_once(fri_early, done, db_path=db)) is False
     # 周五 16:20 → 生成
     fri = datetime(2026, 10, 23, 16, 20, tzinfo=ET)
-    assert run(app._report_check_once(fri, done, db_path=db)) is True
+    assert run(app.reports._report_check_once(fri, done, db_path=db)) is True
     path = tmp_path / "report-20261023.json"
     assert path.exists()
     rep = json.loads(path.read_text(encoding="utf-8"))
@@ -296,7 +296,7 @@ def test_report_schedule_timing(console_app, monkeypatch, tmp_path, db):
                for e in events)
     assert sent and "复盘 2026-10-23" in sent[0]   # iMessage 摘要已发
     # 同一天再次到点 → 不重复生成
-    assert run(app._report_check_once(fri, done, db_path=db)) is False
+    assert run(app.reports._report_check_once(fri, done, db_path=db)) is False
 
 
 def test_api_report_default_and_named_day(console_app, monkeypatch):
@@ -309,13 +309,13 @@ def test_api_report_default_and_named_day(console_app, monkeypatch):
         return {"day": day, "total_signals": 0, "groups": [],
                 "breakout_crowd": [], "big_moves": {}, "stop_analysis": {}}
 
-    monkeypatch.setattr(app.shadow_report, "generate_report", fake_generate)
-    r = run(app.api_shadow_report("2026-10-23"))
+    monkeypatch.setattr(shadow_report, "generate_report", fake_generate)
+    r = run(app.research.api_shadow_report("2026-10-23"))
     assert r["day"] == "2026-10-23" and called == ["2026-10-23"]
-    r = run(app.api_shadow_report(""))
+    r = run(app.research.api_shadow_report(""))
     from datetime import datetime as _dt
     today = _dt.now(ET).strftime("%Y-%m-%d")
     assert called[-1] == today and r["day"] == today
     with pytest.raises(app.HTTPException) as ei:
-        run(app.api_shadow_report("2026/10/23"))
+        run(app.research.api_shadow_report("2026/10/23"))
     assert ei.value.status_code == 400

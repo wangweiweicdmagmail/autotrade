@@ -119,6 +119,12 @@ class RealtimeCollector:
         content_key = json.dumps(symbols, ensure_ascii=False, sort_keys=True,
                                  separators=(",", ":"))
         if content_key != self._content_key:
+            symbols = {symbol: dict(data) for symbol, data in symbols.items()}
+            for symbol, data in symbols.items():
+                previous = self._snapshot.get(symbol) or {}
+                data["price_observed_at"] = (
+                    now if data.get("bar") != previous.get("bar")
+                    else previous.get("price_observed_at", now))
             self._snapshot = symbols
             self._content_key = content_key
             self._last_content_update = now

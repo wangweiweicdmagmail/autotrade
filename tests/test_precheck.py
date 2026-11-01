@@ -63,11 +63,11 @@ def app(console_app, monkeypatch, tmp_path):
     monkeypatch.setattr(a, "gateway", FakeGateway(True, time.time()))
     monkeypatch.setattr(a, "order_mgr", FakeOrderMgr(0.0))
     monkeypatch.setattr(a, "copy_supervisor", FakeSupervisor(True))
-    monkeypatch.setattr(a, "_load_copy_servers", lambda: [])
-    monkeypatch.setattr(a, "_PRECHECK_DIR", tmp_path)
+    monkeypatch.setattr(a.copy, "_load_copy_servers", lambda: [])
+    monkeypatch.setattr(a.precheck, "_PRECHECK_DIR", tmp_path)
     async def fake_status():
         return {"equity": 100000.0, "daily_pnl": 0.0, "ts": time.time()}
-    monkeypatch.setattr(a, "get_status_cached", fake_status)
+    monkeypatch.setattr(a.accounts, "get_status_cached", fake_status)
     n = Notifier(record_event=lambda *_, **k: None,
                  imessage_recipient=lambda: "")
     monkeypatch.setattr(a, "notifier", n)
@@ -76,7 +76,7 @@ def app(console_app, monkeypatch, tmp_path):
 
 def test_all_green(app):
     """全绿路径：overall=ok，七项全 ok/neutral/skip。"""
-    rep = run(app.run_precheck())
+    rep = run(app.precheck.run_precheck())
     assert rep["overall"] == "ok"
     by = {i["key"]: i for i in rep["items"]}
     assert by["data_flow"]["status"] == "ok"
@@ -93,7 +93,7 @@ def test_data_flow_red(app, monkeypatch):
     """数据流红：标的缺失 / bar 陈旧。"""
     monkeypatch.setattr(app.collector, "_market",
                         {"NASDAQ:NVDA": {"attack_c": {"pmh": 1, "pml": 0.5}}})
-    rep = run(app.run_precheck())
+    rep = run(app.precheck.run_precheck())
     by = {i["key"]: i for i in rep["items"]}
     assert by["data_flow"]["status"] == "bad" and "缺" in by["data_flow"]["detail"]
     assert rep["overall"] == "bad"
@@ -102,7 +102,7 @@ def test_data_flow_red(app, monkeypatch):
                         {s: {"attack_c": {"pmh": 100.0, "pml": 98.0}}
                          for s in app.config.WATCHLIST})
     monkeypatch.setattr(app.collector, "latest_bar_time", time.time() - 700)
-    rep = run(app.run_precheck())
+    rep = run(app.precheck.run_precheck())
     by = {i["key"]: i for i in rep["items"]}
     assert by["data_flow"]["status"] == "bad" and "陈旧" in by["data_flow"]["detail"]
 
@@ -110,7 +110,7 @@ def test_data_flow_red(app, monkeypatch):
 def test_ibkr_red(app, monkeypatch):
     """IBKR 红：未连接 / 净值取不到（fail-open 标注）。"""
     monkeypatch.setattr(app, "gateway", FakeGateway(False))
-    rep = run(app.run_precheck())
+    rep = run(app.precheck.run_precheck())
     by = {i["key"]: i for i in rep["items"]}
     assert by["ibkr"]["status"] == "bad"
     assert by["clock"]["status"] == "skip"       # 未连接时钟比对跳过
@@ -118,8 +118,8 @@ def test_ibkr_red(app, monkeypatch):
     async def no_equity():
         return {"equity": None, "daily_pnl": None, "ts": time.time()}
     monkeypatch.setattr(app, "gateway", FakeGateway(True, time.time()))
-    monkeypatch.setattr(app, "get_status_cached", no_equity)
-    rep = run(app.run_precheck())
+    monkeypatch.setattr(app.accounts, "get_status_cached", no_equity)
+    rep = run(app.precheck.run_precheck())
     by = {i["key"]: i for i in rep["items"]}
     assert by["ibkr"]["status"] == "bad" and "fail-open" in by["ibkr"]["detail"]
 
@@ -128,27 +128,27 @@ def test_risk_budget_and_clock(app, monkeypatch):
     """风险预算：超预算红；时钟：偏差 >30s 红。"""
     monkeypatch.setattr(app, "order_mgr",
                         FakeOrderMgr(app.config.RISK_MAX_TOTAL_RISK_USD + 1))
-    rep = run(app.run_precheck())
+    rep = run(app.precheck.run_precheck())
     by = {i["key"]: i for i in rep["items"]}
     assert by["risk_budget"]["status"] == "bad" and "超预算" in by["risk_budget"]["detail"]
 
     monkeypatch.setattr(app, "order_mgr", FakeOrderMgr(0.0))
     monkeypatch.setattr(app, "gateway", FakeGateway(True, time.time() - 60))
-    rep = run(app.run_precheck())
+    rep = run(app.precheck.run_precheck())
     by = {i["key"]: i for i in rep["items"]}
     assert by["clock"]["status"] == "bad" and "偏差" in by["clock"]["detail"]
 
 
 def test_copy_servers(app, monkeypatch):
     """跟单进程：enabled 但进程死 → 红；无启用 → skip。"""
-    monkeypatch.setattr(app, "_load_copy_servers",
+    monkeypatch.setattr(app.copy, "_load_copy_servers",
                         lambda: [{"name": "A", "enabled": True}])
     monkeypatch.setattr(app, "copy_supervisor", FakeSupervisor(False))
-    rep = run(app.run_precheck())
+    rep = run(app.precheck.run_precheck())
     by = {i["key"]: i for i in rep["items"]}
     assert by["copy"]["status"] == "bad" and "进程不在" in by["copy"]["detail"]
     monkeypatch.setattr(app, "copy_supervisor", FakeSupervisor(True))
-    rep = run(app.run_precheck())
+    rep = run(app.precheck.run_precheck())
     by = {i["key"]: i for i in rep["items"]}
     assert by["copy"]["status"] == "ok"
 
@@ -167,13 +167,13 @@ def test_leftover_alerts(app, tmp_path):
                     "title": "数据陈旧", "msg": "x"}),
         json.dumps({"type": "alert_recovered", "key": "data_stale"}),
     ]) + "\n", encoding="utf-8")
-    rep = run(app.run_precheck())
+    rep = run(app.precheck.run_precheck())
     by = {i["key"]: i for i in rep["items"]}
     assert by["leftover"]["status"] == "bad" and "TWS 断线" in by["leftover"]["detail"]
     # 补上恢复记录 → 绿
     with open(ev, "a", encoding="utf-8") as f:
         f.write(json.dumps({"type": "alert_recovered", "key": "tws_down"}) + "\n")
-    rep = run(app.run_precheck())
+    rep = run(app.precheck.run_precheck())
     by = {i["key"]: i for i in rep["items"]}
     assert by["leftover"]["status"] == "ok"
 
@@ -183,17 +183,17 @@ def test_schedule_timing(app):
     notifier critical；落盘 tmp。"""
     done = set()
     sat = datetime(2026, 10, 24, 9, 30, tzinfo=ET)    # 周六
-    assert run(app._precheck_check_once(sat, done)) is False
+    assert run(app.precheck._precheck_check_once(sat, done)) is False
     fri_early = datetime(2026, 10, 23, 9, 24, tzinfo=ET)
-    assert run(app._precheck_check_once(fri_early, done)) is False
+    assert run(app.precheck._precheck_check_once(fri_early, done)) is False
     fri = datetime(2026, 10, 23, 9, 25, tzinfo=ET)
-    assert run(app._precheck_check_once(fri, done)) is True
-    path = app._PRECHECK_DIR / "precheck-20261023.json"
+    assert run(app.precheck._precheck_check_once(fri, done)) is True
+    path = app.precheck._PRECHECK_DIR / "precheck-20261023.json"
     assert path.exists()
     rep = json.loads(path.read_text(encoding="utf-8"))
     assert rep["overall"] == "ok"                    # 全绿基线
     assert not app.notifier.is_active("precheck:2026-10-23")   # 无红不告警
-    assert run(app._precheck_check_once(fri, done)) is False   # 当天只一次
+    assert run(app.precheck._precheck_check_once(fri, done)) is False   # 当天只一次
 
 
 def test_schedule_red_alert(app, monkeypatch):
@@ -201,19 +201,19 @@ def test_schedule_red_alert(app, monkeypatch):
     monkeypatch.setattr(app.collector, "_market", {})   # 数据流全缺 → 红
     done = set()
     fri = datetime(2026, 10, 23, 9, 25, tzinfo=ET)
-    assert run(app._precheck_check_once(fri, done)) is True
+    assert run(app.precheck._precheck_check_once(fri, done)) is True
     a = app.notifier._active.get("precheck:2026-10-23")
     assert a and a["level"] == "critical" and "数据流" in a["msg"]
 
 
 def test_api(app, monkeypatch):
     """API：手动跑返回结构；last 无记录 404、有记录返回最近一份。"""
-    rep = run(app.api_precheck())
+    rep = run(app.precheck.api_precheck())
     assert rep["overall"] == "ok" and len(rep["items"]) == 7
     with pytest.raises(app.HTTPException) as ei:
-        run(app.api_precheck_last())
+        run(app.precheck.api_precheck_last())
     assert ei.value.status_code == 404
-    (app._PRECHECK_DIR / "precheck-20261023.json").write_text(
+    (app.precheck._PRECHECK_DIR / "precheck-20261023.json").write_text(
         json.dumps(rep), encoding="utf-8")
-    last = run(app.api_precheck_last())
+    last = run(app.precheck.api_precheck_last())
     assert last["overall"] == "ok"

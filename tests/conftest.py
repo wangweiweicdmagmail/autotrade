@@ -22,11 +22,10 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-# 提前 import console.app：ib_async → eventkit 在 import 时调
-# asyncio.get_event_loop()；一旦有测试先跑过 asyncio.run（主线程事件循环
-# 被关闭清空），之后再 import console.app 会 RuntimeError。在 conftest
-# 加载期（尚无事件循环操作）完成首次 import，后续全部走 sys.modules 缓存。
-import console.app  # noqa: F401,E402
+# 提前导入执行依赖，保证 ib_async 的首次导入处于有效主线程事件循环。
+# 这不会创建应用服务、加载生产状态或连接外部系统。
+from console.runtime.bootstrap import build_services, RuntimePaths
+from console.factory import create_app
 
 LOGS = ROOT / "logs"
 
@@ -52,18 +51,12 @@ def run(coro):
 
 @pytest.fixture
 def console_app(tmp_path, monkeypatch):
-    """console.app 测试基座：所有落盘路径指 tmp_path、record_event 内存桩，
-    用例结束后 _settings 内容还原（monkeypatch 负责还原被替换的对象本身，
-    dict 原位变更须手工还原）。不触发 startup、不碰 8000 端口。"""
-    import console.app as app
-    monkeypatch.setattr(app, "record_event", lambda *a, **k: None)
-    monkeypatch.setattr(app, "_SETTINGS_PATH", tmp_path / "settings.json")
-    monkeypatch.setattr(app, "_CLIENTS_PATH", tmp_path / "clients.json")
-    monkeypatch.setattr(app, "_COPY_SERVERS_PATH", tmp_path / "copy_servers.json")
-    monkeypatch.setattr(app, "_COPY_TRADER_PY", tmp_path / "copy_trader.py")
-    settings_backup = dict(app._settings)
+    """每个测试一个应用实例；所有生产状态路径在加载前即指向 tmp_path。"""
+    context = build_services(RuntimePaths(data_dir=tmp_path))
+    context.events.record_event = lambda *a, **k: None
+    context.copy._COPY_TRADER_PY = tmp_path / "copy_trader.py"
+    create_app(context)
     try:
-        yield app
+        yield context
     finally:
-        app._settings.clear()
-        app._settings.update(settings_backup)
+        context.close_log_handler()

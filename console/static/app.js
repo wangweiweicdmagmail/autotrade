@@ -1,8 +1,8 @@
 /* autotrade 交易控制台前端逻辑（Vue3 + Element Plus，两宫格） */
 const { createApp } = Vue;
 
-// 一次性提醒去重的持久化（存 localStorage）：刷新页面后保本/自动平仓/
-// 未快速突破等「只播一次」的提醒不再重播
+// 一次性提醒去重的持久化（存 localStorage）：刷新页面后保本/自动策略事件/
+// 自动平仓/未快速突破等「只播一次」的提醒不再重播
 function loadNotified(key) {
   try { return JSON.parse(localStorage.getItem(key) || '{}'); } catch (e) { return {}; }
 }
@@ -46,6 +46,10 @@ createApp({
       })(),
       atrMult: 1.0,        // 全局止损 ATR 倍数（快照 status.stop_atr_mult 为准，全客户端同步）
       atrMultDirty: false, // 止损倍数输入框编辑中标记（编辑时不被快照覆盖）
+      pyramidAutoBreakeven: true,
+      pyramidBreakevenR: 3.0,
+      pyramidAddUnlockR: 2.0,
+      pyramidParamsDirty: false,
       screenPmFilter: false,  // 选股盘前区间过滤开关（快照 status.screen_premarket_filter 同步）
       fvgPmFilter: false,     // FVG 监控盘前区间过滤开关（快照 status.fvg_premarket_filter 同步）
       imessageRecipient: '',  // iMessage 告警收件人（快照 status.imessage_recipient 同步，空=跳过该通道）
@@ -79,6 +83,10 @@ createApp({
       stopAlerts: [],             // 止损单守卫提醒（持仓缺少 STP/TRAIL 保护单）
       externalAlerts: [],         // 外部订单/持仓告警（IBKR 手动单，告警模式）
       autoCloseNotices: [],       // 自动平仓记录（语音/通知）
+      autoNotices: [],            // 金字塔建仓/加仓/平仓事件（语音/通知）
+      autoModel: 'ema9_pyramid',
+      autoInstanceId: 'default',
+      autoModels: [{ id: 'ema9_pyramid', name: 'EMA9-ST-ATR', execution_profile: 'ema9_legacy_pyramid' }],
       fvgReverseAlerts: [],       // 反向 FVG 守卫提醒（锁利/平仓失败）
       fvgReverseNotices: [],      // 反向 FVG 自动平仓记录（语音/通知）
       lastScanAlert: {},          // 已提醒过的持仓扫描（按 scanned_at 去重）
@@ -88,6 +96,8 @@ createApp({
       lastStopAlert: {},          // 已提醒过的止损单缺失（按 checked_at 去重）
       lastExternalAlert: {},      // 已提醒过的外部订单/持仓（kind:ticker 去重，60s 节流）
       lastAutoCloseNotice: loadNotified('notified_autoclose'),  // 已播报过的自动平仓（持久化）
+      lastAutoNotice: loadNotified('notified_pyramid'),     // 已播报过的金字塔事件（持久化）
+      autoNoticesInitDone: false, // 首屏只建基线，不补播服务端历史事件
       lastFvgReverseAlert: {},          // 已提醒过的反向 FVG（lot_id+alerted_at 去重）
       lastFvgReverseNotice: loadNotified('notified_fvg_reverse'),  // 已播报过的反向FVG平仓（持久化）
       events: [],                 // 历史事件（持久日志回溯）
@@ -144,15 +154,15 @@ createApp({
       expandedAutoOrders: {},
       demoMode: (() => { try { return localStorage.getItem('demo_mode') === '1'; } catch (e) { return false; } })(),
       demoAutoInstances: [
-        { inst_id: 'demo-nvda', symbol: 'NASDAQ:NVDA', strategy: 'ema9_pyramid', state: 'ACTIVE', side: 'short', source: 'manual_seed', entries: 2, avg_cost: 206.73, entry_px: 206.73, qty: 667, stop_px: 206.73, initial_risk_usd: 300, initial_r: 0.85, unlocked: true, breakeven_done: true, unrealized_r: 1.12, mfe_r: 2.18, second_mfe_r: 0.35, max_notional: 137820.69, max_position_pct: 63.28, lot_ids: ['demo-nvda-1', 'demo-nvda-2'] },
+        { inst_id: 'demo-nvda', enabled: true, last_order_budget: 200, last_order_risk: 198.9, last_order_qty: 90, last_order_stop: 208.22, symbol: 'NASDAQ:NVDA', strategy: 'ema9_pyramid', state: 'ACTIVE', side: 'short', source: 'manual_seed', entries: 2, avg_cost: 207.0931, entry_px: 207.0931, qty: 442, stop_px: 207.09, initial_risk_usd: 300, initial_r: 0.85, unlocked: true, breakeven_done: true, unrealized_r: 1.662, mfe_r: 3.2, second_mfe_r: 0.5, max_notional: 137820.69, max_position_pct: 63.28, lot_ids: ['demo-nvda-1', 'demo-nvda-2'] },
         { inst_id: 'demo-qcom', symbol: 'NASDAQ:QCOM', strategy: 'ema9_pyramid', state: 'ACTIVE', side: 'short', source: 'auto', entries: 3, avg_cost: 166.61, entry_px: 166.61, qty: 494, stop_px: 166.61, initial_risk_usd: 300, initial_r: 1.37, unlocked: true, breakeven_done: true, unrealized_r: 2.35, mfe_r: 3.55, second_mfe_r: 2.10, max_notional: 81346.98, max_position_pct: 37.35, lot_ids: ['demo-qcom-1', 'demo-qcom-2', 'demo-qcom-3'] },
-        { inst_id: 'demo-amd', symbol: 'NASDAQ:AMD', strategy: 'ema9_pyramid', state: 'ACTIVE', side: 'long', source: 'manual_seed', entries: 1, avg_cost: 513.07, entry_px: 513.07, qty: 72, stop_px: 508.92, initial_risk_usd: 300, initial_r: 4.15, unlocked: false, breakeven_done: false, unrealized_r: -0.22, mfe_r: 1.55, second_mfe_r: 0, max_notional: 37244.52, max_position_pct: 17.10, lot_ids: ['demo-amd-1'] },
+        { inst_id: 'demo-amd', enabled: false, restored: true, recovery_block_reason: '缺少完整整组快照，自动加仓已暂停', symbol: 'NASDAQ:AMD', strategy: 'ema9_pyramid', state: 'ACTIVE', side: 'long', source: 'manual_seed', entries: 1, avg_cost: 513.07, entry_px: 513.07, qty: 72, stop_px: 508.92, initial_risk_usd: 300, initial_r: 4.15, unlocked: false, breakeven_done: false, unrealized_r: -0.22, mfe_r: 1.55, second_mfe_r: 0, max_notional: 37244.52, max_position_pct: 17.10, lot_ids: ['demo-amd-1'] },
       ],
       demoOrderLots: [
-        { lot_id: 'demo-nvda-1', symbol: 'NASDAQ:NVDA', side: 'short', qty: 352, filled_qty: 352, state: 'ACTIVE', limit_type: 'market', trader: 'master', entry_px: 207.37, avg_fill: 207.37, stop_px: 206.73, last_px: 205.68, realized_pnl: 0, created_at: 1793368200, updated_at: 1793375400, reason: '手动首仓', signal_snapshot: { pyramid_seed: true } },
-        { lot_id: 'demo-nvda-2', symbol: 'NASDAQ:NVDA', side: 'short', qty: 315, filled_qty: 315, state: 'ACTIVE', limit_type: 'auto_ema9_pyramid', trader: 'auto', entry_px: 206.01, avg_fill: 206.01, stop_px: 206.73, last_px: 205.68, realized_pnl: 0, created_at: 1793375400, updated_at: 1793376600, reason: 'EMA9金字塔 第2次', signal_snapshot: { entry_index: 2 } },
+        { lot_id: 'demo-nvda-1', symbol: 'NASDAQ:NVDA', side: 'short', qty: 352, filled_qty: 352, state: 'ACTIVE', limit_type: 'market', trader: 'master', entry_px: 207.37, avg_fill: 207.37, stop_px: 207.09, last_px: 205.68, realized_pnl: 0, created_at: 1793368200, updated_at: 1793375400, reason: '手动首仓', signal_snapshot: { pyramid_seed: true } },
+        { lot_id: 'demo-nvda-2', symbol: 'NASDAQ:NVDA', side: 'short', qty: 90, filled_qty: 90, state: 'ACTIVE', limit_type: 'auto_ema9_pyramid', trader: 'auto', entry_px: 206.01, avg_fill: 206.01, stop_px: 207.09, last_px: 205.68, realized_pnl: 0, created_at: 1793375400, updated_at: 1793376600, reason: 'EMA9金字塔 第2次', signal_snapshot: { entry_index: 2, risk_budget: 200, planned_risk_usd: 198.9 } },
         { lot_id: 'demo-qcom-1', symbol: 'NASDAQ:QCOM', side: 'short', qty: 218, filled_qty: 218, state: 'ACTIVE', limit_type: 'auto_ema9_pyramid', trader: 'auto', entry_px: 168.52, avg_fill: 168.52, stop_px: 166.61, last_px: 163.86, realized_pnl: 0, created_at: 1793367000, updated_at: 1793370000, reason: 'EMA9金字塔 第1次', signal_snapshot: { entry_index: 1 } },
-        { lot_id: 'demo-qcom-2', symbol: 'NASDAQ:QCOM', side: 'short', qty: 172, filled_qty: 172, state: 'ACTIVE', limit_type: 'auto_ema9_pyramid', trader: 'auto', entry_px: 165.36, avg_fill: 165.36, stop_px: 166.61, last_px: 163.86, realized_pnl: 0, created_at: 1793370000, updated_at: 1793372000, reason: 'EMA9金字塔 第2次', signal_snapshot: { entry_index: 2 } },
+        { lot_id: 'demo-qcom-2', symbol: 'NASDAQ:QCOM', side: 'short', qty: 172, filled_qty: 172, state: 'ACTIVE', limit_type: 'auto_ema9_pyramid', trader: 'auto', entry_px: 165.36, avg_fill: 165.36, stop_px: 166.61, last_px: 163.86, realized_pnl: 0, created_at: 1793370000, updated_at: 1793372000, reason: 'EMA9金字塔 第2次', signal_snapshot: { entry_index: 2, risk_budget: 200, planned_risk_usd: 198.9 } },
         { lot_id: 'demo-qcom-3', symbol: 'NASDAQ:QCOM', side: 'short', qty: 104, filled_qty: 104, state: 'ACTIVE', limit_type: 'auto_ema9_pyramid', trader: 'auto', entry_px: 164.67, avg_fill: 164.67, stop_px: 166.61, last_px: 163.86, realized_pnl: 0, created_at: 1793372000, updated_at: 1793373000, reason: 'EMA9金字塔 第3次', signal_snapshot: { entry_index: 3 } },
         { lot_id: 'demo-amd-1', symbol: 'NASDAQ:AMD', side: 'long', qty: 72, filled_qty: 72, state: 'ACTIVE', limit_type: 'market', trader: 'master', entry_px: 513.07, avg_fill: 513.07, stop_px: 508.92, last_px: 512.15, realized_pnl: 0, created_at: 1793367000, updated_at: 1793368000, reason: '手动首仓', signal_snapshot: { pyramid_seed: true } },
       ],
@@ -210,7 +220,7 @@ createApp({
         a.split(':').pop().localeCompare(b.split(':').pop()));
     },
     logPanelStyle() {
-      return { height: `${this.bottomPanelHeight}px`, flex: `0 0 ${this.bottomPanelHeight}px` };
+      return { height: `${this.bottomPanelHeight}px`, flex: `0 1 ${this.bottomPanelHeight}px`, minHeight: '140px' };
     },
     sortedScreenLong() { return this.sortScreenRows(this.screen.long); },
     sortedScreenShort() { return this.sortScreenRows(this.screen.short); },
@@ -415,6 +425,7 @@ createApp({
   },
 
   mounted() {
+    this.fetchAutoModels();
     // 先确认本客户端身份（master 以服务端判定为准，不在前端猜 IP），未确认前每 5s 轮询
     this.checkIdentity();
     setInterval(() => this.checkIdentity(), 5000);
@@ -857,12 +868,36 @@ createApp({
 
     autoNext(i) {
       if (i.state === 'DONE') return '本轮已结束，不自动重开';
+      if (i.state === 'CLOSING' || i.exit_requested_reason) return '退出中：撤单 / 平仓确认';
+      if (i.recovery_block_reason) return i.recovery_block_reason;
+      if (i.pending_lot_id || i.state === 'PENDING') return '等待挂单实际成交';
+      if (i.enabled === false) return '加仓已暂停，继续管理持仓';
       if (!i.entries) return '等EMA9或手动首仓';
-      if (i.entries >= 3) return '仅管理，等整组退出';
-      if (i.entries === 1 && !i.unlocked) return '等首仓达到2R';
-      if (i.entries === 2 && !i.unlocked) return '等整组均价达到2R';
+      if (i.entries >= (i.risk_budgets?.length || 3)) return '仅管理，等整组退出';
+      const unlockR = i.add_unlock_r ?? this.pyramidAddUnlockR;
+      if (i.entries === 1 && !i.unlocked) return `等首仓达到${unlockR}R`;
+      if (i.entries === 2 && !i.unlocked) return `等整组均价达到${unlockR}R`;
       if (i.entries === 2 && (i.second_mfe_r || 0) < 1) return '等第二仓达到1R';
-      return `等EMA9第${i.entries + 1}次触碰`;
+      return `等${this.autoModelName ? this.autoModelName(i.strategy) : 'EMA9-ST-ATR'}第${i.entries + 1}次入场信号`;
+    },
+    async fetchAutoModels() {
+      try {
+        const response = await fetch('/api/auto/models');
+        if (response.ok) this.autoModels = (await response.json()).models;
+      } catch (_) { /* 断线期间保留最近模型列表 */ }
+    },
+    autoModelName(id) {
+      return this.autoModels.find(model => model.id === id)?.name || id || 'EMA9-ST-ATR';
+    },
+    autoRiskText(i) {
+      if (!i.last_order_budget) return i.entries ? '历史订单风险记录未提供' : '成交后开始统计MFE';
+      return `最近一笔：预算 $${this.fmt2(i.last_order_budget)} / 计划风险 $${this.fmt2(i.last_order_risk)} · ${i.last_order_qty}股 · 止损 ${this.fmt2(i.last_order_stop)}`;
+    },
+    orderRiskText(o) {
+      const meta = o.signal_snapshot || {};
+      const planned = meta.planned_risk_usd ?? o.init_risk_usd;
+      if (planned == null) return '风险记录缺失';
+      return `预算 ${meta.risk_budget == null ? '—' : '$' + this.fmt2(meta.risk_budget)} / 计划 $${this.fmt2(planned)}`;
     },
     autoPnl(i) {
       if (!i.entries || !i.qty || !i.avg_cost) return null;
@@ -878,12 +913,13 @@ createApp({
       return +((px - i.avg_cost) * sign * i.qty).toFixed(2);
     },
     viewAutoOrders(i) {
-      this.expandedAutoOrders[i.symbol] = !this.expandedAutoOrders[i.symbol];
+      const key = i.inst_id || i.symbol;
+      this.expandedAutoOrders[key] = !this.expandedAutoOrders[key];
     },
     autoLotRows(inst) {
       const source = this.demoMode ? this.demoOrderLots : this.lots;
       const ids = inst.lot_ids || [];
-      return source.filter(l => ids.length ? ids.includes(l.lot_id) : l.symbol === inst.symbol);
+      return source.filter(l => ids.includes(l.lot_id));
     },
     async stopAutoInstance(i, closePositions) {
       if (this.demoMode) {
@@ -894,7 +930,7 @@ createApp({
         if (closePositions) {
           await this.$confirm(`确认整组平掉 ${i.symbol.split(':').pop()}？`, '单票整组平仓', { type: 'warning' });
         }
-        const r = await fetch(`/api/auto/instances/${encodeURIComponent(i.symbol)}/stop?close_positions=${closePositions}`,
+        const r = await fetch(`/api/auto/instances/${encodeURIComponent(i.symbol)}/stop?close_positions=${closePositions}&strategy=${encodeURIComponent(i.strategy || 'ema9_pyramid')}&instance_id=${encodeURIComponent(i.strategy_instance_id || 'default')}`,
                               { method: 'POST', headers: this.tradeHeaders() });
         const d = await r.json();
         if (!r.ok) throw new Error(typeof d.detail === 'string' ? d.detail : '操作失败');
@@ -913,7 +949,7 @@ createApp({
                             '手动仓转全自动', { type: 'warning' });
         const r = await fetch('/api/auto/adopt', {
           method: 'POST', headers: this.tradeHeaders(true),
-          body: JSON.stringify({ symbol: row.symbol, lot_id: row.lot_id,
+          body: JSON.stringify({ symbol: row.symbol, lot_id: row.lot_id, strategy: this.autoModel, instance_id: this.autoInstanceId,
                                 initial_risk_usd: this.riskUsd }),
         });
         const d = await r.json();
@@ -936,13 +972,15 @@ createApp({
         const symbols = this.autoSymbols.split(',').map(s => s.trim()).filter(Boolean);
         const r = await fetch('/api/auto/start', {
           method: 'POST', headers: this.tradeHeaders(true),
-          body: JSON.stringify({ strategy: 'ema9_pyramid', symbols,
+          body: JSON.stringify({ strategy: this.autoModel, instance_id: this.autoInstanceId, symbols,
                                 params: { initial_risk_usd: this.riskUsd } }),
         });
         this.checkWrite403(r);
         const d = await r.json();
         if (!r.ok) throw new Error(typeof d.detail === 'string' ? d.detail : '启动失败');
-        this.$message.success(`已启动 ${d.started.length} 个实例${d.skipped.length ? '，跳过 ' + d.skipped.length : ''}`);
+        const reasons = Object.entries(d.skipped_reasons || {}).map(([s, reason]) => `${s.split(':').pop()}：${reason}`);
+        if (reasons.length) this.$message.warning(reasons.join('；'));
+        else this.$message.success(`已启动 ${d.started.length} 个实例${d.skipped.length ? '，跳过 ' + d.skipped.length : ''}`);
       } catch (e) {
         this.$message.error(e.message || String(e));
       } finally {
@@ -1116,8 +1154,11 @@ createApp({
         const r = await fetch('/api/bt/load', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ symbol: this.wbSymbol || 'NVDA', day: this.wbDay || '',
-                                strategy: 'ema9_pyramid',
-                                params: { initial_risk_usd: this.riskUsd, equity: this.equity } }),
+                                strategy: this.autoModel,
+                                params: { initial_risk_usd: this.riskUsd, equity: this.equity,
+                                          pyramid_auto_breakeven: this.autoModel === 'ema9_pyramid' && this.pyramidAutoBreakeven,
+                                          pyramid_breakeven_r: this.pyramidBreakevenR,
+                                          pyramid_add_unlock_r: this.pyramidAddUnlockR } }),
         });
         const d = await r.json();
         if (!r.ok) throw new Error(typeof d.detail === 'string' ? d.detail : '加载失败');
@@ -1240,6 +1281,11 @@ createApp({
           if (!this.atrMultDirty && msg.status && msg.status.stop_atr_mult != null) {
             this.atrMult = msg.status.stop_atr_mult;
           }
+          if (!this.pyramidParamsDirty && msg.status) {
+            this.pyramidAutoBreakeven = msg.status.pyramid_auto_breakeven !== false;
+            this.pyramidBreakevenR = msg.status.pyramid_breakeven_r ?? 3.0;
+            this.pyramidAddUnlockR = msg.status.pyramid_add_unlock_r ?? 2.0;
+          }
           // 盘前区间过滤开关跟快照走（全客户端同步）
           if (msg.status) {
             this.screenPmFilter = !!msg.status.screen_premarket_filter;
@@ -1262,6 +1308,7 @@ createApp({
           this.externalAlerts = msg.external_alerts || [];
           this.slowBreakAlerts = msg.slow_break_alerts || [];
           this.autoCloseNotices = msg.auto_close_notices || [];
+          this.autoNotices = msg.auto_notices || [];
           this.fvgReverseAlerts = msg.fvg_reverse_alerts || [];
           this.fvgReverseNotices = msg.fvg_reverse_notices || [];
           this.shadow = msg.shadow || { stats: {}, events: [] };
@@ -1278,6 +1325,7 @@ createApp({
           this.checkStopAlert();
           this.checkExternalAlert();
           this.checkAutoCloseNotice();
+          this.checkAutoNotices();
           this.checkFvgReverseAlert();
           this.checkFvgReverseNotice();
           this.checkAutoEntryProposals();
@@ -1401,6 +1449,66 @@ createApp({
         });
       }
       if (dirty) saveNotified('notified_autoclose', this.lastAutoCloseNotice);
+    },
+
+    // 金字塔策略关键节点：提交与实际成交分开播报，首屏不补播历史事件
+    checkAutoNotices() {
+      let dirty = false;
+      const fresh = [];
+      for (const n of this.autoNotices) {
+        if (!n.id || this.lastAutoNotice[n.id]) continue;
+        this.lastAutoNotice[n.id] = n.ts || true;
+        dirty = true;
+        if (this.autoNoticesInitDone) fresh.push(n);
+      }
+      this.autoNoticesInitDone = true;
+      fresh.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+      const spoken = [];
+      for (const n of fresh) {
+        const ticker = (n.symbol || '').split(':').pop();
+        const spelled = ticker.split('').join(' ');
+        const side = n.side === 'long' ? '多头' : n.side === 'short' ? '空头' : '';
+        const action = (n.entries || 1) > 1 ? `第 ${n.entries} 次加仓` : '首次建仓';
+        let title = '自动策略提醒';
+        let text = `${spelled} 自动策略状态更新`;
+        let message = ticker;
+        let type = 'info';
+        let duration = 10000;
+        if (n.event === 'pyramid_order_placed') {
+          title = `${action}已提交`;
+          text = `${spelled} ${side}${action}已提交，等待成交`;
+          message = `${ticker} ${side} ${n.qty || 0} 股，限价 ${n.entry_px}，止损 ${n.stop_px}，等待成交`;
+        } else if (n.event === 'pyramid_entry_filled') {
+          title = `${action}已成交`;
+          text = `${spelled} ${side}${action}已成交`;
+          message = `${ticker} ${side} ${n.qty || 0} 股，成交均价 ${n.entry_px}`;
+          type = 'success';
+        } else if (n.event === 'pyramid_order_failed') {
+          title = '自动策略下单失败';
+          text = `${spelled} 自动策略下单失败，请检查`;
+          message = `${ticker}：${n.error || '下单失败，请检查日志'}`;
+          type = 'error';
+          duration = 0;
+        } else if (n.event === 'pyramid_close_requested') {
+          const ok = n.ok !== false;
+          title = ok ? '整组平仓已提交' : '整组平仓提交失败';
+          text = ok ? `${spelled} 整组平仓已提交，等待成交` : `${spelled} 整组平仓提交失败，请检查`;
+          message = `${ticker} ${side} ${n.qty || 0} 股，原因 ${n.reason || '策略退出'}${ok ? '，等待成交' : ''}`;
+          type = ok ? 'warning' : 'error';
+          duration = ok ? 10000 : 0;
+        } else if (n.event === 'pyramid_flat') {
+          title = '整组平仓已完成';
+          text = `${spelled} 自动策略已完成平仓`;
+          message = `${ticker} ${side}仓位已全部结束`;
+          type = 'success';
+        } else {
+          continue;
+        }
+        spoken.push(text);
+        this.$notify({ title, message, type, duration, position: 'bottom-right' });
+      }
+      if (spoken.length) this.speak(spoken.join('，'));
+      if (dirty) saveNotified('notified_pyramid', this.lastAutoNotice);
     },
 
     // 反向 FVG 自动平仓播报（镜像自动平仓通知，持久化刷新不重播）
@@ -1716,6 +1824,28 @@ createApp({
         this.atrMult = data.stop_atr_mult;
         this.$message.success(`止损 ATR 倍数已更新为 ${data.stop_atr_mult}×（全局生效）`);
       } catch (e) {
+        this.$message.error(e.message || String(e));
+      }
+    },
+
+    // 金字塔加仓解锁与自动保本参数：服务端持久化并立即应用到实时策略
+    async savePyramidParam(key, value) {
+      if (value == null) return;
+      try {
+        const body = {}; body[key] = value;
+        const r = await fetch('/api/settings', {
+          method: 'POST', headers: this.tradeHeaders(true),
+          body: JSON.stringify(body),
+        });
+        this.checkWrite403(r);
+        const data = await r.json();
+        if (!r.ok) throw new Error(typeof data.detail === 'string' ? data.detail : '保存失败');
+        this.pyramidAutoBreakeven = data.pyramid_auto_breakeven;
+        this.pyramidBreakevenR = data.pyramid_breakeven_r;
+        this.pyramidAddUnlockR = data.pyramid_add_unlock_r;
+        this.$message.success('自动策略参数已更新（实时策略与后续回测生效）');
+      } catch (e) {
+        if (key === 'pyramid_auto_breakeven') this.pyramidAutoBreakeven = !value;
         this.$message.error(e.message || String(e));
       }
     },

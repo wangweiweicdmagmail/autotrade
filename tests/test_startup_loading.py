@@ -18,7 +18,7 @@ def _ready_market():
 
 def test_root_stays_on_loading_until_ready(console_app, monkeypatch):
     state = _ready_state()
-    monkeypatch.setattr(console_app, "_startup_state", state)
+    monkeypatch.setattr(console_app.lifecycle, "_startup_state", state)
     client = TestClient(console_app.app)
     response = client.get("/")
     assert response.status_code == 200
@@ -33,7 +33,7 @@ def test_root_stays_on_loading_until_ready(console_app, monkeypatch):
 
 
 def test_startup_status_requires_full_confirmed_watchlist(console_app, monkeypatch):
-    monkeypatch.setattr(console_app, "_startup_state", _ready_state())
+    monkeypatch.setattr(console_app.lifecycle, "_startup_state", _ready_state())
     monkeypatch.setattr(console_app.config, "WATCHLIST", ["NASDAQ:QQQ", "NASDAQ:AAPL"])
     monkeypatch.setattr(console_app.collector, "_running", True)
     monkeypatch.setattr(console_app.collector, "_proc", SimpleNamespace(returncode=None))
@@ -42,7 +42,7 @@ def test_startup_status_requires_full_confirmed_watchlist(console_app, monkeypat
     monkeypatch.setattr(console_app.gateway, "enabled", False)
     monkeypatch.setattr(console_app.gateway, "_connected", False)
 
-    payload = console_app._startup_status()
+    payload = console_app.lifecycle._startup_status()
     market = next(s for s in payload["stages"] if s["key"] == "market")
     ibkr = next(s for s in payload["stages"] if s["key"] == "ibkr")
     assert payload["all_ready"] is False
@@ -51,7 +51,7 @@ def test_startup_status_requires_full_confirmed_watchlist(console_app, monkeypat
 
 
 def test_live_startup_requires_ibkr(console_app, monkeypatch):
-    monkeypatch.setattr(console_app, "_startup_state", _ready_state())
+    monkeypatch.setattr(console_app.lifecycle, "_startup_state", _ready_state())
     monkeypatch.setattr(console_app.config, "WATCHLIST", ["NASDAQ:QQQ"])
     monkeypatch.setattr(console_app.collector, "_running", True)
     monkeypatch.setattr(console_app.collector, "_proc", SimpleNamespace(returncode=None))
@@ -59,15 +59,15 @@ def test_live_startup_requires_ibkr(console_app, monkeypatch):
     monkeypatch.setattr(console_app.collector, "study_health", lambda: {"systemic": False})
     monkeypatch.setattr(console_app.gateway, "enabled", True)
     monkeypatch.setattr(console_app.gateway, "_connected", False)
-    assert console_app._startup_status()["all_ready"] is False
+    assert console_app.lifecycle._startup_status()["all_ready"] is False
 
     monkeypatch.setattr(console_app.gateway, "_connected", True)
-    assert console_app._startup_status()["all_ready"] is True
+    assert console_app.lifecycle._startup_status()["all_ready"] is True
 
 
 def test_first_readiness_is_latched(console_app, monkeypatch):
     state = _ready_state()
-    monkeypatch.setattr(console_app, "_startup_state", state)
+    monkeypatch.setattr(console_app.lifecycle, "_startup_state", state)
     monkeypatch.setattr(console_app.config, "WATCHLIST", ["NASDAQ:QQQ"])
     monkeypatch.setattr(console_app.collector, "_running", True)
     monkeypatch.setattr(console_app.collector, "_proc", SimpleNamespace(returncode=None))
@@ -75,16 +75,16 @@ def test_first_readiness_is_latched(console_app, monkeypatch):
     monkeypatch.setattr(console_app.collector, "study_health", lambda: {"systemic": False})
     monkeypatch.setattr(console_app.gateway, "enabled", False)
     monkeypatch.setattr(console_app.gateway, "_connected", False)
-    monkeypatch.setattr(console_app, "_CONSOLE_AUTO_OPEN_BROWSER", False)
+    monkeypatch.setattr(console_app.desktop, "_CONSOLE_AUTO_OPEN_BROWSER", False)
 
     async def no_sleep(_seconds):
         return None
     monkeypatch.setattr(console_app.asyncio, "sleep", no_sleep)
-    run(console_app._startup_prepare())
+    run(console_app.desktop._startup_prepare())
     assert state["ready"] is True
 
     monkeypatch.setattr(console_app.collector, "_running", False)
-    assert console_app._startup_status()["ready"] is True
+    assert console_app.lifecycle._startup_status()["ready"] is True
 
 
 def test_cold_browser_launch_uses_one_process_with_two_tabs(console_app, monkeypatch):
@@ -111,19 +111,19 @@ def test_cold_browser_launch_uses_one_process_with_two_tabs(console_app, monkeyp
     async def fake_activate():
         return None
 
-    monkeypatch.setattr(console_app, "_cdp_alive", fake_alive)
+    monkeypatch.setattr(console_app.desktop, "_cdp_alive", fake_alive)
     monkeypatch.setattr(console_app.asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr(console_app.asyncio, "sleep", no_sleep)
-    monkeypatch.setattr(console_app, "_tv_ensure_browser", fake_tv_ready)
-    monkeypatch.setattr(console_app, "_cdp_page_id", lambda _prefix: "console-tab")
-    monkeypatch.setattr(console_app, "_activate_console_tab", fake_activate)
+    monkeypatch.setattr(console_app.desktop, "_tv_ensure_browser", fake_tv_ready)
+    monkeypatch.setattr(console_app.desktop, "_cdp_page_id", lambda _prefix: "console-tab")
+    monkeypatch.setattr(console_app.desktop, "_activate_console_tab", fake_activate)
 
-    assert run(console_app._workspace_ensure_browser()) is None
+    assert run(console_app.desktop._workspace_ensure_browser()) is None
     assert len(commands) == 1
     command = commands[0]
     assert command[:4] == ("open", "-na", "Google Chrome", "--args")
-    assert console_app._CONSOLE_URL in command
-    assert console_app._TV_CHART_URL in command
+    assert console_app.desktop._CONSOLE_URL in command
+    assert console_app.desktop._TV_CHART_URL in command
 
 
 def test_existing_browser_only_opens_missing_console_tab(console_app, monkeypatch):
@@ -150,12 +150,12 @@ def test_existing_browser_only_opens_missing_console_tab(console_app, monkeypatc
     async def unexpected_exec(*args, **kwargs):
         raise AssertionError("已有浏览器不应再启动 Chrome 进程")
 
-    monkeypatch.setattr(console_app, "_cdp_alive", fake_alive)
-    monkeypatch.setattr(console_app, "_cdp_page_id", fake_page_id)
-    monkeypatch.setattr(console_app, "_cdp_open_tab", fake_open_tab)
-    monkeypatch.setattr(console_app, "_tv_ensure_browser", fake_tv_ready)
-    monkeypatch.setattr(console_app, "_activate_console_tab", fake_activate)
+    monkeypatch.setattr(console_app.desktop, "_cdp_alive", fake_alive)
+    monkeypatch.setattr(console_app.desktop, "_cdp_page_id", fake_page_id)
+    monkeypatch.setattr(console_app.desktop, "_cdp_open_tab", fake_open_tab)
+    monkeypatch.setattr(console_app.desktop, "_tv_ensure_browser", fake_tv_ready)
+    monkeypatch.setattr(console_app.desktop, "_activate_console_tab", fake_activate)
     monkeypatch.setattr(console_app.asyncio, "create_subprocess_exec", unexpected_exec)
 
-    assert run(console_app._workspace_ensure_browser()) is None
-    assert opened == [console_app._CONSOLE_URL]
+    assert run(console_app.desktop._workspace_ensure_browser()) is None
+    assert opened == [console_app.desktop._CONSOLE_URL]

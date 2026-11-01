@@ -41,7 +41,7 @@ def test_disable_waits_for_active_control_call():
 
 def test_local_shutdown_sequence_and_write_lock(console_app, monkeypatch):
     calls = []
-    monkeypatch.setattr(console_app, "_system_stopping", False)
+    monkeypatch.setattr(console_app.system, "_system_stopping", False)
 
     async def disable():
         calls.append("disable_control")
@@ -55,8 +55,8 @@ def test_local_shutdown_sequence_and_write_lock(console_app, monkeypatch):
 
     monkeypatch.setattr(console_app.gateway, "disable_control", disable)
     monkeypatch.setattr(console_app.copy_supervisor, "stop_all", stop_copy)
-    monkeypatch.setattr(console_app, "_close_tws_process", close_tws)
-    monkeypatch.setattr(console_app, "_schedule_console_exit", lambda: calls.append("exit"))
+    monkeypatch.setattr(console_app.system, "_close_tws_process", close_tws)
+    monkeypatch.setattr(console_app.system, "_schedule_console_exit", lambda: calls.append("exit"))
     client = TestClient(console_app.app, client=("127.0.0.1", 50000))
 
     response = client.post("/api/system/shutdown")
@@ -70,7 +70,7 @@ def test_local_shutdown_sequence_and_write_lock(console_app, monkeypatch):
 
 
 def test_remote_client_cannot_shutdown(console_app, monkeypatch):
-    monkeypatch.setattr(console_app, "_system_stopping", False)
+    monkeypatch.setattr(console_app.system, "_system_stopping", False)
 
     async def forbidden():
         raise AssertionError("远程请求不得进入关闭流程")
@@ -79,7 +79,7 @@ def test_remote_client_cannot_shutdown(console_app, monkeypatch):
     client = TestClient(console_app.app)
     response = client.post("/api/system/shutdown")
     assert response.status_code == 403
-    assert console_app._system_stopping is False
+    assert console_app.system._system_stopping is False
 
 
 def test_tws_force_kill_fallback(console_app, monkeypatch):
@@ -96,17 +96,17 @@ def test_tws_force_kill_fallback(console_app, monkeypatch):
     async def wait(_pids, _timeout):
         return next(waits)
 
-    monkeypatch.setattr(console_app, "_tws_pids", pids)
-    monkeypatch.setattr(console_app, "_osascript", quit_tws)
-    monkeypatch.setattr(console_app, "_wait_tws_exit", wait)
+    monkeypatch.setattr(console_app.system, "_tws_pids", pids)
+    monkeypatch.setattr(console_app.desktop, "_osascript", quit_tws)
+    monkeypatch.setattr(console_app.system, "_wait_tws_exit", wait)
     monkeypatch.setattr(console_app.os, "kill", lambda pid, sig: killed.append((pid, sig)))
 
-    assert run(console_app._close_tws_process()) is True
+    assert run(console_app.system._close_tws_process()) is True
     assert killed == [(123, signal.SIGTERM), (123, signal.SIGKILL)]
 
 
 def test_tws_already_closed_is_success(console_app, monkeypatch):
     async def pids():
         return []
-    monkeypatch.setattr(console_app, "_tws_pids", pids)
-    assert run(console_app._close_tws_process()) is True
+    monkeypatch.setattr(console_app.system, "_tws_pids", pids)
+    assert run(console_app.system._close_tws_process()) is True

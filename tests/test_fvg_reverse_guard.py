@@ -7,7 +7,7 @@
 """
 import pytest
 
-from console.app import _fvg_reverse_action
+from engine.execution_rules import fvg_reverse_action as _fvg_reverse_action
 
 
 @pytest.mark.parametrize("side,event,avg_fill,price,expected", [

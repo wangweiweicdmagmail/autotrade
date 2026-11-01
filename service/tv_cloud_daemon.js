@@ -75,11 +75,12 @@ const path = require('path');
 const TradingView = require('@mathieuc/tradingview');
 const { loadIndicatorWithText } = require('./pine_text.js');
 const { emaFromPeriods } = require('./ema.js');
+const { loadPineModels, outputFromPeriod } = require('./pine_models.js');
+const PINE_MODELS = loadPineModels();
 
 const TREND_STATE_ID = 'USER;e577100fe79942b4830783d1ceaad535';
 const FVG_ID = 'USER;5ec7d04179b3429ca9286db452352d85';
 const SMART_STOP_ID = 'USER;ca26e3ab587841e2adb38cfbfd0bec41';
-const EMA9_AUTO_ID = 'USER;a17a52ae5b6642e0a3ddbba23edc9ff3';
 const ATTACK_ZONE_ID = 'USER;8ab4f534e5874b47b24a5ce5c49acace';
 const PUSH_INTERVAL_MS = 1000;      // 输出节流：每秒一次
 const HEARTBEAT_MS = 30000;         // 心跳：每 30s
@@ -147,19 +148,6 @@ function ssFromPeriod(p) {
   };
 }
 
-function e9FromPeriod(p) {
-  if (!p) return {};
-  return {
-    time: p.$time,
-    direction: finite(p.Direction),
-    atr: finite(p.ATR),
-    touch: finite(p.Touch_EMA9),
-    ema_9: finite(p.EMA_9),
-    long_stop: finite(p.Long_Stop),
-    short_stop: finite(p.Short_Stop),
-  };
-}
-
 // 「5M 进攻区域」指标（USER;8ab4f534e5874b47b24a5ce5c49acace）：
 //   Bar_Color      0/1（na = 1e100，finite 转 null）
 //   premarketHigh / premarketLow  当天盘前区间（TV 侧自算，权威来源，
@@ -218,11 +206,13 @@ async function main() {
   const ssIndic = await loadIndicatorWithText(
     TradingView, SMART_STOP_ID, creds);
   // smart_stop 同样用默认输入（ATR10 / 回看 3 / 钳制 1~2×ATR）
-  let ema9AutoIndic = null;
-  try {
-    ema9AutoIndic = await loadIndicatorWithText(TradingView, EMA9_AUTO_ID, creds);
-  } catch (e) {
-    console.error(`[ema9_auto] 指标加载失败，金字塔策略不可启动: ${(e.message || e).toString().slice(0, 240)}`);
+  const modelIndicators = [];
+  for (const model of PINE_MODELS) {
+    try {
+      modelIndicators.push({ model, indicator: await loadIndicatorWithText(TradingView, model.indicator_id, creds) });
+    } catch (e) {
+      console.error(`[pine:${model.id}] 指标加载失败，该模型不可启动: ${(e.message || e).toString().slice(0, 240)}`);
+    }
   }
   let attackIndic = null;
   try {
@@ -250,7 +240,7 @@ async function main() {
     const tsStudy = new chart.Study(trendStateIndic);
     const fvgStudy = new chart.Study(fvgIndic);
     const ssStudy = new chart.Study(ssIndic);
-    const e9Study = ema9AutoIndic ? new chart.Study(ema9AutoIndic) : null;
+    const modelStudies = modelIndicators.map(({ model, indicator }) => ({ model, study: new chart.Study(indicator) }));
     const attackStudy = attackIndic ? new chart.Study(attackIndic) : null;
     entries[symbol] = {
       chart, studies: { attack: attackStudy },
@@ -307,11 +297,11 @@ async function main() {
         if (ps[1]) state[symbol].fvg_c = fvgFromPeriod(ps[1], ps, 1);  // 确认（策略/选股用）
       }
     });
-    if (e9Study) e9Study.onUpdate(() => {
-      const ps = e9Study.periods;
+    for (const { model, study } of modelStudies) study.onUpdate(() => {
+      const ps = study.periods;
       if (ps && ps.length) {
-        state[symbol].e9 = e9FromPeriod(ps[0]);
-        if (ps[1]) state[symbol].e9_c = e9FromPeriod(ps[1]);
+        state[symbol][model.realtime_key] = outputFromPeriod(model, ps[0]);
+        if (ps[1]) state[symbol][model.confirmed_key] = outputFromPeriod(model, ps[1]);
       }
     });
     if (attackStudy) attackStudy.onUpdate(() => {
@@ -401,7 +391,10 @@ async function main() {
     const symbols = {};
     for (const [sym, s] of Object.entries(state)) {
       // smart_stop（ss/ss_c 独立通道）推送时合并进 ts/ts_c，消费方无感知
-      if (s.bar) symbols[sym] = { bar: s.bar, bar_c: s.bar_c, bar_c2: s.bar_c2, ts: { ...s.ts, ...s.ss, ema_9: s.ema_9 }, ts_c: { ...s.ts_c, ...s.ss_c, ema_9: s.ema_9_c }, fvg: s.fvg, fvg_c: s.fvg_c, attack: s.attack, attack_c: s.attack_c, e9: s.e9, e9_c: s.e9_c };
+      if (s.bar) symbols[sym] = { bar: s.bar, bar_c: s.bar_c, bar_c2: s.bar_c2, ts: { ...s.ts, ...s.ss, ema_9: s.ema_9 }, ts_c: { ...s.ts_c, ...s.ss_c, ema_9: s.ema_9_c }, fvg: s.fvg, fvg_c: s.fvg_c, attack: s.attack, attack_c: s.attack_c, ...Object.fromEntries(PINE_MODELS.flatMap(model => [
+        [model.realtime_key, s[model.realtime_key] || {}],
+        [model.confirmed_key, s[model.confirmed_key] || {}],
+      ])) };
     }
     if (Object.keys(symbols).length > 0) {
       process.stdout.write(JSON.stringify({

@@ -7,7 +7,7 @@
   <link rel="icon" href="data:," />
   <link rel="stylesheet" href="https://unpkg.com/element-plus@2.9.1/dist/index.css" />
   <link rel="stylesheet" href="https://unpkg.com/element-plus@2.9.1/theme-chalk/dark/css-vars.css" />
-  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/style.css?v=pine-models-2" />
 </head>
 <body>
   <div id="app" v-cloak>
@@ -181,47 +181,74 @@
           <el-tag :type="autoView.enabled ? 'success' : 'info'" size="small">
             {{ autoView.enabled ? '运行中' : '已停止' }}{{ autoView.strategy ? ' · ' + autoView.strategy : '' }}
           </el-tag>
+          <el-select v-model="autoModel" size="small" style="width:180px" :disabled="demoMode" aria-label="Pine策略模型">
+            <el-option v-for="model in autoModels" :key="model.id" :label="model.name" :value="model.id"></el-option>
+          </el-select>
+          <el-input v-model="autoInstanceId" size="small" style="width:120px" placeholder="执行实例标识" :disabled="demoMode" aria-label="执行实例标识"></el-input>
           <el-input v-model="autoSymbols" size="small" placeholder="输入标的，如 NVDA（最多5组）" style="width:300px"></el-input>
           <el-button size="small" type="primary" :loading="autoBusy" @click="startAuto">启动全自动</el-button>
           <el-button size="small" type="warning" :disabled="!autoView.enabled" @click="stopAuto(false)">停止新开仓</el-button>
           <el-button size="small" type="danger" :disabled="!autoView.enabled" @click="stopAuto(true)">停止并全平</el-button>
           <el-button size="small" :type="demoMode ? 'warning' : 'info'" @click="demoMode = !demoMode">{{ demoMode ? '退出演示' : '演示数据' }}</el-button>
-          <span class="muted">EMA9实时触线全自动 · 2R解锁加仓 · 首仓=顶栏单笔资金，后续2/3、1/3 · 最多3次</span>
+          <span class="muted">Pine 指标提供信号、方向与止损 · 公共执行器负责风控和订单</span>
+          <span class="auto-params" v-if="autoModel === 'ema9_pyramid' && autoInstanceId === 'default'">
+            <small class="muted">EMA9-ST-ATR 默认实例 · 3-2-1兼容执行配置</small>
+            <span class="risk-label">自动保本</span>
+            <el-switch v-model="pyramidAutoBreakeven" :disabled="demoMode"
+                       @change="v => savePyramidParam('pyramid_auto_breakeven', v)"></el-switch>
+            <el-input-number v-model="pyramidBreakevenR" :min="0.1" :max="20" :step="0.5"
+                             size="small" controls-position="right" style="width:82px"
+                             :disabled="demoMode || !pyramidAutoBreakeven"
+                             @focus="pyramidParamsDirty = true" @blur="pyramidParamsDirty = false"
+                             @change="v => savePyramidParam('pyramid_breakeven_r', v)"></el-input-number>
+            <span class="risk-label">R</span>
+            <span class="risk-label auto-add-label">加仓解锁</span>
+            <el-input-number v-model="pyramidAddUnlockR" :min="0.1" :max="20" :step="0.5"
+                             size="small" controls-position="right" style="width:82px" :disabled="demoMode"
+                             @focus="pyramidParamsDirty = true" @blur="pyramidParamsDirty = false"
+                             @change="v => savePyramidParam('pyramid_add_unlock_r', v)"></el-input-number>
+            <span class="risk-label">R</span>
+          </span>
         </div>
         <div v-if="demoMode" class="demo-banner">仅前端演示数据，不会写入订单或调用下单接口</div>
         <div class="auto-main-scroll">
           <div class="auto-table-wrap"><div class="auto-table">
             <div class="perf-row shadow-dist-head auto-table-head">
               <span>操作</span><span class="perf-name">标的</span><span>状态</span><span>方向/次数</span>
-              <span>均价/整组止损</span><span>整组R / 第二仓R</span><span>下一步</span><span>实时盈亏</span><span>最大仓位</span>
+              <span>均价/整组止损</span><span>当前R / 成交后MFE</span><span>下一步</span><span>实时盈亏</span><span>最大仓位</span>
             </div>
             <div v-for="i in autoView.instances" :key="i.inst_id" class="auto-instance-group">
               <div class="perf-row auto-instance-row">
                 <span class="auto-actions">
                   <el-button size="small" class="auto-detail-toggle" @click="viewAutoOrders(i)">
-                    {{ expandedAutoOrders[i.symbol] ? '▾ 明细' : '▸ 明细' }}
+                    {{ expandedAutoOrders[i.inst_id || i.symbol] ? '▾ 明细' : '▸ 明细' }}
                   </el-button>
                   <el-button size="small" type="warning" @click="stopAutoInstance(i, false)">停止加仓</el-button>
                   <el-button size="small" type="danger" :disabled="!i.entries" @click="stopAutoInstance(i, true)">整组平仓</el-button>
                 </span>
-                <span class="perf-name">{{ i.symbol.split(':').pop() }}<small v-if="i.source === 'manual_seed'" class="manual-seed">手动首仓</small></span>
-                <span><el-tag size="small" :type="autoStateTag(i.state)">{{ i.state }}</el-tag></span>
+                <span class="perf-name">{{ i.symbol.split(':').pop() }}<small class="auto-meta">{{ autoModelName(i.strategy) }} · {{ i.strategy_instance_id || 'default' }}</small><small v-if="i.source === 'manual_seed'" class="manual-seed">手动首仓</small></span>
+                <span><el-tag size="small" :type="autoStateTag(i.state)">{{ i.state }}</el-tag><small v-if="i.restored" class="auto-meta">{{ i.recovery_block_reason ? '恢复待核验' : (i.enabled ? '已恢复' : '已恢复 · 加仓需启用') }}</small></span>
                 <span :class="i.side === 'long' ? 'pnl-pos' : (i.side === 'short' ? 'pnl-neg' : 'muted')">
                   {{ i.start_direction === 1 ? '锁多' : (i.start_direction === -1 ? '锁空' : '') }} / {{ i.entries || 0 }}次{{ i.unlocked ? ' · 已解锁' : '' }}
                 </span>
                 <span>{{ i.avg_cost || '—' }} / {{ i.stop_px || '—' }}</span>
-                <span :class="pnlClass(i.unrealized_r)">{{ i.state === 'ACTIVE' ? i.unrealized_r + 'R' : '—' }} / {{ i.entries === 2 ? i.second_mfe_r + 'R' : '—' }}</span>
-                <b class="auto-next">{{ autoNext(i) }}</b>
+                <span :class="pnlClass(i.unrealized_r)">{{ i.qty ? i.unrealized_r + 'R' : '—' }} / {{ i.qty ? i.mfe_r + 'R' : '—' }}<small v-if="i.entries >= 2" class="auto-meta">第二仓 MFE {{ i.second_mfe_r }}R / 1R</small></span>
+                <b class="auto-next">{{ autoNext(i) }}<small class="auto-meta">{{ i.breakeven_done ? '整组已保本' : (pyramidAutoBreakeven ? '待达到保本门槛' : '自动保本已关闭') }}</small></b>
                 <b :class="pnlClass(autoPnl(i))">{{ autoPnl(i) == null ? '—' : fmtMoney(autoPnl(i)) }}</b>
                 <span>{{ i.max_position_pct == null ? '—' : i.max_position_pct + '%' }}</span>
               </div>
-              <div v-if="expandedAutoOrders[i.symbol] && autoLotRows(i).length" class="auto-order-detail">
+              <div class="auto-risk-strip" :class="{ 'auto-recovery-warning': i.recovery_block_reason }">
+                <span>{{ autoRiskText(i) }}</span>
+                <span v-if="i.initial_r">首仓 1R = {{ fmt2(i.initial_r) }} / 股 · 累计建仓 {{ i.entries }}/3</span>
+                <span v-if="i.recovery_block_reason">{{ i.recovery_block_reason }}；保护与退出继续管理</span>
+              </div>
+              <div v-if="expandedAutoOrders[i.inst_id || i.symbol] && autoLotRows(i).length" class="auto-order-detail">
                 <div class="auto-order-head"><b>实际订单（{{ autoLotRows(i).length }}）</b><span class="muted">成交、止损与订单操作</span></div>
                 <div class="auto-order-row auto-order-columns">
                   <span>次数/类型</span><span>状态</span><span>股数</span><span>成交均价</span><span>止损</span><span>盈亏</span><span>操作</span>
                 </div>
                 <div v-for="o in autoLotRows(i)" :key="o.lot_id" class="auto-order-row">
-                  <span>第{{ (o.signal_snapshot && o.signal_snapshot.entry_index) || 1 }}次<small class="order-kind">{{ o.limit_type === 'auto_ema9_pyramid' ? '自动' : '手动' }}</small></span>
+                  <span>第{{ (o.signal_snapshot && o.signal_snapshot.entry_index) || 1 }}次<small class="order-kind">{{ o.limit_type === 'auto_ema9_pyramid' ? '自动' : '手动' }}</small><small class="auto-meta">{{ orderRiskText(o) }}</small></span>
                   <span><el-tag size="small" :type="stateTag(o.state)">{{ o.state }}</el-tag></span>
                   <span>{{ o.filled_qty || o.qty }}</span>
                   <span>{{ (o.avg_fill || o.entry_px).toFixed(2) }}</span>
@@ -1224,6 +1251,6 @@
 
   <script src="https://unpkg.com/vue@3.5.13/dist/vue.global.prod.js"></script>
   <script src="https://unpkg.com/element-plus@2.9.1/dist/index.full.min.js"></script>
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=pine-models-2"></script>
 </body>
 </html>

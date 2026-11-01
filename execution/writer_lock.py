@@ -4,12 +4,13 @@ import fcntl
 from pathlib import Path
 
 _lock_handle = None
+_lock_owner = None
 
 
-def acquire_writer_lock(path: str) -> bool:
-    global _lock_handle
+def acquire_writer_lock(path: str, owner=None) -> bool:
+    global _lock_handle, _lock_owner
     if _lock_handle is not None:
-        return True
+        return owner is _lock_owner
     lock_path = Path(path)
     if not lock_path.is_absolute():
         lock_path = Path(__file__).resolve().parent.parent / lock_path
@@ -21,11 +22,14 @@ def acquire_writer_lock(path: str) -> bool:
         handle.close()
         return False
     _lock_handle = handle
+    _lock_owner = owner
     return True
 
 
-def release_writer_lock() -> None:
-    global _lock_handle
+def release_writer_lock(owner=None) -> None:
+    global _lock_handle, _lock_owner
+    if owner is not None and owner is not _lock_owner:
+        return
     if _lock_handle is None:
         return
     try:
@@ -33,3 +37,4 @@ def release_writer_lock() -> None:
     finally:
         _lock_handle.close()
         _lock_handle = None
+        _lock_owner = None

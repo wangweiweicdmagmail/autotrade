@@ -89,11 +89,11 @@ def test_api_returns_comparison(console_app, monkeypatch):
 
     async def status():
         return {"equity": 10200, "daily_pnl": 100}
-    monkeypatch.setattr(app, "get_status_cached", status)
+    monkeypatch.setattr(app.accounts, "get_status_cached", status)
     saved = []
     monkeypatch.setattr(rc, "save_equity_anchor", lambda _p, d, e: saved.append((d, e)))
 
-    result = run(app.api_returns_compare("2026-10-20", "2026-10-20"))
+    result = run(app.research.api_returns_compare("2026-10-20", "2026-10-20"))
     assert result["rows"][0]["account_return"] == pytest.approx(0.01)
     assert result["rows"][0]["qqq_return"] == pytest.approx(0.02)
     assert result["summary"]["excess_return"] == pytest.approx(-0.01)
@@ -104,7 +104,7 @@ def test_api_returns_comparison(console_app, monkeypatch):
 def test_api_rejects_invalid_range_before_io(console_app, monkeypatch):
     async def must_not_query():
         raise AssertionError("非法日期不应查询账户状态")
-    monkeypatch.setattr(console_app, "get_status_cached", must_not_query)
+    monkeypatch.setattr(console_app.accounts, "get_status_cached", must_not_query)
     with pytest.raises(console_app.HTTPException) as exc:
-        run(console_app.api_returns_compare("2026-10-21", "2026-10-20"))
+        run(console_app.research.api_returns_compare("2026-10-21", "2026-10-20"))
     assert exc.value.status_code == 400

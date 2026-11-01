@@ -1,4 +1,9 @@
-# autotrade — 人机结合交易系统（TradingView 信号 × IBKR 执行）
+# autotrade — Pine 策略驱动的自动化量化执行系统
+
+> 当前交接基线：2026-11-02 第一阶段里程碑，见 [成果记录](docs/milestones/2026-11-02-phase1.md) 和 [当前架构](ARCHITECTURE.md)。
+> Pine 指标实现策略，Python 实现公共执行。首个模型是用户的 EMA9-ST-ATR；`ema9_pyramid` 是保留的兼容标识。
+> 生产入口为 `console.app:app`；`main.py` 和 `auto_runner.py` 保留为历史入口。
+> 下方 2026-10 的“当前状态”“已确认”及人工提案/TRAIL 描述为历史记录，不能覆盖上述最新边界。
 
 > 开发日志 / 交接文档。最后更新：2026-10-02（浏览器模式切换 + v2 全量化订单）。
 > **本文档自包含**：所有 IBKR 实战经验已完整收录于第 6 章，不再依赖

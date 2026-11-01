@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "strategies": [
+    {
+      "id": "ema9_pyramid",
+      "name": "EMA9-ST-ATR",
+      "indicator_id": "USER;a17a52ae5b6642e0a3ddbba23edc9ff3",
+      "realtime_key": "e9",
+      "confirmed_key": "e9_c",
+      "plots": {
+        "direction": "Direction",
+        "atr": "ATR",
+        "touch": "Touch_EMA9",
+        "ema_9": "EMA_9",
+        "long_stop": "Long_Stop",
+        "short_stop": "Short_Stop"
+      },
+      "fields": {
+        "entry_signal": "touch",
+        "direction": "direction",
+        "entry_price": "ema_9",
+        "long_stop": "long_stop",
+        "short_stop": "short_stop"
+      },
+      "execution_profile": "ema9_legacy_pyramid"
+    }
+  ]
+}

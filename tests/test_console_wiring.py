@@ -39,10 +39,10 @@ def app(console_app, monkeypatch):
     """console.app + 突破子系统状态全部换成临时实例（结束自动还原）。"""
     import collections
     monkeypatch.setattr(console_app, "breakout_tracker", BreakoutTracker())
-    monkeypatch.setattr(console_app, "_breakout_last_bar", {})
-    monkeypatch.setattr(console_app, "_breakout_pending", {})
-    monkeypatch.setattr(console_app, "_breakout_injected", {})
-    monkeypatch.setattr(console_app, "_breakout_signals", collections.deque())
+    monkeypatch.setattr(console_app.signals, "_breakout_last_bar", {})
+    monkeypatch.setattr(console_app.signals, "_breakout_pending", {})
+    monkeypatch.setattr(console_app.signals, "_breakout_injected", {})
+    monkeypatch.setattr(console_app.signals, "_breakout_signals", collections.deque())
     return console_app
 
 
@@ -63,7 +63,7 @@ def test_breakout_wiring_end_to_end(app):
         times.update(b["time"] for b in bars)
 
     for sym in syms:   # 首次建基线（模拟 loop 里 prev is None）
-        app._breakout_last_bar[sym] = -1
+        app.signals._breakout_last_bar[sym] = -1
 
     from zoneinfo import ZoneInfo
     et = ZoneInfo("America/New_York")
@@ -96,38 +96,38 @@ def test_breakout_wiring_end_to_end(app):
                     and pml is not None and pmh > pml > 0
                     and dt_et.hour * 60 + dt_et.minute >= 570):
                 day = dt_et.strftime("%Y-%m-%d")
-                if app._breakout_injected.get(sym) != day:
+                if app.signals._breakout_injected.get(sym) != day:
                     if app.breakout_tracker.set_premarket(sym, pmh, pml, day):
-                        app._breakout_injected[sym] = day
-            pend = app._breakout_pending.get(sym)
+                        app.signals._breakout_injected[sym] = day
+            pend = app.signals._breakout_pending.get(sym)
             if pend is not None:
                 p_bt, p_bar, retries = pend
                 fvg_c = data.get("fvg_c") or {}
                 if fvg_c.get("time") == p_bt:
-                    app._breakout_pending.pop(sym, None)
-                    app._feed_breakout(sym, p_bar, data, fed_times)
+                    app.signals._breakout_pending.pop(sym, None)
+                    app.signals._feed_breakout(sym, p_bar, data, fed_times)
                 elif retries <= 0:
-                    app._breakout_pending.pop(sym, None)
+                    app.signals._breakout_pending.pop(sym, None)
                 else:
-                    app._breakout_pending[sym] = (p_bt, p_bar, retries - 1)
-            prev = app._breakout_last_bar.get(sym)
+                    app.signals._breakout_pending[sym] = (p_bt, p_bar, retries - 1)
+            prev = app.signals._breakout_last_bar.get(sym)
             if prev is None:
-                app._breakout_last_bar[sym] = bt
+                app.signals._breakout_last_bar[sym] = bt
                 continue
             if bt <= prev:
                 continue
-            app._breakout_last_bar[sym] = bt
+            app.signals._breakout_last_bar[sym] = bt
             fvg_c = data.get("fvg_c") or {}
             fvg_t = fvg_c.get("time")
             if fvg_t is not None and fvg_t != bt:
-                app._breakout_pending[sym] = (bt, dict(bar_c), 5)
+                app.signals._breakout_pending[sym] = (bt, dict(bar_c), 5)
                 continue
-            app._feed_breakout(sym, bar_c, data, fed_times)
+            app.signals._feed_breakout(sym, bar_c, data, fed_times)
         for ft in sorted(fed_times):
             for sig in app.breakout_tracker.flush(ft):
-                app._emit_breakout(sig)
+                app.signals._emit_breakout(sig)
 
-    sigs = sorted(app._breakout_signals,
+    sigs = sorted(app.signals._breakout_signals,
                   key=lambda s: (s["confirm_hm"], s["ticker"]))
     assert len(sigs) == len(EXPECTED), [s["symbol"] for s in sigs]
     for s, (sym, side, ctm, btm, close, pmh, pml) in zip(sigs, EXPECTED):
@@ -136,7 +136,7 @@ def test_breakout_wiring_end_to_end(app):
         assert s["close"] == close
         assert s["premarket_high"] == pmh and s["premarket_low"] == pml
     # 注入路径确实走通（有 symbol 被注入过）
-    assert app._breakout_injected, "attack_c 注入未发生"
+    assert app.signals._breakout_injected, "attack_c 注入未发生"
     # 信号 id/ts 出口字段完整（前端信号栏依赖）
     for s in sigs:
         assert s["id"].endswith(":breakout") and s["ts"] > 0

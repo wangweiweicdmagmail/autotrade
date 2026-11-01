@@ -7,6 +7,7 @@
 快照 copy 段 = 配置 + 状态文件白名单合入。TestClient 不起服务、路径全在
 tmp_path、subprocess 全 mock。
 """
+from console.services.copy import CopySupervisor
 import asyncio
 import json
 import time
@@ -19,9 +20,9 @@ from .conftest import run
 
 @pytest.fixture
 def app(console_app, monkeypatch):
-    monkeypatch.setattr(console_app, "_is_local", lambda request: True)
+    monkeypatch.setattr(console_app.clients, "_is_local", lambda request: True)
     console_app._events_test = []
-    monkeypatch.setattr(console_app, "record_event",
+    monkeypatch.setattr(console_app.events, "record_event",
                         lambda t, **d: console_app._events_test.append(
                             {"type": t, **d}))
     return console_app
@@ -156,17 +157,17 @@ def test_supervisor_reload_lifecycle(app, tmp_path, monkeypatch):
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
     fake_trader = tmp_path / "copy_trader.py"
     fake_trader.write_text("# fake\n")
-    monkeypatch.setattr(app, "_COPY_TRADER_PY", fake_trader)
+    monkeypatch.setattr(app.copy, "_COPY_TRADER_PY", fake_trader)
 
     async def go():
         # 文件缺失 → 只告警不启动
-        monkeypatch.setattr(app, "_COPY_TRADER_PY", tmp_path / "nope.py")
-        sup0 = app.CopySupervisor()
+        monkeypatch.setattr(app.copy, "_COPY_TRADER_PY", tmp_path / "nope.py")
+        sup0 = CopySupervisor(app)
         await sup0.start([mk_cfg("X")])
         assert not sup0._running and not fake_procs
-        monkeypatch.setattr(app, "_COPY_TRADER_PY", fake_trader)
+        monkeypatch.setattr(app.copy, "_COPY_TRADER_PY", fake_trader)
 
-        sup = app.CopySupervisor()
+        sup = CopySupervisor(app)
         monkeypatch.setattr(app, "copy_supervisor", sup)
         await sup.start([mk_cfg("A", enabled=True), mk_cfg("B", enabled=False)])
         assert sup.process_alive("A") and not sup.process_alive("B")
@@ -247,10 +248,10 @@ def test_snapshot_copy_section(app, tmp_path, monkeypatch):
     async def fake_status():
         return {"equity": None, "daily_pnl": None, "ts": time.time()}
 
-    monkeypatch.setattr(app, "get_status_cached", fake_status)
+    monkeypatch.setattr(app.accounts, "get_status_cached", fake_status)
 
     async def go():
-        snap = await app.build_snapshot()
+        snap = await app.snapshot.build_snapshot()
         assert "copy" in snap and "servers" in snap["copy"]
         row = next(s for s in snap["copy"]["servers"] if s["name"] == "A")
         assert row["client_id"] == 13 and row["size_mode"] == "risk"
@@ -262,7 +263,7 @@ def test_snapshot_copy_section(app, tmp_path, monkeypatch):
         assert row["process_alive"] is False
         assert "internal_field" not in row
         (tmp_path / "copy-A-status.json").unlink()
-        snap2 = await app.build_snapshot()
+        snap2 = await app.snapshot.build_snapshot()
         row2 = snap2["copy"]["servers"][0]
         assert row2["connected"] is None and row2["orders"] is None
         assert row2["process_alive"] is False

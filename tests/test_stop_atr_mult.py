@@ -6,6 +6,7 @@
 越界 400 且不污染当前值；落盘持久化（tmp 路径）；lot 固化 atr_mult
 （突破成交补挂止损沿用下单口径）；策略 params 缺省回退全局默认。
 """
+from console import schemas
 import json
 
 import pytest
@@ -24,26 +25,26 @@ DATA = {
 
 @pytest.fixture
 def app(console_app, monkeypatch):
-    console_app._settings.clear()          # 缺键 → 回退 config 默认
-    console_app._fvg_events.clear()
-    monkeypatch.setattr(console_app, "_equity_cache",
+    console_app.settings._settings.clear()          # 缺键 → 回退 config 默认
+    console_app.signals._fvg_events.clear()
+    monkeypatch.setattr(console_app.accounts, "_equity_cache",
                         {"equity": 100000.0, "daily_pnl": 0.0, "ts": 9e18})
     yield console_app
-    console_app._fvg_events.clear()
+    console_app.signals._fvg_events.clear()
 
 
 def test_default_matches_config(app):
     """① 默认 1.0 时各定价函数与原 1×ATR 口径一致。"""
-    assert app._stop_atr_mult() == config.STOP_ATR_MULT
-    limit, stop, breakout, bar, atr = app._midpoint_prices(DATA, "long")
+    assert app.settings._stop_atr_mult() == config.STOP_ATR_MULT
+    limit, stop, breakout, bar, atr = app.trading._midpoint_prices(DATA, "long")
     assert (limit, stop) == (100.0, 98.0)
-    limit, stop = app._market_prices(DATA, "long")
+    limit, stop = app.trading._market_prices(DATA, "long")
     assert stop == 98.0
-    limit, stop = app._market_prices(DATA, "short")
+    limit, stop = app.trading._market_prices(DATA, "short")
     assert stop == 102.0
-    app._fvg_events.append({"symbol": "NASDAQ:NVDA", "side": "long",
+    app.signals._fvg_events.append({"symbol": "NASDAQ:NVDA", "side": "long",
                             "top": 100.0, "bottom": 99.0})
-    limit, stop = app._fvg_chase_prices(DATA, "long", "NASDAQ:NVDA")
+    limit, stop = app.trading._fvg_chase_prices(DATA, "long", "NASDAQ:NVDA")
     assert stop == 98.0
 
 
@@ -61,53 +62,53 @@ def test_post_1_5x_reprices_immediately(app):
         "ts": {"atr": 2.0, "direction": 1},
         "ts_c": {"atr": 2.0, "direction": 1},
     }
-    app._fvg_events.append({"symbol": "NASDAQ:NVDA", "side": "long",
+    app.signals._fvg_events.append({"symbol": "NASDAQ:NVDA", "side": "long",
                             "top": 100.0, "bottom": 99.0})
     # 默认 1.0× 基线
-    assert app._midpoint_prices(data2, "long")[1] == 96.5
-    assert app._market_prices(data2, "long")[1] == 98.0
-    assert app._market_prices(data2, "short")[1] == 102.0
-    assert app._fvg_chase_prices(data2, "long", "NASDAQ:NVDA")[1] == 98.0
+    assert app.trading._midpoint_prices(data2, "long")[1] == 96.5
+    assert app.trading._market_prices(data2, "long")[1] == 98.0
+    assert app.trading._market_prices(data2, "short")[1] == 102.0
+    assert app.trading._fvg_chase_prices(data2, "long", "NASDAQ:NVDA")[1] == 98.0
 
-    r = run(app.api_update_settings(app.SettingsRequest(stop_atr_mult=1.5),
+    r = run(app.settings.api_update_settings(schemas.SettingsRequest(stop_atr_mult=1.5),
                                     trader="master"))
     assert r["ok"] and r["stop_atr_mult"] == 1.5
-    assert run(app.api_get_settings())["stop_atr_mult"] == 1.5
-    assert app._midpoint_prices(data2, "long")[1] == 96.0    # 钳制上限 3.0
-    assert app._market_prices(data2, "long")[1] == 97.0
-    assert app._market_prices(data2, "short")[1] == 102.8
-    assert app._fvg_chase_prices(data2, "long", "NASDAQ:NVDA")[1] == 97.0
+    assert run(app.settings.api_get_settings())["stop_atr_mult"] == 1.5
+    assert app.trading._midpoint_prices(data2, "long")[1] == 96.0    # 钳制上限 3.0
+    assert app.trading._market_prices(data2, "long")[1] == 97.0
+    assert app.trading._market_prices(data2, "short")[1] == 102.8
+    assert app.trading._fvg_chase_prices(data2, "long", "NASDAQ:NVDA")[1] == 97.0
 
 
 def test_snapshot_carries_value(app):
     """③ 快照 status 带新值。"""
-    run(app.api_update_settings(app.SettingsRequest(stop_atr_mult=1.5),
+    run(app.settings.api_update_settings(schemas.SettingsRequest(stop_atr_mult=1.5),
                                 trader="master"))
-    snap = run(app.build_snapshot())
+    snap = run(app.snapshot.build_snapshot())
     assert snap["status"]["stop_atr_mult"] == 1.5
 
 
 def test_range_guard(app):
     """④ 越界 0.1 / 6 → 400，且不污染当前值。"""
-    run(app.api_update_settings(app.SettingsRequest(stop_atr_mult=1.5),
+    run(app.settings.api_update_settings(schemas.SettingsRequest(stop_atr_mult=1.5),
                                 trader="master"))
     for bad in (0.1, 6.0):
         with pytest.raises(app.HTTPException) as ei:
-            run(app.api_update_settings(app.SettingsRequest(stop_atr_mult=bad),
+            run(app.settings.api_update_settings(schemas.SettingsRequest(stop_atr_mult=bad),
                                         trader="master"))
         assert ei.value.status_code == 400
-    assert app._stop_atr_mult() == 1.5
+    assert app.settings._stop_atr_mult() == 1.5
 
 
 def test_persist_and_reload(app):
     """⑤ 落盘后重载（模拟重启）值保持。"""
-    run(app.api_update_settings(app.SettingsRequest(stop_atr_mult=1.5),
+    run(app.settings.api_update_settings(schemas.SettingsRequest(stop_atr_mult=1.5),
                                 trader="master"))
-    payload = json.loads(app._SETTINGS_PATH.read_text(encoding="utf-8"))
+    payload = json.loads(app.settings._SETTINGS_PATH.read_text(encoding="utf-8"))
     assert payload.get("stop_atr_mult") == 1.5
-    app._settings.clear()
-    app._settings.update(app._load_settings())   # 模拟重启重载
-    assert app._stop_atr_mult() == 1.5
+    app.settings._settings.clear()
+    app.settings._settings.update(app.settings._load_settings())   # 模拟重启重载
+    assert app.settings._stop_atr_mult() == 1.5
 
 
 def test_lot_atr_mult_frozen(app, tmp_path):

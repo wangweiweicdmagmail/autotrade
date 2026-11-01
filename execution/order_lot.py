@@ -166,6 +166,7 @@ class OrderManager:
         self._risk = risk_gate
         self._state_path = Path(state_path)
         self._lots: Dict[str, OrderLot] = {}
+        self._pyramid_groups: dict = {}
         self._locks: Dict[str, asyncio.Lock] = {}       # 每 lot 串行化撤改平与 watcher
         self._recent_places: Dict[tuple, float] = {}   # 下单幂等：近期相同单时间戳
         self._watchers: Dict[tuple, asyncio.Task] = {}  # (lot_id, kind) -> watcher 任务
@@ -310,6 +311,10 @@ class OrderManager:
 
         # 幂等：2 秒内相同 symbol+side+限价+止损 视为重复提交（防双击/重试）
         key = (symbol, side, round(limit_px, 2), round(stop_px, 2))
+        ownership = signal_snapshot or {}
+        if ownership.get("strategy_id"):
+            key += (ownership["strategy_id"], ownership.get("strategy_instance_id", "default"),
+                    ownership.get("group_id"), ownership.get("entry_index"))
         now = time.time()
         last = self._recent_places.get(key)
         if last is not None and now - last < 2.0:
@@ -1746,6 +1751,17 @@ class OrderManager:
     def get(self, lot_id: str) -> Optional[OrderLot]:
         return self._lots.get(lot_id)
 
+    def pyramid_states(self) -> dict:
+        import copy
+        return copy.deepcopy(self._pyramid_groups)
+
+    def save_pyramid_state(self, group_id: str, state: dict) -> None:
+        if self._pyramid_groups.get(group_id) == state:
+            return
+        import copy
+        self._pyramid_groups[group_id] = copy.deepcopy(state)
+        self._save()
+
     def mark_pyramid_seed(self, lot_id: str, risk_dist: float,
                           initial_risk_usd: float) -> None:
         lot = self._lots.get(lot_id)
@@ -1757,6 +1773,12 @@ class OrderManager:
                                "initial_risk_usd": float(initial_risk_usd),
                                "entry_index": 1}
         self._save()
+
+    def mark_pyramid_group(self, lot_id: str, meta: dict) -> None:
+        lot = self._lots.get(lot_id)
+        if lot is not None:
+            lot.signal_snapshot = {**lot.signal_snapshot, **meta}
+            self._save()
 
     async def reprice_midpoint_lot(self, lot_id: str, new_limit: float,
                                    new_stop: float, bar_time: float,
@@ -2151,10 +2173,13 @@ class OrderManager:
         try:
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
             payload = {"lots": [l.to_dict() for l in self._lots.values()],
+                       "pyramid_groups": self._pyramid_groups,
                        "saved_at": time.time()}
-            self._state_path.write_text(
+            temporary = self._state_path.with_suffix(self._state_path.suffix + ".tmp")
+            temporary.write_text(
                 json.dumps(payload, ensure_ascii=False, indent=2),
                 encoding="utf-8")
+            temporary.replace(self._state_path)
         except OSError:
             logger.exception("lot 状态落盘失败")
 
@@ -2163,6 +2188,7 @@ class OrderManager:
             return
         try:
             payload = json.loads(self._state_path.read_text(encoding="utf-8"))
+            self._pyramid_groups = payload.get("pyramid_groups") or {}
             for d in payload.get("lots", []):
                 lot = OrderLot.from_dict(d)
                 self._lots[lot.lot_id] = lot
