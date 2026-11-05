@@ -1,4 +1,4 @@
-"""策略执行端口。模拟价格推进与交易组存储是独立能力。"""
+"""策略执行端口。兼容方法名保留；meta.entry_order_type 显式区分 MKT/LMT。"""
 
 from typing import Optional, Protocol, runtime_checkable
 

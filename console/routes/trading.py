@@ -3,7 +3,7 @@
 from fastapi import Depends
 from typing import List
 from typing import Optional
-from console.schemas import LimitStopOrderRequest, UpdateTrailRequest
+from console.schemas import LimitStopOrderRequest, OpeningBreakoutOrderRequest, OpeningBreakoutPrepareRequest, UpdateTrailRequest
 from console.dependencies import get_services, require_trader
 from fastapi import APIRouter
 
@@ -33,6 +33,26 @@ async def api_place_limit_stop(
     services=Depends(get_services),
 ) -> dict:
     return await services.trading.api_place_limit_stop(req=req, trader=trader)
+
+
+@router.post("/api/lots/opening-breakout")
+async def api_place_opening_breakout(
+    req: OpeningBreakoutOrderRequest,
+    trader: str = Depends(require_trader),
+    *,
+    services=Depends(get_services),
+) -> dict:
+    return await services.trading.api_place_opening_breakout(req, trader)
+
+
+@router.post("/api/lots/opening-breakout/prepare")
+async def api_prepare_opening_breakout(
+    req: OpeningBreakoutPrepareRequest,
+    trader: str = Depends(require_trader),
+    *,
+    services=Depends(get_services),
+) -> dict:
+    return services.signals.prepare_opening_breakout(req, trader)
 
 
 @router.post("/api/lots/{lot_id}/trail")

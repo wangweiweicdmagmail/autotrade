@@ -7,7 +7,7 @@
   <link rel="icon" href="data:," />
   <link rel="stylesheet" href="https://unpkg.com/element-plus@2.9.1/dist/index.css" />
   <link rel="stylesheet" href="https://unpkg.com/element-plus@2.9.1/theme-chalk/dark/css-vars.css" />
-  <link rel="stylesheet" href="/static/style.css?v=pine-models-2" />
+  <link rel="stylesheet" href="/static/style.css?v=opening-breakout-feed-2" />
 </head>
 <body>
   <div id="app" v-cloak>
@@ -17,59 +17,93 @@
         <div class="brand-line">
           <span class="logo">autotrade</span>
           <button class="deck-toggle-btn" @click="deckCollapsed = !deckCollapsed"
-                  :title="deckCollapsed ? '展开交易台' : '收起交易台'">⚡ {{ deckCollapsed ? '▶' : '◀' }}</button>
-          <span class="sub">交易控制台 · 5M 实时 · 限价 + STOP 子单</span>
+                  :title="deckCollapsed ? '展开手动交易' : '收起手动交易'">手动交易 {{ deckCollapsed ? '▶' : '◀' }}</button>
+          <span class="sub">交易控制台 · 5M 实时 · 市价/限价 + STOP 保护单</span>
         </div>
         <el-button v-if="traderName === 'master'" size="small" type="danger" plain
                    class="shutdown-btn" :loading="systemClosing" @click="confirmShutdown">关闭系统</el-button>
       </div>
       <div class="statusbar">
         <div class="status-row">
-          <span class="risk-input">
-            <span class="risk-label">单笔资金 $</span>
-            <el-input-number v-model="riskUsd" :min="10" :step="100" size="small" controls-position="right" style="width:110px"></el-input-number>
-          </span>
-          <span class="risk-input">
-            <span class="risk-label">最大仓位</span>
-            <el-input-number v-model="maxPositionPct" :min="10" :max="200" :step="10" size="small" controls-position="right" style="width:110px"></el-input-number>
-          </span>
-          <span class="risk-input">
-            <!-- 全局止损 ATR 倍数：值以快照为准（全客户端同步），编辑中不被快照覆盖 -->
-            <span class="risk-label">止损 ATR×</span>
-            <el-input-number v-model="atrMult" :min="0.2" :max="5" :step="0.1" size="small" controls-position="right" style="width:110px"
-                             @focus="atrMultDirty = true" @blur="atrMultDirty = false" @change="saveAtrMult"></el-input-number>
-          </span>
-          <span class="risk-input">
-            <!-- iMessage 告警收件人：值以快照为准（全客户端同步），编辑中不被快照覆盖 -->
-            <span class="risk-label">iMessage</span>
-            <el-input v-model="imessageRecipient" size="small" placeholder="告警收件人（空=关）" style="width:180px"
-                      @focus="imessageDirty = true" @blur="imessageDirty = false" @change="saveImessage"></el-input>
-          </span>
-          <el-tag :type="status.dry_run ? 'warning' : 'danger'" effect="dark" size="small">{{ status.dry_run ? 'DRY-RUN' : 'LIVE' }}</el-tag>
+          <el-tag :type="status.dry_run ? 'warning' : 'danger'" effect="dark" size="small">{{ status.dry_run ? '模拟执行 · DRY-RUN' : '实盘交易 · LIVE' }}</el-tag>
           <el-tag :type="status.connected ? 'success' : 'info'" effect="dark" size="small">{{ status.connected ? 'IBKR 已连接' : 'IBKR 未连接' }}</el-tag>
           <el-tag v-if="!status.market_running" type="danger" effect="dark" size="small">行情断开</el-tag>
           <el-tag v-else-if="status.market_stale" type="danger" effect="dark" size="small">行情陈旧</el-tag>
+          <el-tag v-else type="info" size="small">行情 {{ status.market_age == null ? '时效未知' : status.market_age + 's' }}</el-tag>
+          <el-tag v-if="status.halted" type="danger" effect="dark" size="small">账户风控已暂停</el-tag>
+          <details v-if="status.recovery && (status.recovery.blocks_entry || status.recovery.export_error || (status.recovery.position_differences || []).length)" class="recovery-status">
+            <summary>{{ status.recovery.blocks_entry ? '执行恢复待处理 · 暂停新入场' : '对账与导出提示' }}</summary>
+            <div class="recovery-status-content">
+              <div>账本版本 {{ status.recovery.schema_version }} · 修订 {{ status.recovery.revision }} · 已核对 {{ status.recovery.checked_at ? clock(status.recovery.checked_at) : '尚未核对' }}</div>
+              <div v-for="(issue, index) in status.recovery.issues" :key="index">{{ issue.symbol || '' }} {{ issue.lot_id || '' }}：{{ issue.reason }}</div>
+              <div v-for="difference in status.recovery.position_differences" :key="difference.symbol">{{ difference.symbol }} 持仓差异：本系统 {{ difference.local_qty }} / 券商 {{ difference.broker_qty }}。可能含手工或其他系统交易，不自动归因到交易组。</div>
+              <div v-if="status.recovery.export_error">账本已保存，JSON 导出失败：{{ status.recovery.export_error }}</div>
+              <div>请先核对券商订单、成交与保护单；受理结果不明时不要重新提交。已有订单仍可撤单或退出。</div>
+            </div>
+          </details>
+          <span class="stat-item">运行 {{ executionOverview.active }} · 暂停 {{ executionOverview.paused }} · 待处理 {{ executionOverview.blocked }}</span>
+          <el-button size="small" @click="settingsVisible = true">参数与通知</el-button>
+          <el-button size="small" type="warning" plain @click="globalControlsVisible = true">全局控制</el-button>
         </div>
         <div class="status-row">
           <span class="stat-item">净值 <b>{{ fmtMoney(status.equity) }}</b></span>
           <span class="stat-item">日盈亏 <b :class="pnlClass(status.daily_pnl)">{{ fmtMoney(status.daily_pnl) }}</b></span>
           <span class="stat-item">风险 <b :class="totalRiskClass">${{ fmtMoney(status.total_risk_usd) }}/{{ fmtMoney(status.max_total_risk_usd) }}</b></span>
           <span class="stat-item">仓位 <b>{{ status.total_position_pct == null ? '—' : status.total_position_pct + '%' }}</b></span>
+          <span v-if="status.broker_route" class="stat-item">配置路由 <b>{{ status.broker_route.fa_group || status.broker_route.account || '未提供' }}</b></span>
+          <details class="connection-details"><summary>连接时序</summary><div class="connection-metrics">
           <span class="stat-item">TV <b>{{ clock(tvTime) }}</b></span>
           <span class="stat-item">IBKR <b>{{ clock(ibkrTime) }}</b></span>
           <span class="stat-item">更新延时 <b :class="(status.bar_update_delay || 0) > 5 ? 'delay-warn' : ''">{{ status.bar_update_delay == null ? '—' : status.bar_update_delay + 's' }}</b></span>
-          <span class="stat-item">最大 <b>{{ maxDelay }}s</b></span>
+          <span class="stat-item">最大 <b>{{ maxDelay }}s</b></span></div>
+          </details>
           <el-button size="small" class="precheck-btn" @click="openPrecheck">盘前检查</el-button>
+          <a class="architecture-entry" href="/static/architecture.html" target="_blank" rel="noopener">系统架构</a>
         </div>
       </div>
     </header>
 
+    <el-drawer v-model="settingsVisible" title="参数与通知 · 按作用范围管理" size="min(520px, 96vw)">
+      <div class="settings-content">
+        <h3>手动交易 · 本客户端</h3>
+        <label>每笔风险预算（美元）<strong>{{ riskUsd || "—" }}</strong></label>
+        <label>手动订单最大仓位（占账户净值 %）<el-input-number v-model="maxPositionPct" :min="10" :max="200" :step="10" controls-position="right"></el-input-number></label>
+        <p>每笔风险预算由系统配置。最大仓位比例保存在当前客户端。</p>
+        <h3>ATR 止损参数 · 全局设置</h3>
+        <label>手动及相关历史流程 ATR 倍数<el-input-number v-model="atrMult" :min="0.2" :max="5" :step="0.1" controls-position="right" @focus="atrMultDirty = true" @blur="atrMultDirty = false" @change="saveAtrMult"></el-input-number></label>
+        <p>修改后立即保存到服务端。Pine 策略模型的初始止损来自其输出，此参数不统一覆盖各策略的止损。</p>
+        <h3>通知 · 全局设置</h3>
+        <label>iMessage 告警收件人<el-input v-model="imessageRecipient" placeholder="留空关闭该通道" @focus="imessageDirty = true" @blur="imessageDirty = false" @change="saveImessage"></el-input></label>
+        <p>编辑完成后立即保存。局部实例演示不会隔离这些真实配置。</p>
+        <h3>账户风控 · 当前有效值</h3><p>风险敞口 ${{ fmtMoney(status.total_risk_usd) }} / 上限 ${{ fmtMoney(status.max_total_risk_usd) }}；账户仓位 {{ status.total_position_pct == null ? '未知' : status.total_position_pct + '%' }}。此处只读。</p>
+      </div>
+    </el-drawer>
+    <el-dialog v-model="globalControlsVisible" title="全局控制 · 全部自动执行实例" width="min(620px, 96vw)">
+      <p>此处操作覆盖全部策略模型及执行实例，与启动表单的选择无关，不包含未接管的手动订单。</p>
+      <p>暂停新入场不会撤销已有挂单；保护与退出仍由现有规则管理。退出全部交易组会请求撤单和平仓，完成情况以实际订单状态为准。</p>
+      <div class="global-actions"><el-button :disabled="demoMode" type="warning" @click="stopAuto(false)">暂停全部实例新入场</el-button><el-button :disabled="demoMode" type="danger" plain @click="stopAuto(true)">退出全部自动执行交易组</el-button></div>
+      <p v-if="demoMode" class="muted">请先退出实例界面演示，再进行全局交易控制。</p>
+    </el-dialog>
+    <nav class="workspace-nav" aria-label="工作区">
+      <button :aria-pressed="bottomTab === 'instances'" @click="selectWorkspace('execution', 'instances')">执行监控</button>
+      <button :aria-pressed="bottomTab === 'orders'" @click="selectWorkspace('execution', 'orders')">订单批次</button>
+      <button :aria-pressed="bottomTab === 'fvg'" @click="selectWorkspace('execution', 'fvg')">FVG 监控</button>
+      <button :aria-pressed="bottomTab === 'screen'" @click="selectWorkspace('execution', 'screen')">选股</button>
+      <button :aria-pressed="bottomTab === 'momentum'" @click="selectWorkspace('execution', 'momentum')">推进力</button>
+      <button :aria-pressed="bottomTab === 'openingBreakouts'" @click="selectWorkspace('execution', 'openingBreakouts')">小区间突破</button>
+      <button :aria-pressed="bottomTab === 'backtest'" @click="selectWorkspace('validation', 'backtest')">回测验证</button>
+      <button :aria-pressed="bottomTab === 'night'" @click="selectWorkspace('validation', 'night')">夜盘模拟</button>
+      <el-dropdown trigger="click" @command="tab => selectWorkspace('research', tab)"><button :aria-pressed="workspaceGroup === 'research'">研究复盘{{ workspaceGroup === 'research' ? ' · ' + workspaceTabNames[bottomTab] : '' }} ▾</button><template #dropdown><el-dropdown-menu><el-dropdown-item v-for="tab in workspaceTabs.research" :key="tab" :command="tab">{{ workspaceTabNames[tab] }}</el-dropdown-item></el-dropdown-menu></template></el-dropdown>
+      <el-dropdown trigger="click" @command="tab => selectWorkspace('operations', tab)"><button :aria-pressed="workspaceGroup === 'operations'">系统运维{{ workspaceGroup === 'operations' ? ' · ' + workspaceTabNames[bottomTab] : '' }} ▾</button><template #dropdown><el-dropdown-menu><el-dropdown-item v-for="tab in workspaceTabs.operations" :key="tab" :command="tab">{{ workspaceTabNames[tab] }}</el-dropdown-item></el-dropdown-menu></template></el-dropdown>
+      <button v-if="workspaceGroup === 'execution' && bottomTab !== 'instances'" class="workspace-expand" :aria-pressed="!workspaceExpanded" @click="toggleWorkspace">{{ workspaceExpanded ? '与执行实例分屏' : '辅助内容全屏' }}</button>
+    </nav>
+
     <!-- 盘前检查单结果面板（绿灯/红灯/中性一眼扫完） -->
-    <el-dialog v-model="precheckVisible" title="盘前检查单" width="560px">
+    <el-dialog v-model="precheckVisible" title="盘前检查单" width="min(560px, 96vw)">
       <template v-if="precheck">
         <div class="precheck-head">
-          <el-tag :type="precheck.overall === 'ok' ? 'success' : 'danger'" effect="dark">
-            {{ precheck.overall === 'ok' ? '全部就绪' : '有红项' }}
+          <el-tag :type="precheck.overall === 'bad' ? 'danger' : precheck.waiting_for_market ? 'warning' : 'success'" effect="dark">
+            {{ precheck.overall === 'bad' ? '有红项' : precheck.waiting_for_market ? '行情加载中' : '无红项' }}
           </el-tag>
           <span class="muted">{{ precheck.day }} · {{ new Date(precheck.ts * 1000).toLocaleTimeString() }}</span>
           <el-button size="small" type="primary" style="margin-left:auto" :loading="precheckLoading" @click="runPrecheck">重新运行</el-button>
@@ -88,7 +122,7 @@
 
     <!-- TV 看盘面板（客户端专属：截图回传 master 的 TV 画面，含私有指标） -->
     <el-dialog v-model="tvView.visible" :title="'TV 图表 · ' + tvView.symbol"
-               width="960px" @close="closeTvView">
+               width="min(960px, 96vw)" @close="closeTvView">
       <div class="tv-view-body">
         <img v-if="tvView.image" :src="tvView.image" class="tv-view-img"
              alt="TV 图表截图" />
@@ -168,7 +202,7 @@
           </div>
 
           <!-- 下单按钮（多绿空红，震荡也放行，与服务端闸门一致） -->
-          <el-button :type="slot.side === 'long' ? 'success' : (slot.side === 'short' ? 'danger' : 'info')" class="tile-btn" :disabled="!slot.ready || placing" @click="placeOrder(slot)">
+          <el-button :type="slot.side === 'long' ? 'success' : (slot.side === 'short' ? 'danger' : 'info')" class="tile-btn" :disabled="!slot.ready || !slot.qty || placing || hasAutoPosition(slot.symbol)" :title="hasAutoPosition(slot.symbol) ? '已有自动策略仓位，禁止手动加仓' : ''" @click="placeOrder(slot)">
             {{ slot.side === 'long' ? '买入' : (slot.side === 'short' ? '卖出' : '震荡') }} {{ slot.qty }} 股 · {{ typeLabel(slots[i].limitType) }}
           </el-button>
         </div>
@@ -176,23 +210,27 @@
       </div>
 
       <!-- 自动策略主工作区 -->
-      <section class="panel auto-main">
-        <div class="shadow-bt-form">
-          <el-tag :type="autoView.enabled ? 'success' : 'info'" size="small">
-            {{ autoView.enabled ? '运行中' : '已停止' }}{{ autoView.strategy ? ' · ' + autoView.strategy : '' }}
-          </el-tag>
-          <el-select v-model="autoModel" size="small" style="width:180px" :disabled="demoMode" aria-label="Pine策略模型">
-            <el-option v-for="model in autoModels" :key="model.id" :label="model.name" :value="model.id"></el-option>
-          </el-select>
-          <el-input v-model="autoInstanceId" size="small" style="width:120px" placeholder="执行实例标识" :disabled="demoMode" aria-label="执行实例标识"></el-input>
-          <el-input v-model="autoSymbols" size="small" placeholder="输入标的，如 NVDA（最多5组）" style="width:300px"></el-input>
-          <el-button size="small" type="primary" :loading="autoBusy" @click="startAuto">启动全自动</el-button>
-          <el-button size="small" type="warning" :disabled="!autoView.enabled" @click="stopAuto(false)">停止新开仓</el-button>
-          <el-button size="small" type="danger" :disabled="!autoView.enabled" @click="stopAuto(true)">停止并全平</el-button>
-          <el-button size="small" :type="demoMode ? 'warning' : 'info'" @click="demoMode = !demoMode">{{ demoMode ? '退出演示' : '演示数据' }}</el-button>
-          <span class="muted">Pine 指标提供信号、方向与止损 · 公共执行器负责风控和订单</span>
+      <section class="panel auto-main" :class="{ 'workspace-expanded': workspaceExpanded }">
+        <div class="execution-toolbar" v-show="!workspaceExpanded">
+          <div class="execution-start">
+            <el-select class="execution-model" v-model="autoModel" size="small" :disabled="demoMode" aria-label="Pine策略模型">
+              <el-option v-for="model in autoModels" :key="model.id" :label="model.name" :value="model.id"></el-option>
+            </el-select>
+            <el-input class="execution-instance" v-model="autoInstanceId" size="small" placeholder="实例标识" :disabled="demoMode" aria-label="执行实例标识" title="执行实例标识"></el-input>
+            <el-input class="execution-symbols" v-model="autoSymbols" size="small" placeholder="标的，如 NVDA（最多5组）" aria-label="执行标的"></el-input>
+            <span class="execution-risk" title="首仓风险预算由系统配置">首仓预算 {{ riskUsd ? "$" + riskUsd : "—" }}</span>
+            <el-button size="small" type="primary" :disabled="demoMode" :loading="autoBusy" @click="startAuto">启动执行实例</el-button>
+            <el-button size="small" class="execution-options-toggle" :aria-expanded="executionParamsOpen" aria-controls="execution-options" @click="executionParamsOpen = !executionParamsOpen">执行参数 {{ executionParamsOpen ? '▴' : '▾' }}</el-button>
+            <el-button v-if="demoMode" size="small" type="warning" @click="demoMode = false">退出演示</el-button>
+          </div>
+          <div class="execution-caption">
+            <el-tag :type="autoView.enabled ? 'success' : 'info'" size="small">{{ autoView.enabled ? '新入场已启用' : '新入场未启用' }}</el-tag>
+            <span>{{ profileName(selectedAutoModel.execution_profile) }} · 初始止损来自 Pine · 首仓风险预算仅作用于新建仓</span>
+          </div>
+          <div class="execution-options" id="execution-options" v-show="executionParamsOpen">
+            <span class="scope-note">首仓预算由系统配置，各实例行显示实际生效的预算与规则。</span>
           <span class="auto-params" v-if="autoModel === 'ema9_pyramid' && autoInstanceId === 'default'">
-            <small class="muted">EMA9-ST-ATR 默认实例 · 3-2-1兼容执行配置</small>
+            <small class="muted">默认实例执行参数 · 修改后立即保存，作用于该引擎后续判断；各行显示实际生效值</small>
             <span class="risk-label">自动保本</span>
             <el-switch v-model="pyramidAutoBreakeven" :disabled="demoMode"
                        @change="v => savePyramidParam('pyramid_auto_breakeven', v)"></el-switch>
@@ -209,51 +247,52 @@
                              @change="v => savePyramidParam('pyramid_add_unlock_r', v)"></el-input-number>
             <span class="risk-label">R</span>
           </span>
+            <el-button v-if="!demoMode" size="small" @click="demoMode = true">实例界面演示</el-button>
+          </div>
         </div>
-        <div v-if="demoMode" class="demo-banner">仅前端演示数据，不会写入订单或调用下单接口</div>
-        <div class="auto-main-scroll">
+        <div v-if="demoMode" class="demo-banner">实例演示：订单与实例操作已禁用；账户状态、参数设置、手动交易及其他页面仍连接当前运行环境。</div>
+        <div class="auto-main-scroll" v-show="!workspaceExpanded">
           <div class="auto-table-wrap"><div class="auto-table">
             <div class="perf-row shadow-dist-head auto-table-head">
-              <span>操作</span><span class="perf-name">标的</span><span>状态</span><span>方向/次数</span>
-              <span>均价/整组止损</span><span>当前R / 成交后MFE</span><span>下一步</span><span>实时盈亏</span><span>最大仓位</span>
+              <span class="perf-name">标的 / 归属</span><span>状态</span><span>方向/次数</span>
+              <span>均价/订单止损</span><span>当前R / 成交后MFE</span><span>下一步 / 限制原因</span><span>盈亏 / 峰值仓位</span><span>操作</span>
             </div>
-            <div v-for="i in autoView.instances" :key="i.inst_id" class="auto-instance-group">
+            <div v-for="(i, index) in orderedAutoInstances" :key="i.inst_id" class="auto-instance-group" :class="{ 'has-position': instanceHasPosition(i), 'is-pending': i.state === 'PENDING' || !!i.pending_lot_id, 'is-inactive': instanceInactive(i) }">
+              <div v-if="instanceInactive(i) && (index === 0 || !instanceInactive(orderedAutoInstances[index - 1]))" class="inactive-section-heading">已停止 · {{ inactiveAutoCount }} 个实例<span>本轮不再执行，下方保留历史记录</span></div>
               <div class="perf-row auto-instance-row">
+                <span class="perf-name instance-identity">{{ i.symbol.split(':').pop() }}<small class="auto-meta">{{ autoModelName(i.strategy) }} · {{ i.strategy_instance_id || 'default' }}</small><small v-if="i.source === 'manual_seed'" class="manual-seed">手动首仓</small></span>
+                <span class="instance-state"><el-tag size="small" :type="autoStateTag(i.state)" :class="{ 'inactive-state-tag': instanceInactive(i) }">{{ instanceInactive(i) ? '已停止' : instanceState(i) }}</el-tag><small v-if="instanceInactive(i)" class="inactive-state-note">不再执行</small><small v-if="i.enabled === false && i.state !== 'DONE'" class="instance-restriction">新入场暂停</small><small v-if="i.restored && !instanceInactive(i)" class="auto-meta">已恢复 · 请核对生效参数</small></span>
+                <span class="instance-direction" :class="!instanceInactive(i) && (i.side === 'long' ? 'pnl-pos' : (i.side === 'short' ? 'pnl-neg' : 'muted'))">
+                  <small class="auto-field-label">{{ instanceInactive(i) ? '历史方向 / 建仓次数' : '方向 / 建仓次数' }}</small>{{ i.start_direction === 1 ? '锁多' : (i.start_direction === -1 ? '锁空' : '') }} / {{ i.entries || 0 }}次{{ i.unlocked && !instanceInactive(i) ? ' · 已解锁' : '' }}
+                </span>
+                <span class="instance-prices"><small class="auto-field-label">{{ instanceInactive(i) ? '历史均价 / 历史止损' : '均价 / 订单止损' }}</small>{{ i.avg_cost || '—' }} / {{ i.stop_px || '—' }}<small class="auto-meta">{{ instanceInactive(i) ? '历史价格，不代表当前委托' : '保护确认见订单回报' }}</small></span>
+                <span class="instance-metrics" :class="instanceHasPosition(i) && pnlClass(i.unrealized_r)"><small class="auto-field-label">当前R / 成交后MFE</small>{{ i.qty ? i.unrealized_r + 'R' : '—' }} / {{ i.qty ? i.mfe_r + 'R' : '—' }}</span>
+                <b class="auto-next"><small class="auto-field-label">下一步 / 限制原因</small>{{ instanceInactive(i) ? '本轮已停止，不再执行' : autoNext(i) }}<small class="auto-meta">{{ instanceInactive(i) ? '重新运行需从上方启动执行实例' : instanceRuleText(i) }}</small></b>
+                <b class="instance-pnl" :class="!instanceInactive(i) && pnlClass(autoPnl(i))"><small class="auto-field-label">实时盈亏 $</small>{{ autoPnl(i) == null ? '—' : fmt2(autoPnl(i)) }}<small class="auto-meta">峰值仓位 {{ i.max_position_pct == null ? '—' : i.max_position_pct + '%' }}</small></b>
                 <span class="auto-actions">
-                  <el-button size="small" class="auto-detail-toggle" @click="viewAutoOrders(i)">
-                    {{ expandedAutoOrders[i.inst_id || i.symbol] ? '▾ 明细' : '▸ 明细' }}
-                  </el-button>
-                  <el-button size="small" type="warning" @click="stopAutoInstance(i, false)">停止加仓</el-button>
-                  <el-button size="small" type="danger" :disabled="!i.entries" @click="stopAutoInstance(i, true)">整组平仓</el-button>
+                  <el-button size="small" :aria-expanded="!!expandedAutoOrders[i.inst_id || i.symbol]" @click="viewAutoOrders(i)">{{ expandedAutoOrders[i.inst_id || i.symbol] ? '收起订单' : '订单明细' }}</el-button>
+                  <el-button v-if="!instanceInactive(i)" size="small" type="success" plain :title="autoBreakevenHint(i) || '按该交易组实际成交均价保本，保留更有利止损'" :disabled="!!autoBreakevenHint(i)" :loading="!!autoBreakevenBusy[autoBreakevenKey(i)]" @click="breakevenAutoInstance(i)">{{ i.breakeven_done ? '已至成本' : '整组保本' }}</el-button>
+                  <el-button v-if="!instanceInactive(i)" size="small" type="warning" plain :disabled="demoMode || i.enabled === false || i.state === 'DONE' || !!i.exit_requested_reason" @click="stopAutoInstance(i, false)">暂停新入场</el-button>
+                  <el-button v-if="!instanceInactive(i)" size="small" class="auto-exit-btn" type="danger" plain :loading="i.state === 'CLOSING' || !!i.exit_requested_reason" :disabled="demoMode || !(i.lot_ids || []).length || i.state === 'DONE'" @click="stopAutoInstance(i, true)">退出交易组</el-button>
                 </span>
-                <span class="perf-name">{{ i.symbol.split(':').pop() }}<small class="auto-meta">{{ autoModelName(i.strategy) }} · {{ i.strategy_instance_id || 'default' }}</small><small v-if="i.source === 'manual_seed'" class="manual-seed">手动首仓</small></span>
-                <span><el-tag size="small" :type="autoStateTag(i.state)">{{ i.state }}</el-tag><small v-if="i.restored" class="auto-meta">{{ i.recovery_block_reason ? '恢复待核验' : (i.enabled ? '已恢复' : '已恢复 · 加仓需启用') }}</small></span>
-                <span :class="i.side === 'long' ? 'pnl-pos' : (i.side === 'short' ? 'pnl-neg' : 'muted')">
-                  {{ i.start_direction === 1 ? '锁多' : (i.start_direction === -1 ? '锁空' : '') }} / {{ i.entries || 0 }}次{{ i.unlocked ? ' · 已解锁' : '' }}
-                </span>
-                <span>{{ i.avg_cost || '—' }} / {{ i.stop_px || '—' }}</span>
-                <span :class="pnlClass(i.unrealized_r)">{{ i.qty ? i.unrealized_r + 'R' : '—' }} / {{ i.qty ? i.mfe_r + 'R' : '—' }}<small v-if="i.entries >= 2" class="auto-meta">第二仓 MFE {{ i.second_mfe_r }}R / 1R</small></span>
-                <b class="auto-next">{{ autoNext(i) }}<small class="auto-meta">{{ i.breakeven_done ? '整组已保本' : (pyramidAutoBreakeven ? '待达到保本门槛' : '自动保本已关闭') }}</small></b>
-                <b :class="pnlClass(autoPnl(i))">{{ autoPnl(i) == null ? '—' : fmtMoney(autoPnl(i)) }}</b>
-                <span>{{ i.max_position_pct == null ? '—' : i.max_position_pct + '%' }}</span>
               </div>
               <div class="auto-risk-strip" :class="{ 'auto-recovery-warning': i.recovery_block_reason }">
                 <span>{{ autoRiskText(i) }}</span>
-                <span v-if="i.initial_r">首仓 1R = {{ fmt2(i.initial_r) }} / 股 · 累计建仓 {{ i.entries }}/3</span>
+                <span v-if="i.initial_r">首仓 1R = ${{ fmt2(i.initial_r) }} / 股 · 累计建仓 {{ i.entries }}/{{ instanceMaxEntries(i) || '未提供' }}</span>
                 <span v-if="i.recovery_block_reason">{{ i.recovery_block_reason }}；保护与退出继续管理</span>
               </div>
-              <div v-if="expandedAutoOrders[i.inst_id || i.symbol] && autoLotRows(i).length" class="auto-order-detail">
+              <div v-if="expandedAutoOrders[i.inst_id || i.symbol]" class="auto-order-detail">
                 <div class="auto-order-head"><b>实际订单（{{ autoLotRows(i).length }}）</b><span class="muted">成交、止损与订单操作</span></div>
                 <div class="auto-order-row auto-order-columns">
                   <span>次数/类型</span><span>状态</span><span>股数</span><span>成交均价</span><span>止损</span><span>盈亏</span><span>操作</span>
                 </div>
                 <div v-for="o in autoLotRows(i)" :key="o.lot_id" class="auto-order-row">
                   <span>第{{ (o.signal_snapshot && o.signal_snapshot.entry_index) || 1 }}次<small class="order-kind">{{ o.limit_type === 'auto_ema9_pyramid' ? '自动' : '手动' }}</small><small class="auto-meta">{{ orderRiskText(o) }}</small></span>
-                  <span><el-tag size="small" :type="stateTag(o.state)">{{ o.state }}</el-tag></span>
+                  <span><el-tag size="small" :type="stateTag(o.state)">{{ orderState(o.state) }}</el-tag></span>
                   <span>{{ o.filled_qty || o.qty }}</span>
-                  <span>{{ (o.avg_fill || o.entry_px).toFixed(2) }}</span>
-                  <span>{{ o.stop_px.toFixed(2) }}</span>
-                  <span :class="pnlClass(lotPnl(o))">{{ fmtMoney(lotPnl(o)) }}</span>
+                  <span>{{ (o.avg_fill || o.entry_px).toFixed(2) }}<small class="auto-meta">{{ entryOrderTypeText(o) }}</small></span>
+                  <span>{{ o.stop_px.toFixed(2) }}<small class="auto-meta">{{ protectionText(o) }}</small></span>
+                  <span :class="pnlClass(lotPnl(o))">{{ fmt2(lotPnl(o)) }}</span>
                   <span class="auto-order-actions">
                     <el-button size="small" type="success" :disabled="demoMode || o.state !== 'ACTIVE'" @click="breakevenLot(o)">保本</el-button>
                     <el-button size="small" type="warning" :disabled="demoMode || o.state !== 'ACTIVE'" @click="closeLot(o)">平仓</el-button>
@@ -268,13 +307,13 @@
         </div>
 
         <!-- 底部面板高度拖拽手柄 -->
-        <div class="panel-resizer" :class="{ resizing: panelResizing }"
+        <div v-show="!workspaceExpanded && bottomTab !== 'instances'" class="panel-resizer" :class="{ resizing: panelResizing }"
              title="拖动调整 Tab 面板高度" @pointerdown="startPanelResize"><span></span></div>
         <!-- 底部面板：选股 / 运行日志（tab 切换，与订单表格平分高度） -->
-        <div class="log-panel" :style="logPanelStyle">
+        <div v-show="bottomTab !== 'instances'" class="log-panel" :style="logPanelStyle">
           <el-tabs v-model="bottomTab" class="bottom-tabs" @tab-change="onBottomTabChange">
             <!-- 订单批次（自动策略主区域的辅助执行视图） -->
-            <el-tab-pane label="订单批次" name="orders">
+            <el-tab-pane class="workspace-pane pane-orders" v-if="workspaceGroup === 'execution'" label="订单批次" name="orders">
               <div class="orders-tab-panel">
                 <div class="panel-title order-title">
                   <span>订单批次</span>
@@ -290,41 +329,31 @@
                 </div>
                 <el-table :data="sortedLots" size="small" style="width:100%" :row-class-name="lotRowClass"
                           class="tv-link-table" @row-click="row => row.symbol && tvShow(row.symbol)">
-                  <el-table-column label="操作" width="480" fixed="left">
-                    <template #default="{ row }">
-                      <el-button class="op-btn" type="success" :disabled="!(row.state === 'ACTIVE' && !row.breakeven_reached)" @click.stop="breakevenLot(row)">保本</el-button>
-                      <el-button class="op-btn" type="primary" :disabled="!(row.state === 'ACTIVE' && row.filled_qty > 1)" @click.stop="closeHalf(row)">平半</el-button>
-                      <el-button class="op-btn" type="warning" :disabled="row.state !== 'ACTIVE'" @click.stop="closeLot(row)">平仓</el-button>
-                      <el-button class="op-btn" type="danger" :disabled="!(row.state === 'PENDING' || (status.dry_run && row.state === 'ACTIVE'))" @click.stop="cancelLot(row)">撤单</el-button>
-                      <el-button v-if="row.state === 'ACTIVE' && row.limit_type !== 'auto_ema9_pyramid' && !(row.signal_snapshot && row.signal_snapshot.pyramid_seed)"
-                                 class="op-btn" type="info" @click.stop="adoptManualLot(row)">转自动</el-button>
-                    </template>
-                  </el-table-column>
-                  <el-table-column label="标的" width="110">
-                    <template #default="{ row }"><span class="lot-symbol">{{ tickerOf(row.symbol) }}</span></template>
+                  <el-table-column label="标的 / 归属" width="175" fixed="left">
+                    <template #default="{ row }"><span class="lot-symbol">{{ tickerOf(row.symbol) }}</span><small class="auto-meta">{{ row.signal_snapshot && row.signal_snapshot.strategy_id ? autoModelName(row.signal_snapshot.strategy_id) + ' · ' + (row.signal_snapshot.strategy_instance_id || 'default') : '手动 / 历史订单' }}</small></template>
                   </el-table-column>
                   <el-table-column label="交易员" width="70">
                     <template #default="{ row }"><span :class="traderClass(row.trader)">{{ row.trader || '—' }}</span></template>
                   </el-table-column>
                   <el-table-column label="状态" width="130">
                     <template #default="{ row }">
-                      <el-tag :type="stateTag(row.state)" size="small">{{ row.state }}</el-tag>
+                      <el-tag :type="stateTag(row.state)" size="small">{{ orderState(row.state) }}</el-tag>
                       <div v-if="row.state === 'CLOSED' && row.exit_reason" class="muted exit-reason">{{ exitReasonLabel(row.exit_reason) }}</div>
                     </template>
                   </el-table-column>
                   <el-table-column label="股数" width="75">
                     <template #default="{ row }">{{ row.state === 'PENDING' ? row.qty : row.filled_qty }}</template>
                   </el-table-column>
-                  <el-table-column label="入/限价" width="90">
-                    <template #default="{ row }"><span class="lot-price">{{ row.avg_fill > 0 ? row.avg_fill.toFixed(2) : row.entry_px.toFixed(2) }}</span></template>
+                  <el-table-column label="成交/参考价" width="110">
+                    <template #default="{ row }"><span class="lot-price">{{ row.avg_fill > 0 ? row.avg_fill.toFixed(2) : row.entry_px.toFixed(2) }}</span><small class="auto-meta">{{ entryOrderTypeText(row) }}</small></template>
                   </el-table-column>
-                  <el-table-column prop="stop_px" label="止损" width="90">
-                    <template #default="{ row }"><span class="lot-price">{{ row.stop_px > 0 ? row.stop_px.toFixed(2) : '—' }}</span></template>
+                  <el-table-column prop="stop_px" label="订单止损" width="155">
+                    <template #default="{ row }"><span class="lot-price">{{ row.stop_px > 0 ? row.stop_px.toFixed(2) : '—' }}</span><small class="auto-meta">{{ protectionText(row) }}</small></template>
                   </el-table-column>
                   <el-table-column label="盈亏" width="110">
                     <template #default="{ row }">
                       <template v-if="row.state === 'CLOSED' || row.state === 'ACTIVE' || row.state === 'CLOSING'">
-                        <b class="lot-pnl" :class="pnlClass(lotPnl(row))">{{ fmtMoney(lotPnl(row)) }}</b>
+                        <b class="lot-pnl" :class="pnlClass(lotPnl(row))">{{ fmt2(lotPnl(row)) }}</b>
                         <div v-if="row.state === 'CLOSED' && row.actual_rr" class="muted exit-reason">RR {{ row.actual_rr }}</div>
                         <div v-else-if="markStaleText(row)" class="mark-stale">{{ markStaleText(row) }}</div>
                       </template>
@@ -338,11 +367,25 @@
                     <template #default="{ row }">{{ row.state === 'CLOSED' && row.exit_px > 0 ? row.exit_px.toFixed(2) : '—' }}</template>
                   </el-table-column>
                   <el-table-column prop="reason" label="备注" min-width="120" show-overflow-tooltip></el-table-column>
+                  <el-table-column label="操作" width="228" fixed="right">
+                    <template #default="{ row }">
+                      <div class="order-primary-actions" @click.stop>
+                        <el-button v-if="row.state === 'ACTIVE'" size="small" type="success" plain :disabled="demoMode || row.breakeven_reached" @click="breakevenLot(row)">保本</el-button>
+                        <el-button v-if="row.state === 'ACTIVE'" size="small" type="danger" plain :disabled="demoMode" @click="closeLot(row)">平仓</el-button>
+                        <el-button v-if="row.state === 'PENDING' || (status.dry_run && row.state === 'ACTIVE')" size="small" type="warning" plain :disabled="demoMode" @click="cancelLot(row)">撤单</el-button>
+                        <el-dropdown v-if="row.state === 'ACTIVE'" trigger="click"><el-button size="small">更多 ▾</el-button><template #dropdown><el-dropdown-menu>
+                          <el-dropdown-item :disabled="demoMode || row.filled_qty <= 1" @click="closeHalf(row)">平掉一半</el-dropdown-item>
+                          <el-dropdown-item :disabled="demoMode" v-if="!String(row.limit_type || '').startsWith('auto_') && !(row.signal_snapshot && (row.signal_snapshot.pyramid_seed || row.signal_snapshot.strategy_id))" @click="adoptManualLot(row)">交由所选执行实例接管</el-dropdown-item>
+                        </el-dropdown-menu></template></el-dropdown>
+                        <span v-if="!['ACTIVE', 'PENDING'].includes(row.state)" class="muted">{{ row.state === 'CLOSING' ? '等待退出回报' : '已结束' }}</span>
+                      </div>
+                    </template>
+                  </el-table-column>
                 </el-table>
               </div>
             </el-tab-pane>
             <!-- FVG 监控 tab -->
-            <el-tab-pane label="FVG 监控" name="fvg">
+            <el-tab-pane class="workspace-pane pane-fvg" v-if="workspaceGroup === 'execution'" label="FVG 监控" name="fvg">
               <div class="fvg-panel">
                 <div class="fvg-head">
                   <span class="fvg-title">FVG 动态监控</span>
@@ -388,7 +431,8 @@
                               <span v-if="ev.retested" class="retested">已回踩</span>
                               <span v-else :class="ev.state">{{ fvgStateText(ev.state) }}</span>
                               <button v-if="fvgCanChase(ev)" class="fvg-chase-btn" :class="side"
-                                      title="现价贴近缺口边缘，按市价追价" @click.stop="chaseFvg(ev)">追</button>
+                                      :disabled="placing || hasAutoPosition(ev.symbol)"
+                                      :title="hasAutoPosition(ev.symbol) ? '已有自动策略仓位，禁止手动加仓' : '现价贴近缺口边缘，按市价追价'" @click.stop="chaseFvg(ev)">追</button>
                             </div>
                           </div>
                         </template>
@@ -428,7 +472,7 @@
               </div>
             </el-tab-pane>
             <!-- 盘前报告 tab（第二位）：生成按钮+进度态 / 历史列表 / markdown 正文 -->
-            <el-tab-pane label="盘前报告" name="reports">
+            <el-tab-pane class="workspace-pane pane-reports" v-if="workspaceGroup === 'research'" label="盘前报告" name="reports">
               <div class="perf-panel report-wrap">
                 <div class="report-head">
                   <span class="news-title">盘前交易分析报告</span>
@@ -474,7 +518,7 @@
               </div>
             </el-tab-pane>
             <!-- 盘前新闻 tab（第二位）：大盘情绪+主题 / 自选股热点卡 / 原始头条 -->
-            <el-tab-pane label="盘前新闻" name="news">
+            <el-tab-pane class="workspace-pane pane-news" v-if="workspaceGroup === 'research'" label="盘前新闻" name="news">
               <div class="perf-panel news-panel">
                 <div class="news-head">
                   <span class="news-title">盘前热点新闻</span>
@@ -528,17 +572,22 @@
               </div>
             </el-tab-pane>
             <!-- 选股 tab -->
-            <el-tab-pane label="选股" name="screen">
+            <el-tab-pane class="workspace-pane pane-screen" v-if="workspaceGroup === 'execution'" label="选股" name="screen">
               <div class="screen-wrap">
                 <div class="screen-sort">
                   <el-checkbox v-model="screenPmFilter" size="small" class="pm-filter"
                                title="盘前区间过滤（全局设置）：多头仅保留现价>盘前高点、空头仅保留现价<盘前低点；无盘前区间数据的标的保留"
                                @change="v => savePmFilter('screen_premarket_filter', v)">盘前过滤</el-checkbox>
+                  <el-checkbox v-model="screenOpeningRangeFilter" size="small" class="pm-filter"
+                               title="美东 09:45 后，5 分钟收盘价和现价均须突破开盘小区间的同向边界；缺数据不入选"
+                               @change="v => savePmFilter('screen_opening_range_filter', v)">小区间过滤</el-checkbox>
+                  <span v-if="screenOpeningRangeFilter" class="muted">仅显示收盘确认且仍在区间外的标的</span>
                   <span class="muted" v-if="status.tv_view && status.tv_view.panes > 0"
                         title="master TV 宫格画面位：客户端每人一格看截图">
                     TV 画面位 {{ status.tv_view.slots }}</span>
                   <span>排序（高→低）</span>
                   <el-select v-model="screenSort" size="small" style="width:150px">
+                    <el-option label="EMA7 短期强度" value="slope"></el-option>
                     <el-option label="EMA 发散度" value="divergence"></el-option>
                     <el-option label="ST 持续根数" value="duration"></el-option>
                     <el-option label="ST 推进次数" value="push"></el-option>
@@ -548,36 +597,146 @@
                 <div class="screen-grid">
                   <div class="screen-col">
                     <div class="screen-col-title long">多头（强→弱）</div>
-                    <div v-for="r in sortedScreenLong" :key="r.symbol" class="screen-row" :class="r.qualified ? 'screen-ok-long' : 'screen-gray'" @click="pickScreen(r)">
+                    <div v-for="r in sortedScreenLong" :key="r.symbol" class="screen-row" role="button" tabindex="0" @keydown.enter="pickScreen(r)" @keydown.space.prevent="pickScreen(r)" :class="r.qualified ? 'screen-ok-long' : 'screen-gray'" @click="pickScreen(r)">
                       <span class="screen-ticker">{{ r.ticker }}</span>
                       <span class="screen-close">{{ r.close }}</span>
                       <span class="screen-st">ST {{ r.st_duration_bars == null ? '—' : r.st_duration_bars + '根' }} / {{ r.st_push_count == null ? '—' : r.st_push_count + '次' }}</span>
                       <span class="screen-fvg" :class="r.fvg_last_dir === 1 ? 'pnl-pos' : (r.fvg_last_dir === -1 ? 'pnl-neg' : 'muted')" title="ST 同向 FVG 累积计数">{{ r.fvg_cum_count == null ? '—' : 'FVG' + (r.fvg_last_dir === 1 ? '▲' : (r.fvg_last_dir === -1 ? '▼' : '')) + r.fvg_cum_count }}</span>
-                      <span class="screen-pm" title="盘前高/低（进攻区域指标）">{{ r.pmh != null ? r.pmh + '/' + r.pml : '' }}</span>
+                      <span v-if="screenOpeningRangeFilter" class="screen-pm" title="开盘小区间（低点–高点）">{{ r.opening_low }}–{{ r.opening_high }}</span>
+                      <span v-else class="screen-pm" title="盘前高/低（进攻区域指标）">{{ r.pmh != null ? r.pmh + '/' + r.pml : '' }}</span>
                       <span v-if="newsHot[r.ticker]" class="news-badge" :title="newsHot[r.ticker]">新闻</span>
-                      <span class="screen-atr pnl-pos" title="|EMA20 − EMA100| / ATR(10)">{{ r.divergence }}</span>
+                      <span v-if="screenSort === 'slope'" class="screen-atr"
+                            :class="r.ema_slope_atr > 0 ? 'pnl-pos' : r.ema_slope_atr < 0 ? 'pnl-neg' : 'muted'"
+                            title="已收盘 EMA7 的四根变化 ÷ 上一根 ATR">{{ r.ema_slope_atr == null ? '—' : (r.ema_slope_atr > 0 ? '+' : '') + r.ema_slope_atr.toFixed(2) + ' ATR' }}</span>
+                      <span v-else class="screen-atr pnl-pos" title="|EMA20 − EMA100| / ATR(10)">{{ r.divergence }}</span>
                     </div>
                     <div v-if="!sortedScreenLong.length" class="muted log-empty">暂无多头</div>
                   </div>
                   <div class="screen-col">
                     <div class="screen-col-title short">空头（强→弱）</div>
-                    <div v-for="r in sortedScreenShort" :key="r.symbol" class="screen-row" :class="r.qualified ? 'screen-ok-short' : 'screen-gray'" @click="pickScreen(r)">
+                    <div v-for="r in sortedScreenShort" :key="r.symbol" class="screen-row" role="button" tabindex="0" @keydown.enter="pickScreen(r)" @keydown.space.prevent="pickScreen(r)" :class="r.qualified ? 'screen-ok-short' : 'screen-gray'" @click="pickScreen(r)">
                       <span class="screen-ticker">{{ r.ticker }}</span>
                       <span class="screen-close">{{ r.close }}</span>
                       <span class="screen-st">ST {{ r.st_duration_bars == null ? '—' : r.st_duration_bars + '根' }} / {{ r.st_push_count == null ? '—' : r.st_push_count + '次' }}</span>
                       <span class="screen-fvg" :class="r.fvg_last_dir === 1 ? 'pnl-pos' : (r.fvg_last_dir === -1 ? 'pnl-neg' : 'muted')" title="ST 同向 FVG 累积计数">{{ r.fvg_cum_count == null ? '—' : 'FVG' + (r.fvg_last_dir === 1 ? '▲' : (r.fvg_last_dir === -1 ? '▼' : '')) + r.fvg_cum_count }}</span>
-                      <span class="screen-pm" title="盘前高/低（进攻区域指标）">{{ r.pmh != null ? r.pmh + '/' + r.pml : '' }}</span>
+                      <span v-if="screenOpeningRangeFilter" class="screen-pm" title="开盘小区间（低点–高点）">{{ r.opening_low }}–{{ r.opening_high }}</span>
+                      <span v-else class="screen-pm" title="盘前高/低（进攻区域指标）">{{ r.pmh != null ? r.pmh + '/' + r.pml : '' }}</span>
                       <span v-if="newsHot[r.ticker]" class="news-badge" :title="newsHot[r.ticker]">新闻</span>
-                      <span class="screen-atr pnl-neg" title="|EMA20 − EMA100| / ATR(10)">{{ r.divergence }}</span>
+                      <span v-if="screenSort === 'slope'" class="screen-atr"
+                            :class="r.ema_slope_atr > 0 ? 'pnl-pos' : r.ema_slope_atr < 0 ? 'pnl-neg' : 'muted'"
+                            title="已收盘 EMA7 的四根变化 ÷ 上一根 ATR">{{ r.ema_slope_atr == null ? '—' : (r.ema_slope_atr > 0 ? '+' : '') + r.ema_slope_atr.toFixed(2) + ' ATR' }}</span>
+                      <span v-else class="screen-atr pnl-neg" title="|EMA20 − EMA100| / ATR(10)">{{ r.divergence }}</span>
                     </div>
                     <div v-if="!sortedScreenShort.length" class="muted log-empty">暂无空头</div>
                   </div>
                 </div>
               </div>
             </el-tab-pane>
+            <el-tab-pane class="workspace-pane pane-screen" v-if="workspaceGroup === 'execution'" label="推进力" name="momentum">
+              <div class="screen-wrap momentum-wrap">
+                <div class="momentum-intro">
+                  <strong>开盘小区间推进榜</strong>
+                  <span class="muted">按 EMA7 相对边界的位置排名 · 已计算 {{ momentum.ready_count }} 只</span>
+                  <el-checkbox v-model="momentumBreakoutsOnly" size="small" class="pm-filter"
+                               title="只显示已收盘 EMA7 当前仍在小区间外的标的">只看突破</el-checkbox>
+                </div>
+                <div class="momentum-intro">
+                  <span class="muted" title="按已收盘 EMA7 首次越过开盘小区间边界统计，同一根并列">今日首破 · 美东 · 已核对 {{ momentum.first_break_ready || 0 }} 只</span>
+                  <span v-for="side in ['long', 'short']" :key="side" :class="side === 'long' ? 'pnl-pos' : 'pnl-neg'">
+                    <strong>{{ side === 'long' ? '最早上破' : '最早下破' }}</strong>
+                    <template v-if="momentum.first_breaks?.[side]?.length">
+                      {{ hmET(momentum.first_breaks[side][0].time) }}
+                      <button v-for="r in momentum.first_breaks[side]" :key="r.symbol" type="button" class="momentum-first-symbol" @click="pickScreen(r)">{{ r.ticker }}</button>
+                    </template>
+                    <span v-else class="muted">—</span>
+                  </span>
+                </div>
+                <p v-if="!momentum.ready_count" class="muted log-empty">等待同日开盘小区间锁定及已收盘的 EMA7 数据，最早美东 09:45 出榜。</p>
+                <div v-else class="momentum-grid">
+                  <section v-for="side in ['long', 'short']" :key="side" class="screen-col">
+                    <div class="screen-col-title" :class="side">{{ side === 'long' ? '上沿方向' : '下沿方向' }}</div>
+                    <div class="momentum-row momentum-labels muted">
+                      <span>排名 / 标的</span><span title="以小区间半宽为 1。正值已突破，零值触及边界，负值为距边界的差距">边界进度</span><span title="使用最近 15 分钟的 EMA7 变化，可包含盘前数据">15 分钟推进力</span><span>EMA7 位置</span><span title="最近 20 根已收盘 K 线的同向占比">EMA7 成功率</span><span>现价状态</span>
+                    </div>
+                    <button v-for="(r, index) in visibleMomentumRows[side]" :key="r.symbol" type="button"
+                            class="momentum-row momentum-stock" :class="{ 'momentum-leader': index === 0 }"
+                            @click="pickScreen(r)">
+                      <span><small>{{ index + 1 }}</small> <strong>{{ r.ticker }}</strong>
+                        <small v-if="r.first_break_time" class="momentum-first-time">首破 {{ hmET(r.first_break_time) }}</small></span>
+                      <strong class="momentum-score" :class="r.breakout_distance > 0 ? (side === 'long' ? 'pnl-pos' : 'pnl-neg') : 'muted'">{{ r.breakout_distance == null ? '—' : (r.breakout_distance > 0 ? '+' : '') + r.breakout_distance.toFixed(2) }}</strong>
+                      <span :class="r.momentum > 0 ? 'pnl-pos' : r.momentum < 0 ? 'pnl-neg' : 'muted'">{{ r.momentum == null ? '—' : (r.momentum > 0 ? '+' : '') + r.momentum.toFixed(2) }}</span>
+                      <span>{{ r.position > 0 ? '+' : '' }}{{ r.position.toFixed(2) }}</span>
+                      <span>{{ r.ema7_success_count == null ? '—' : (r.ema7_success_count * 5) + '% · ' + r.ema7_success_count + '/20' }}</span>
+                      <span :class="r.outside ? (side === 'long' ? 'pnl-pos' : 'pnl-neg') : 'muted'">{{ r.outside == null ? '—' : r.outside ? '已越过同向边界' : '未越过同向边界' }}</span>
+                    </button>
+                    <div v-if="!visibleMomentumRows[side].length" class="muted log-empty">{{ momentumBreakoutsOnly ? '暂无该方向的 EMA7 突破标的' : '暂无该方向标的' }}</div>
+                  </section>
+                </div>
+                <p class="muted momentum-note">位置以区间中点为 0、上下沿为 ±1，正值和中点归上沿方向，负值归下沿方向。已突破的按超出距离排在前面，区间内的越靠近边界排名越高。边界进度相同时按同向推进速度排序。成功率按最近连续 20 根已收盘 K 线统计，多头看收盘在 EMA7 上方，空头看下方。现价状态实时更新。</p>
+              </div>
+            </el-tab-pane>
+            <el-tab-pane class="workspace-pane pane-screen" v-if="workspaceGroup === 'execution'" label="小区间突破" name="openingBreakouts">
+              <div class="screen-wrap">
+                <p class="muted">小区间突破 · 多空对称：收盘越界 ≥0.7 ATR；实体超过此前实体 EMA10；上下影线各 ≤20%；实体中点越过前根极值；前 3 根实体不穿 EMA7；前 4 根无逆向反包；Pine 斜率多 &gt;1.5、空 &lt;−1.5。每日每股只取首次信号，10:30 起停止下单（不接 10:25 K 线）。人工预约后收盘确认，市价入场，中点止损；入场首根 K 线收盘移至信号收盘价，不做 1R 保本；第三根收盘退出。突破订单最多同时 5 笔，仍受账户风控约束。<a href="/static/architecture.html#opening-breakout" target="_blank" rel="noopener">完整规则与数据口径</a></p>
+                <p v-if="openingBreakoutCoverage?.pending.length" class="muted">
+                  截至美东 {{ hmET(openingBreakoutCoverage.through) }}，
+                  已扫描 {{ openingBreakoutCoverage.total - openingBreakoutCoverage.pending.length }}/{{ openingBreakoutCoverage.total }} 个标的。
+                  等待补齐：{{ openingBreakoutCoverage.pending.map(s => s.split(':').pop()).join('、') }}
+                </p>
+                <el-table :data="openingBreakouts" row-key="id" size="small" empty-text="今日暂无小区间突破提醒">
+                  <el-table-column label="K 线开盘 · 美东" min-width="120"><template #default="{ row }">{{ hmET(openingBreakoutBarTime(row)) }}</template></el-table-column>
+                  <el-table-column label="标的" min-width="90"><template #default="{ row }"><el-button link type="primary" @click="pickScreen(row)">{{ row.ticker }}</el-button></template></el-table-column>
+                  <el-table-column label="方向" min-width="75"><template #default="{ row }"><span :class="row.side === 'long' ? 'pnl-pos' : 'pnl-neg'">{{ row.side === 'long' ? '上破' : '下破' }}</span></template></el-table-column>
+                  <el-table-column label="收盘价" min-width="90"><template #default="{ row }">{{ row.close.toFixed(2) }}</template></el-table-column>
+                  <el-table-column label="区间边界" min-width="95"><template #default="{ row }">{{ row.edge.toFixed(2) }}</template></el-table-column>
+                  <el-table-column label="触发价" min-width="90"><template #default="{ row }">{{ row.threshold.toFixed(2) }}</template></el-table-column>
+                  <el-table-column label="超出距离" min-width="105"><template #default="{ row }">{{ row.distance_atr.toFixed(2) }} ATR</template></el-table-column>
+                  <el-table-column label="实体 / EMA10" min-width="110"><template #default="{ row }">{{ row.body_ema_ratio == null ? (row.body_ema10 === 0 ? '基线为 0' : '—') : row.body_ema_ratio.toFixed(2) + ' 倍' }}</template></el-table-column>
+                  <el-table-column label="实体 / ATR" min-width="105"><template #default="{ row }">{{ row.body_atr == null ? '—' : row.body_atr.toFixed(2) + ' ATR' }}</template></el-table-column>
+                  <el-table-column label="Pine 斜率 / ATR" min-width="125"><template #default="{ row }">{{ row.signal_slope_atr == null ? '—' : row.signal_slope_atr.toFixed(3) }}</template></el-table-column>
+                  <el-table-column label="上 / 下影线" min-width="110"><template #default="{ row }">{{ row.upper_wick_fraction == null ? '—' : (row.upper_wick_fraction * 100).toFixed(1) + '% / ' + (row.lower_wick_fraction * 100).toFixed(1) + '%' }}</template></el-table-column>
+                  <el-table-column label="止损" min-width="85"><template #default="{ row }">{{ row.stop_px == null ? '—' : row.stop_px.toFixed(2) }}</template></el-table-column>
+                  <el-table-column label="信号状态" min-width="165">
+                    <template #default="{ row }"><span :title="row.status_detail">{{ openingBreakoutStatus(row) }}</span></template>
+                  </el-table-column>
+                  <el-table-column label="开仓操作" min-width="135">
+                    <template #default="{ row }">
+                      <el-button size="small" :type="row.side === 'long' ? 'success' : 'danger'"
+                                 :disabled="openingBreakoutEntryDisabled(row)"
+                                 @click="placeOpeningBreakout(row)">{{ openingBreakoutActionLabel(row) }}</el-button>
+                    </template>
+                  </el-table-column>
+                </el-table>
+              </div>
+            </el-tab-pane>
             <!-- 影子回测 tab -->
-            <el-tab-pane label="影子" name="shadow">
+            <el-tab-pane class="workspace-pane pane-shadow" v-if="workspaceGroup === 'research'" label="影子" name="shadow">
               <div class="perf-panel">
+                <div class="perf-group">
+                  <div class="perf-group-title">EMA9-ST-ATR 策略影子复盘</div>
+                  <p class="muted">交易时段自动观察自选池，模拟结果仅供统计复盘。数据未就绪时暂停推进。</p>
+                  <div class="shadow-bt-form">
+                    <el-date-picker v-model="strategyShadowDay" size="small" type="date" value-format="YYYY-MM-DD" placeholder="默认当天 · 美东" :disabled="strategyShadowLoading"></el-date-picker>
+                    <el-button size="small" :loading="strategyShadowLoading" @click="loadStrategyShadow">刷新复盘</el-button>
+                  </div>
+                  <p v-if="strategyShadowError" class="pnl-neg">{{ strategyShadowError }}</p>
+                  <template v-if="strategyShadowReport">
+                    <p>{{ strategyShadowReport.day }} · 已启动 {{ strategyShadowReport.symbols.length }} 个标的 · 模拟订单 {{ strategyShadowReport.orders.length }} 笔 · 模拟已实现盈亏 ${{ fmt2(strategyShadowReport.realized_pnl) }}</p>
+                    <el-table :data="strategyShadowReport.orders" size="small" empty-text="该日暂无策略影子订单">
+                      <el-table-column prop="symbol" label="标的" min-width="125"></el-table-column>
+                      <el-table-column label="方向" width="65"><template #default="{ row }">{{ row.side === 'long' ? '多' : '空' }}</template></el-table-column>
+                      <el-table-column prop="qty" label="股数" width="70"></el-table-column>
+                      <el-table-column label="入场 · 美东" min-width="95"><template #default="{ row }">{{ hmET(row.fill_time) || '—' }}</template></el-table-column>
+                      <el-table-column prop="avg_fill" label="模拟成交价" min-width="100"></el-table-column>
+                      <el-table-column prop="stop_px" label="执行止损" min-width="90"></el-table-column>
+                      <el-table-column prop="exit_px" label="模拟退出价" min-width="100"></el-table-column>
+                      <el-table-column label="状态" min-width="80"><template #default="{ row }">{{ orderState(row.state) }}</template></el-table-column>
+                      <el-table-column prop="exit_reason" label="退出原因" min-width="120"></el-table-column>
+                      <el-table-column prop="realized_pnl" label="已实现盈亏" min-width="100"></el-table-column>
+                    </el-table>
+                  </template>
+                </div>
+                <details><summary>历史研究 · 单信号统计</summary>
                 <!-- 每日复盘报告（收盘后 16:20 ET 自动生成；此处可手动重算任意历史日） -->
                 <div class="perf-group">
                   <div class="perf-group-title">每日复盘报告</div>
@@ -649,8 +808,8 @@
                   </div>
                   <div v-for="n in ['1','2','3','4','5']" :key="n" class="perf-row">
                     <span class="perf-name">{{ n }}R</span>
-                    <span>{{ (shadow.stats.dist_before_stop[n] || {}).count || 0 }} 笔（{{ (shadow.stats.dist_before_stop[n] || {}).pct || 0 }}%）</span>
-                    <span>{{ (shadow.stats.dist_eod[n] || {}).count || 0 }} 笔（{{ (shadow.stats.dist_eod[n] || {}).pct || 0 }}%）</span>
+                    <span>{{ (shadow.stats.dist_before_stop?.[n] || {}).count || 0 }} 笔（{{ (shadow.stats.dist_before_stop?.[n] || {}).pct || 0 }}%）</span>
+                    <span>{{ (shadow.stats.dist_eod?.[n] || {}).count || 0 }} 笔（{{ (shadow.stats.dist_eod?.[n] || {}).pct || 0 }}%）</span>
                   </div>
                 </div>
                 <div class="perf-group">
@@ -735,36 +894,139 @@
                   </div>
                   <div v-if="!filteredShadowEvents.length" class="muted log-empty">暂无影子信号（实时检测：回踩/FVG/突破/策略候选 全类型建档）</div>
                 </div>
+                </details>
               </div>
             </el-tab-pane>
             <!-- FVG 监控 tab -->
             <!-- 回测工作台 tab -->
-            <el-tab-pane label="回测" name="backtest">
-              <div class="perf-panel">
+            <el-tab-pane class="workspace-pane pane-night" v-if="workspaceGroup === 'validation'" label="夜盘模拟" name="night">
+              <div class="night-workspace">
+                <div class="section-heading"><h3>夜盘模拟测试</h3><a href="/static/architecture.html#night-test" target="_blank" rel="noopener">使用说明 ↗</a><el-tag type="warning">独立模拟 · 5M · 美东时间</el-tag><a href="/api/night-test/report" download="night-paper-test.json" v-if="night.run_id">导出测试报告 JSON</a></div>
+                <p class="muted">先连接数据核对 TV 的标的、24h 时段、复权和指标参数，再人工启动模拟。预载历史仅供查看，不产生订单；指标使用注册脚本默认输入。</p>
                 <div class="shadow-bt-form">
-                  <el-input v-model="wbSymbol" size="small" placeholder="如 NVDA" style="width:110px"></el-input>
-                  <el-date-picker v-model="wbDay" size="small" type="date" value-format="YYYY-MM-DD" placeholder="交易日（默认昨日）" style="width:170px"></el-date-picker>
-                  <el-button size="small" type="primary" :loading="wbLoading" @click="wbLoad">加载数据</el-button>
-                  <template v-if="wb">
-                    <el-button size="small" :disabled="wb.done" @click="wbStep(1)">单步</el-button>
-                    <el-button size="small" :disabled="wb.done" @click="wbStep(10)">步进×10</el-button>
-                    <el-button size="small" type="success" :disabled="wb.done" @click="wbRunAll">全部运行</el-button>
-                    <el-tag size="small" :type="wb.done ? 'info' : 'warning'">{{ wb.cursor }}/{{ wb.total_bars }} 根{{ wb.done ? ' · 已完成' : '' }}</el-tag>
-                  </template>
-                  <span v-if="wbError" class="shadow-bt-err">{{ wbError }}</span>
+                  <label>策略模型 <el-select v-model="nightForm.strategy" style="width:190px" :disabled="night.running"><el-option v-for="model in autoModels" :key="model.id" :label="model.name" :value="model.id" ></el-option></el-select></label>
+                  <label>标的 <el-input v-model="nightForm.symbol" style="width:180px" :disabled="night.running" placeholder="NASDAQ:NVDA" ></el-input></label>
+                  <label>数据时段 <el-select v-model="nightForm.session" style="width:150px" :disabled="night.running"><el-option label="24小时（含夜盘）" value="24h"></el-option><el-option label="盘前盘后" value="extended"></el-option><el-option label="常规时段" value="regular"></el-option></el-select></label>
+                  <el-button :loading="nightBusy" :disabled="night.running" @click="nightAction('connect')">连接 / 重连数据</el-button>
+                  <el-button :disabled="nightBusy || !night.connected" @click="nightAction('disconnect')">结束并断开</el-button>
                 </div>
+                <div class="night-status">
+                  <span>已连接 {{ night.symbol || '—' }} · {{ night.strategy || '—' }}</span>
+                  <span>请求时段 {{ night.session?.requested || '—' }} / 服务端确认 {{ night.session?.resolved || '未确认' }}</span>
+                  <span>解析数据源 {{ night.session?.symbol || '未知' }} · 复权 {{ night.session?.adjustment || '—' }} · Pine 版本 {{ night.session?.pine_version || '未知' }} · 参数 {{ night.session?.indicator_inputs || '—' }}</span>
+                  <span>最新 K 线 {{ nightTime(night.bar?.time) }} · 价格观察 {{ nightTime(night.health?.observed_at) }} ET</span>
+                </div>
+                <el-alert v-if="night.reason || night.error || night.health?.error" :title="night.error || night.reason || night.health.error" type="warning" :closable="false" ></el-alert>
+                <div class="shadow-bt-form">
+                  <label>首仓风险预算 $ <el-input-number v-model="nightForm.risk_budget" :min="1" :max="100000" :disabled="night.running" ></el-input-number></label>
+                  <label>允许入场（ET） <el-input v-model="nightForm.window_start" style="width:85px" :disabled="night.running" ></el-input> — <el-input v-model="nightForm.window_end" style="width:85px" :disabled="night.running" ></el-input></label>
+                  <el-button type="primary" :disabled="nightBusy || !night.ready || night.running" @click="nightAction('start')">人工启动模拟</el-button>
+                  <el-button type="warning" :disabled="nightBusy || !night.run_id || night.stopped_at" @click="nightAction('stop')">停止并模拟结算</el-button>
+                  <span>{{ night.running ? '模拟运行中' : '未运行' }} · 启动 {{ nightTime(night.started_at) }} ET</span>
+                </div>
+                <p class="muted" v-if="night.run_id">本次生效：{{ night.params.session }} · {{ night.params.window_start }}–{{ night.params.window_end }} ET（相同时间表示全天，跨午夜有效） · 首仓 ${{ night.params.risk_budget }} · 基础配置 {{ night.params.base_execution_profile }}；仅覆盖本次模拟入场时段，保留原加仓、保本与止损规则。</p>
+                <div class="night-chart" v-if="nightChart.candles.length">
+                  <div class="muted">最近 90 根 K 线与 Pine 输出 · 金色：入场参考价 · 绿色：多头止损 · 红色：空头止损 · 悬停 K 线查看数值（ET）</div>
+                  <svg viewBox="0 0 1000 275" role="img" aria-label="夜盘 K 线与 Pine 指标值">
+                    <g v-for="(candle,index) in nightChart.candles" :key="index" :stroke="candle.up ? '#54b892' : '#ea7474'" :fill="candle.up ? '#54b892' : '#ea7474'"><title>{{ candle.title }}</title><line :x1="candle.x" :x2="candle.x" :y1="candle.high" :y2="candle.low"/><rect :x="candle.x-3" :y="candle.top" width="6" :height="Math.max(1,candle.bottom-candle.top)"/></g>
+                    <path v-for="path in nightChart.paths" :key="path.label" :d="path.d" :stroke="path.color" fill="none" stroke-width="1.3"><title>{{ path.label }}</title></path>
+                    <text v-for="label in nightChart.labels" :key="label.x" :x="label.x" y="265" fill="#9aa9ba" font-size="12" text-anchor="middle">{{ label.text }}</text>
+                  </svg>
+                </div>
+                <table class="night-values"><thead><tr><th>Pine 导出属性</th><th>实时快照（入场）</th><th>确认快照（退出 / 止损管理）</th></tr></thead><tbody>
+                  <tr v-for="field in [{key:'entry_signal',label:'入场信号'},{key:'direction',label:'方向 1多 / -1空 / 0未知'},{key:'entry_price',label:'入场参考价'},{key:'long_stop',label:'多头止损'},{key:'short_stop',label:'空头止损'}]" :key="field.key"><td>{{ field.label }}</td><td>{{ field.key === 'entry_signal' ? (night.realtime ? Number(night.realtime[field.key]) : '—') : night.realtime?.[field.key] ?? '—' }}</td><td>{{ field.key === 'entry_signal' ? (night.confirmed ? Number(night.confirmed[field.key]) : '—') : night.confirmed?.[field.key] ?? '—' }}</td></tr>
+                  <tr><td>ATR（辅助输出）</td><td>{{ night.raw_realtime?.atr ?? '—' }}</td><td>{{ night.raw_confirmed?.atr ?? '—' }}</td></tr>
+                  <tr><td>对应 K 线起始时间（ET）</td><td>{{ nightTime(night.realtime?.time) }}</td><td>{{ nightTime(night.confirmed?.time) }}</td></tr>
+                  <tr><td>输出校验</td><td>{{ night.realtime?.errors?.join('；') || '—' }}</td><td>{{ night.confirmed?.errors?.join('；') || '—' }}</td></tr>
+                </tbody></table>
+                <h4>本次模拟订单</h4>
+                <el-table :data="night.orders || []" size="small" empty-text="人工启动后，满足策略输出与测试时段才会产生模拟订单">
+                  <el-table-column prop="lot_id" label="模拟订单" width="120"></el-table-column><el-table-column prop="side" label="方向" width="80"></el-table-column><el-table-column prop="qty" label="数量" width="80"></el-table-column><el-table-column prop="state" label="状态" width="100"></el-table-column><el-table-column prop="entry_px" label="入场参考"></el-table-column><el-table-column prop="avg_fill" label="模拟成交"></el-table-column><el-table-column prop="stop_px" label="执行止损"></el-table-column><el-table-column prop="realized_pnl" label="模拟盈亏"></el-table-column>
+                </el-table>
+                <h4>执行决策（最近 100 条）</h4><div class="night-events"><div v-for="(event,index) in (night.events || []).slice().reverse()" :key="index">{{ nightTime(event.received_at) }} {{ eventTypeText(event.event) }} · {{ event.reason || event.error || event.symbol || '' }}</div></div>
+                <p class="muted">{{ night.limitations || '模拟触价不代表券商能在夜盘成交。' }} 测试记录只保存到 paper_tests，重启不自动续跑。报告样本上限 10000，丢弃 {{ night.dropped_samples || 0 }} 条；决策上限 5000，丢弃 {{ night.dropped_events || 0 }} 条。</p>
+              </div>
+            </el-tab-pane>
+            <el-tab-pane class="workspace-pane pane-backtest" v-if="workspaceGroup === 'validation'" label="回测" name="backtest">
+              <div class="perf-panel wb-panel">
+                <div class="wb-heading"><b>策略与执行验证</b><span class="muted">人工选择启动时机，核对策略输出、执行决策和最终结果</span></div>
+                <details class="wb-settings" :open="!wb"><summary>回测参数 · 展开修改后重新运行</summary>
+                <fieldset class="wb-form" :disabled="wbLoading">
+                  <label>策略模型<el-select v-model="wbModel" size="small" :disabled="wbLoading"><el-option v-for="m in autoModels" :key="m.id" :label="m.name" :value="m.id"></el-option></el-select></label>
+                  <label>标的<el-input v-model="wbSymbol" size="small" :disabled="wbLoading" placeholder="如 NVDA"></el-input></label>
+                  <label>交易日 · 美东<el-date-picker v-model="wbDay" size="small" :disabled="wbLoading" type="date" value-format="YYYY-MM-DD" placeholder="默认最近已收盘交易日"></el-date-picker></label>
+                  <label>人工启动时间 · 美东<el-select v-model="wbStartTime" size="small" filterable :disabled="wbLoading" aria-label="执行实例人工启动时间（美东）"><el-option v-for="hm in wbStartTimes" :key="hm" :label="hm + ' ET'" :value="hm"></el-option></el-select></label>
+                  <label>模拟初始资金 $<el-input-number v-model="wbEquity" size="small" :disabled="wbLoading" :min="1" :step="10000" controls-position="right"></el-input-number></label>
+                  <label>首仓风险预算 $<el-input-number v-model="wbRiskUsd" size="small" :disabled="wbLoading" :min="1" :step="100" controls-position="right"></el-input-number></label>
+                  <template v-if="wbSelectedModel.execution_profile === 'ema9_legacy_pyramid'">
+                    <label>加仓解锁 R<el-input-number v-model="wbAddUnlockR" size="small" :disabled="wbLoading" :min="0.1" :step="0.5" controls-position="right"></el-input-number></label>
+                    <label>自动保本<el-switch v-model="wbAutoBreakeven" :disabled="wbLoading"></el-switch></label>
+                    <label v-if="wbAutoBreakeven">保本门槛 R<el-input-number v-model="wbBreakevenR" size="small" :disabled="wbLoading" :min="0.1" :step="0.5" controls-position="right"></el-input-number></label>
+                  </template>
+                </fieldset>
+                <label class="wb-expectation">本次预期（可选，不自动判定策略正确）<el-input v-model="wbExpected" type="textarea" :rows="2" :disabled="wbLoading" placeholder="例如：10:35 多头信号应建仓；方向反转后退出；首仓计划风险不超过预算。"></el-input></label>
+                </details>
+                <div class="wb-actions">
+                  <el-button size="small" type="primary" :loading="wbLoading" @click="wbRun">{{ wbLoading ? '正在运行回测…' : '运行回测' }}</el-button>
+                  <span v-if="wb && wb.history_reused" class="muted">已复用历史数据</span>
+                  <el-button size="small" :disabled="wbLoading" @click="wbCopySettings">复制当前执行设置</el-button>
+                  <el-button v-if="wbPrevious" size="small" @click="wbExportPrevious">导出上次完整报告</el-button>
+                  <span class="muted">执行配置：{{ wbSelectedModel.execution_profile || '—' }} · 独立模拟，不修改实盘设置</span>
+                </div>
+                <p class="wb-note">启动前不参与交易。5 分钟数据从启动时间之后第一根完整 K 线开始回放，已有入场时段限制继续生效。启动时机由你判断。</p>
+                <div v-if="wbError" class="shadow-bt-err" role="alert">{{ wbError }}</div>
                 <template v-if="wb">
-                  <div v-if="wb.current_bar" class="bt-bar">
-                    <b>{{ wb.current_bar.hm }}</b>
-                    O{{ wb.current_bar.open }} H{{ wb.current_bar.high }} L{{ wb.current_bar.low }} C{{ wb.current_bar.close }}
-                    <span :class="wb.current_bar.direction === 1 ? 'pnl-pos' : 'pnl-neg'">{{ wb.current_bar.direction === 1 ? '多' : '空' }}</span>
-                    <span class="muted">EMA9 {{ fmt2(wb.current_bar.ema_9) }} · 触碰 {{ wb.current_bar.touch }} · ATR {{ fmt2(wb.current_bar.atr) }}</span>
+                  <div class="wb-result-context">
+                    <b>{{ wb.model_name }} · {{ wb.symbol }} · {{ wb.day }}</b>
+                    <span>人工启动 {{ wb.run_context.start_time }} ET · 实际回放 {{ wb.run_context.first_bar_time }}–{{ wb.run_context.last_bar_time }} ET · {{ wb.total_bars }} 根</span>
+                    <span>执行配置 {{ wb.execution_profile }} · 模拟资金 ${{ fmtMoney(wb.params.equity) }} · 首仓预算 ${{ fmtMoney(wb.params.initial_risk_usd) }}</span>
+                    <span>启动方向 {{ wbDirectionText(wb.params.start_direction) }} · 各次风险预算 ${{ wbRiskPlan(wb.params) }}<template v-if="wb.execution_profile === 'ema9_legacy_pyramid'"> · 加仓解锁 {{ wb.params.pyramid_add_unlock_r }}R · 自动保本 {{ wb.params.pyramid_auto_breakeven ? wb.params.pyramid_breakeven_r + 'R' : '关闭' }}</template></span>
+                    <span>来源指纹 · 模型声明 {{ wb.run_context.model_revision }} · 执行源文件 {{ wb.run_context.execution_revision }} · 历史数据 {{ wb.run_context.data_revision }}</span>
                   </div>
+                  <div class="wb-report-actions"><el-button size="small" @click="wbExportJson">导出完整验证报告 JSON</el-button><el-button size="small" @click="wbExportCsv">导出订单 CSV</el-button><label>人工核对结论<el-select v-model="wbReview" size="small" placeholder="未核对" aria-label="回测人工核对结论"><el-option label="未核对" value="未核对"></el-option><el-option label="符合预期（人工确认）" value="符合预期"></el-option><el-option label="存在差异，待分析" value="存在差异"></el-option></el-select></label></div>
+                  <p v-if="wbExpectationSnapshot" class="wb-note">本次预期：{{ wbExpectationSnapshot }}</p>
+                  <p v-if="wbPrevious" class="wb-note">上次运行：{{ wbPrevious.model_name }} · {{ wbPrevious.symbol }} · {{ wbPrevious.day }} {{ wbPrevious.start_time }} ET · 已实现盈亏 ${{ fmt2(wbPrevious.summary.total_pnl) }}。比较时请核对数据与启动条件；刷新后需通过已导出报告复核。</p>
                   <div class="perf-group">
-                    <div class="perf-group-title">整组仓位</div>
+                    <div class="perf-group-title">结果总览 · 订单批次口径</div>
+                    <div class="wb-metrics">
+                      <span>信号 K 线 <b>{{ wb.validation.signal_bars }}</b></span>
+                      <span>无效信号 <b :class="wb.validation.invalid_signal_bars ? 'pnl-neg' : ''">{{ wb.validation.invalid_signal_bars }}</b></span>
+                      <span>委托 / 成交 / 撤单 <b>{{ wb.validation.placed_orders }} / {{ wb.validation.filled_orders }} / {{ wb.validation.cancelled_orders }}</b></span>
+                      <span>已平仓批次 <b>{{ wb.summary.count }}</b></span>
+                      <span>已实现盈亏 $<b :class="pnlClass(wb.summary.total_pnl)">{{ fmtMoney(wb.summary.total_pnl) }}</b></span>
+                      <span>批次胜率 <b>{{ wb.summary.win_rate == null ? '—' : wb.summary.win_rate + '%' }}</b></span>
+                      <span>平均实际 R <b>{{ wb.summary.avg_rr == null ? '—' : wb.summary.avg_rr + 'R' }}</b></span>
+                      <span>平均 / 最大 MFE <b>{{ wb.summary.avg_mfe_r == null ? '—' : wb.summary.avg_mfe_r + 'R' }} / {{ wb.summary.max_mfe_r == null ? '—' : wb.summary.max_mfe_r + 'R' }}</b></span>
+                      <span>最大仓位 <b>{{ wb.summary.max_position_pct == null ? '未设置初始资金' : wb.summary.max_position_pct + '%' }}</b></span>
+                    </div>
+                    <p v-if="!wb.orders.length" class="wb-note">未产生订单。请结合策略输出及决策时间线核对：没有信号、输出缺失或无效，以及执行规则拒绝，是不同的结果。</p>
+                  </div>
+                  <div v-if="wbPriceChart" class="wb-chart-panel">
+                    <div class="wb-chart-toolbar"><b>价格与执行核对</b><label>定位 K 线<el-select v-model="wbChartSelection" size="small" aria-label="定位回测 K 线"><el-option v-for="(bar, bi) in wb.replay_bars" :key="bar.time" :label="bar.hm + ' ET'" :value="bi"></el-option></el-select></label><span>收盘价曲线 · ○ 有效信号 · ▲ 成交 · × 退出 · 虚线为每根结束时的模拟止损</span></div>
+                    <div class="wb-chart-scroll"><svg viewBox="0 0 1000 250" role="img" aria-label="历史收盘价、模拟止损、信号、成交和退出位置，可通过时间选择框或下方明细定位">
+                      <g v-for="tick in wbPriceChart.ticks" :key="tick.price"><line x1="62" x2="962" :y1="tick.y" :y2="tick.y" class="chart-grid"></line><text x="4" :y="tick.y + 5">{{ fmt2(tick.price) }}</text></g>
+                      <path :d="wbPriceChart.path" class="chart-price"></path><path :d="wbPriceChart.stopPath" class="chart-stop"></path>
+                      <circle v-for="(p, pi) in wbPriceChart.signals" :key="'signal'+pi" :cx="p.x" :cy="p.y" r="5" class="chart-signal"></circle>
+                      <path v-for="(p, pi) in wbPriceChart.fills" :key="'fill'+pi" :d="'M'+p.x+','+(p.y-9)+'l-7,14h14Z'" class="chart-fill"></path>
+                      <path v-for="(p, pi) in wbPriceChart.exits" :key="'exit'+pi" :d="'M'+(p.x-7)+','+(p.y-7)+'l14,14m0,-14l-14,14'" class="chart-exit"></path>
+                      <line :x1="wbPriceChart.selected.x" :x2="wbPriceChart.selected.x" y1="20" y2="220" class="chart-cursor"></line>
+                      <circle :cx="wbPriceChart.selected.x" :cy="wbPriceChart.selected.y" r="5" class="chart-cursor-dot"></circle>
+                      <text x="62" y="242">{{ wbPriceChart.first }} ET</text><text x="962" y="242" text-anchor="end">{{ wbPriceChart.last }} ET</text>
+                    </svg></div>
+                    <p class="wb-note">{{ wbPriceChart.selected.hm }} ET · 收盘 {{ wbPriceChart.selected.close }} · {{ wbDirectionText(wbPriceChart.selected.direction) }} · 入场参考价 {{ wbPriceChart.selected.entry_price ?? '—' }} · 策略多/空止损 {{ wbPriceChart.selected.long_stop ?? '—' }} / {{ wbPriceChart.selected.short_stop ?? '—' }} · 模拟订单止损 {{ wbPriceChart.selected.execution_stop ?? '—' }}</p>
+                  </div>
+                  <details class="wb-output">
+                    <summary>策略模型输出核对 · {{ wb.validation.signal_bars }} 根信号 K 线 · 缺失输出 {{ wb.validation.missing_output_bars }} 根</summary>
+                    <div class="wb-output-table"><table><thead><tr><th>美东时间</th><th>方向</th><th>入场参考价</th><th>多头止损</th><th>空头止损</th><th>输出校验</th></tr></thead><tbody>
+                      <tr v-for="s in wb.validation.signals" :key="s.time"><td><button class="time-link" @click="wbFocusTime(s.time)">{{ s.hm }}</button></td><td>{{ wbDirectionText(s.direction) }}</td><td>{{ s.entry_price == null ? '—' : s.entry_price }}</td><td>{{ s.long_stop == null ? '—' : s.long_stop }}</td><td>{{ s.short_stop == null ? '—' : s.short_stop }}</td><td :class="s.errors.length ? 'pnl-neg' : ''">{{ s.errors.length ? s.errors.join('；') : '有效' }}</td></tr>
+                    </tbody></table></div>
+                    <p v-if="!wb.validation.signals.length" class="wb-note">启动后未读到入场信号；输出是否完整请查看缺失计数。</p>
+                  </details>
+                  <div class="perf-group">
+                    <div class="perf-group-title">执行实例结束状态 · 已完成收盘结算</div>
                     <div v-for="i in wb.instances" :key="i.inst_id" class="perf-row">
                       <span class="perf-name">{{ i.symbol.split(':').pop() }}</span>
-                      <span><el-tag size="small" :type="autoStateTag(i.state)">{{ i.state }}</el-tag></span>
+                      <span><el-tag size="small" :type="autoStateTag(i.state)">{{ wb.done ? '回测已结束' : instanceState(i) }}</el-tag></span>
                       <span>{{ i.side === 'long' ? '多' : (i.side === 'short' ? '空' : '—') }} / {{ i.entries }}次{{ i.unlocked ? ' · 已解锁' : '' }}</span>
                       <span>均价 {{ i.avg_cost || '—' }} / 止损 {{ i.stop_px || '—' }}</span>
                       <span :class="pnlClass(i.unrealized_r)">{{ i.unrealized_r }}R / MFE {{ i.mfe_r }}R</span>
@@ -779,7 +1041,7 @@
                             {{ isDecisionCollapsed(g, gi) ? '展开' : '折叠' }}
                           </button>
                         </span>
-                        <span class="decision-time">{{ g.items.length > 1 ? g.start + '–' + g.end : g.hm }}</span>
+                        <button class="decision-time time-link" @click="wbFocusTime(g.time)">{{ g.items.length > 1 ? g.start + '–' + g.end : g.hm }}</button>
                         <b :class="g.title === '整组退出' ? 'pnl-neg' : (g.title === '忽略信号' ? 'muted' : 'accent')">
                           {{ g.title }}<template v-if="g.items.length > 1"> ×{{ g.items.length }}</template>
                         </b>
@@ -798,55 +1060,46 @@
                     </div>
                   </div>
                   <div class="perf-group">
-                    <div class="perf-group-title">建仓与加仓（{{ wb.orders.length }}）</div>
+                    <div class="perf-group-title">执行订单（{{ wb.orders.length }} 个批次）</div>
                     <div v-for="o in wb.orders" :key="o.lot_id" class="bt-order">
                       <div class="perf-row">
-                        <span class="perf-name">第{{ o.entries }}次</span>
+                        <button class="perf-name time-link" @click="wbFocusTime((o.filled || o.placed).t)">第{{ o.entries }}次 · 定位</button>
                         <span :class="o.side === 'long' ? 'pnl-pos' : 'pnl-neg'">{{ o.side === 'long' ? '多' : '空' }} x{{ o.qty }}</span>
                         <span>预算 {{ fmtMoney(o.risk_budget) }}</span>
-                        <span v-if="o.placed">入 {{ fmt2(o.placed.limit) }} 损 {{ fmt2(o.placed.stop) }}</span>
+                        <span>计划风险 ${{ fmt2(o.planned_risk) }}</span>
+                        <span v-if="o.placed">{{ entryOrderTypeText(o) }} · Pine 参考 {{ fmt2(o.placed.reference ?? o.placed.limit) }} 损 {{ fmt2(o.placed.stop) }}</span>
                         <span v-if="o.closed">出 {{ o.closed.px }} [{{ exitReasonText(o.closed.reason) }}]</span>
                         <b v-if="o.pnl != null" :class="pnlClass(o.pnl)">{{ o.pnl > 0 ? '+' : '' }}{{ o.pnl }} · {{ o.rr }}R · MFE {{ o.mfe_r }}R</b>
                         <b v-else class="muted">{{ o.state }}</b>
                       </div>
                       <div class="bt-timeline">
-                        <span v-if="o.placed" class="bt-tl">挂单 {{ o.placed.hm }} @{{ fmt2(o.placed.limit) }} / 损 {{ fmt2(o.placed.stop) }}</span>
+                        <span v-if="o.placed" class="bt-tl">委托 {{ o.placed.hm }} · {{ entryOrderTypeText(o) }} · 风险参考 {{ fmt2(o.placed.risk_reference ?? o.placed.limit) }} / 损 {{ fmt2(o.placed.stop) }}</span>
                         <span v-if="o.filled" class="bt-tl tl-fill">成交 {{ o.filled.hm }} @{{ o.filled.px }}</span>
                         <span v-if="o.closed" class="bt-tl tl-close">了结 {{ o.closed.hm }} @{{ o.closed.px }}［{{ exitReasonText(o.closed.reason) }}］</span>
                       </div>
                     </div>
-                    <div v-if="!wb.orders.length" class="muted log-empty">暂无订单（推进 bar 后产生）</div>
+                    <div v-if="!wb.orders.length" class="muted log-empty">本次回测未产生订单</div>
                   </div>
-                  <div v-if="wb.done && wb.summary.count" class="perf-group">
-                    <div class="perf-group-title">当日汇总</div>
-                    <div class="perf-row">
-                      <span>建仓 {{ wb.summary.count }} 次</span>
-                      <span>胜率 {{ wb.summary.win_rate }}%</span>
-                      <span>总 PnL <b :class="pnlClass(wb.summary.total_pnl)">{{ wb.summary.total_pnl }}</b></span>
-                      <span>平均 RR {{ wb.summary.avg_rr }}</span>
-                      <span>平均 MFE {{ wb.summary.avg_mfe_r }}R</span>
-                      <span>最大 MFE <b class="pnl-pos">{{ wb.summary.max_mfe_r }}R</b></span>
-                      <span>最大仓位 <b>{{ wb.summary.max_position_pct }}%</b></span>
-                    </div>
-                  </div>
+                  <details class="wb-output"><summary>回测条件与结果解释</summary><ul><li v-for="w in wb.validation.warnings" :key="w">{{ w }}</li></ul><p class="wb-note">输出“有效”只代表符合数值接口。是否符合你的策略预期，需要结合信号、决策和订单核对；盈亏为正不等于验证通过。</p></details>
                 </template>
-                <div v-if="!wb" class="muted log-empty">输入标的和交易日，点「加载数据」开始回测；之后可单步推进或全部运行</div>
+                <div v-if="!wb && !wbLoading" class="muted log-empty">选择策略模型、交易日和人工启动时间，点击「运行回测」，一次完成数据加载、模拟执行和结果汇总。</div>
+                <div v-if="wbLoading" class="muted log-empty" role="status">正在加载历史数据并执行模拟，请稍候。结果将包含启动后的信号、执行决策和订单明细。</div>
               </div>
             </el-tab-pane>
             <!-- 运行日志 tab -->
-            <el-tab-pane label="运行日志" name="log">
+            <el-tab-pane class="workspace-pane pane-log" v-if="workspaceGroup === 'operations'" label="运行日志" name="log">
               <div class="log-body">
                 <div v-for="(l, i) in logs" :key="i" class="log-line" :class="'log-' + l.level.toLowerCase()">
                   <span class="log-time">{{ logTime(l.ts) }}</span>
                   <span class="log-level">{{ l.level }}</span>
-                  <span class="log-name">{{ l.name }}</span>
+                  <span class="log-name" :title="l.name">{{ l.name }}</span>
                   <span class="log-msg">{{ l.msg }}</span>
                 </div>
                 <div v-if="!logs.length" class="muted log-empty">暂无日志</div>
               </div>
             </el-tab-pane>
             <!-- 账户与 QQQ 收益对比 -->
-            <el-tab-pane label="收益对比" name="returns">
+            <el-tab-pane class="workspace-pane pane-returns" v-if="workspaceGroup === 'research'" label="收益对比" name="returns">
               <div class="returns-panel">
                 <div class="returns-toolbar">
                   <el-date-picker v-model="returnsRange" type="daterange" size="small"
@@ -906,7 +1159,7 @@
                 <div v-else-if="!returnsLoading && !returnsError" class="muted log-empty">选择起止日期后点击查询</div>
               </div>
             </el-tab-pane>
-            <el-tab-pane label="绩效" name="perf">
+            <el-tab-pane class="workspace-pane pane-perf" v-if="workspaceGroup === 'research'" label="绩效" name="perf">
               <div class="perf-panel">
                 <div v-if="!performance || !performance.count" class="muted log-empty">暂无交易记录（平仓后自动归档统计）</div>
                 <template v-else>
@@ -948,7 +1201,7 @@
                 </template>
               </div>
             </el-tab-pane>
-            <el-tab-pane label="事件" name="events">
+            <el-tab-pane class="workspace-pane pane-events" v-if="workspaceGroup === 'operations'" label="事件" name="events">
               <div class="events-panel">
                 <div class="events-filter">
                   <el-select v-model="eventFilter" size="small" style="width:140px">
@@ -976,7 +1229,7 @@
               </div>
             </el-tab-pane>
             <!-- 跟单管理 tab：copy_trader 服务器配置 + 运行状态 + 订单对照 + 失败重放（数据全来自 WS 快照 msg.copy） -->
-            <el-tab-pane label="跟单管理" name="copy">
+            <el-tab-pane class="workspace-pane pane-copy" v-if="workspaceGroup === 'operations'" label="跟单管理" name="copy">
               <div v-if="copy" class="perf-panel">
                 <!-- 服务器配置表（启用开关即时生效，其余字段改完点「保存」统一提交） -->
                 <div class="perf-group">
@@ -1037,7 +1290,7 @@
                         </el-select>
                       </template>
                     </el-table-column>
-                    <el-table-column label="操作" width="140">
+                    <el-table-column label="操作" width="140" fixed="right">
                       <template #default="{ row }">
                         <el-button size="small" type="primary" @click="copySaveServer(row)">保存</el-button>
                         <el-button size="small" type="danger" @click="copyDeleteServer(row)">删除</el-button>
@@ -1083,7 +1336,10 @@
                     <el-table-column label="follower" width="100">
                       <template #default="{ row }"><el-tag size="small" :type="stateTag(row.follower_state)">{{ row.follower_state }}</el-tag></template>
                     </el-table-column>
-                    <el-table-column prop="qty" label="股数" width="75"></el-table-column>
+                    <el-table-column prop="target_qty" label="批次目标" width="90"></el-table-column>
+                    <el-table-column prop="qty" label="跟单余仓" width="90"></el-table-column>
+                    <el-table-column prop="pending_qty" label="待成交" width="80"></el-table-column>
+                    <el-table-column prop="protection_qty" label="确认保护量" width="105"></el-table-column>
                     <el-table-column label="止损" width="90">
                       <template #default="{ row }"><span class="lot-price">{{ row.stop_px > 0 ? row.stop_px.toFixed(2) : '—' }}</span></template>
                     </el-table-column>
@@ -1109,7 +1365,7 @@
                       <template #default="{ row }"><span class="pnl-neg">{{ row.error }}</span></template>
                     </el-table-column>
                     <el-table-column prop="retries" label="重试" width="60"></el-table-column>
-                    <el-table-column label="操作" width="140">
+                    <el-table-column label="操作" width="140" fixed="right">
                       <template #default="{ row }">
                         <el-button size="small" type="primary" @click="copyRetry(row)">重放</el-button>
                         <el-button size="small" @click="copyDismiss(row)">忽略</el-button>
@@ -1156,6 +1412,39 @@
       </section>
       </div>
     </main>
+
+    <footer class="opening-feed" aria-label="小区间突破消息流">
+      <div class="opening-feed-head">
+        <strong>小区间突破</strong>
+        <span class="muted">{{ openingBreakouts.length ? openingBreakouts.length + ' 条 · 美东K线开盘时间' : (openingBreakoutCoverage?.pending.length ? '等待行情和指标补齐' : '今日暂无信号') }}</span>
+        <el-button link size="small" v-if="openingBreakouts.length" @click="scrollOpeningFeedToLatest">回到最新</el-button>
+      </div>
+      <div v-if="openingBreakouts.length" ref="openingFeed" class="opening-feed-scroll"
+           :class="{ dragging: openingFeedDrag }"
+           @pointerdown="startOpeningFeedDrag" @pointermove="moveOpeningFeedDrag"
+           @pointerup="endOpeningFeedDrag" @pointercancel="endOpeningFeedDrag"
+           @lostpointercapture="endOpeningFeedDrag"
+           tabindex="0" role="region" aria-label="按收盘时间横向浏览突破信号">
+        <section v-for="group in openingBreakoutGroups" :key="group.time" class="opening-feed-group">
+          <div class="opening-feed-time">{{ hmET(group.time) }}</div>
+          <div class="opening-feed-cards">
+            <article v-for="row in group.rows" :key="row.id" class="opening-feed-card" :class="row.side">
+              <div class="opening-feed-symbol">
+                <el-button link type="primary" @click="pickScreen(row)">{{ row.ticker }}</el-button>
+                <strong :class="row.side === 'long' ? 'pnl-pos' : 'pnl-neg'">{{ row.side === 'long' ? '上破' : '下破' }}</strong>
+              </div>
+              <span class="muted" :title="row.status_detail">{{ openingBreakoutStatus(row) }}</span>
+              <span>实体 {{ row.body_ema_ratio == null ? (row.body_ema10 === 0 ? '基线为 0' : '—') : row.body_ema_ratio.toFixed(2) + ' 倍实体EMA10' }}</span>
+              <span class="muted">实体 {{ row.body_atr == null ? '—' : row.body_atr.toFixed(2) + ' ATR' }}</span>
+              <span class="muted">止损 {{ row.stop_px == null ? '—' : row.stop_px.toFixed(2) }}</span>
+              <el-button size="small" :type="row.side === 'long' ? 'success' : 'danger'"
+                         :disabled="openingBreakoutEntryDisabled(row)"
+                         @click="placeOpeningBreakout(row)">{{ openingBreakoutActionLabel(row) }}</el-button>
+            </article>
+          </div>
+        </section>
+      </div>
+    </footer>
 
     <!-- 信号栏：右侧常驻（突破卡片固定最上，FVG 卡片 ATR 倍数降序，叉号逐条删除） -->
     <div v-if="fvgFeed.length" class="fvg-feed" :class="{ collapsed: fvgFeedCollapsed }">
@@ -1251,6 +1540,6 @@
 
   <script src="https://unpkg.com/vue@3.5.13/dist/vue.global.prod.js"></script>
   <script src="https://unpkg.com/element-plus@2.9.1/dist/index.full.min.js"></script>
-  <script src="/static/app.js?v=pine-models-2"></script>
+  <script src="/static/app.js?v=opening-breakout-feed-2"></script>
 </body>
 </html>

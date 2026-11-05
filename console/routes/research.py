@@ -1,11 +1,16 @@
 """HTTP adapters; application logic lives in services."""
 
-from fastapi import Depends
-from console.schemas import BtLoadRequest
+from fastapi import Depends, HTTPException
+from console.schemas import BtLoadRequest, BtRunRequest
 from console.dependencies import get_services
 from fastapi import APIRouter
 
 router = APIRouter()
+
+
+@router.post("/api/bt/run")
+async def api_bt_run(req: BtRunRequest, *, services=Depends(get_services)) -> dict:
+    return await services.research.api_bt_run(req=req)
 
 
 @router.get("/api/shadow")
@@ -16,6 +21,14 @@ async def api_shadow(*, services=Depends(get_services)) -> dict:
 @router.get("/api/shadow/report")
 async def api_shadow_report(day: str = "", *, services=Depends(get_services)) -> dict:
     return await services.research.api_shadow_report(day=day)
+
+
+@router.get("/api/shadow/strategy-report")
+async def api_strategy_shadow_report(day: str = "", *, services=Depends(get_services)) -> dict:
+    try:
+        return services.strategy_shadow.report(day)
+    except ValueError as error:
+        raise HTTPException(400, "交易日格式应为 YYYY-MM-DD") from error
 
 
 @router.post("/api/bt/load")

@@ -89,6 +89,12 @@ class MonitoringService:
         stats = {"cancelled": 0, "closed": 0, "pending": 0, "failed": 0, "skipped": 0}
         if not (self.context.gateway.enabled and self.context.gateway._connected):
             return stats
+        # Broker positions and the lot ledger advance independently. Never
+        # turn their difference into an order for a ticker owned by the tool.
+        managed_tickers = {
+            lot["symbol"].split(":")[-1].upper()
+            for lot in self.context.order_mgr.list_lots()
+        }
         positions, trades = (
             await self.context.gateway.positions(),
             await self.context.gateway.trade_map(),
@@ -220,6 +226,17 @@ class MonitoringService:
         for ticker in sorted(set(positions) | set(tool_qty)):
             residual = positions.get(ticker, 0) - tool_qty.get(ticker, 0)
             if abs(residual) < 1:
+                continue
+            if ticker.upper() in managed_tickers or self.context.order_mgr.list_lots(symbol=ticker):
+                stats["skipped"] += 1
+                key = ("managed_residual", ticker)
+                if time.time() - self.context.monitoring._external_alert_last.get(key, 0) >= 60:
+                    self.context.monitoring._external_alert_last[key] = time.time()
+                    self.context.events.record_event(
+                        "external_position_alert", kind="position", ticker=ticker,
+                        qty=abs(int(residual)), side="long" if residual > 0 else "short",
+                        reason="本工具有该标的订单记录，净仓差额需对账",
+                    )
                 continue
             existing = self.context.monitoring._external_cleanup_inflight.get(ticker)
             if existing is not None and (not existing.isDone()):
@@ -710,21 +727,22 @@ class MonitoringService:
         )
 
     async def _auto_breakeven_loop(self) -> None:
-        """非金字塔 ACTIVE lot 按 AUTO_BREAKEVEN_R 自动保本；金字塔由策略整组管理。"""
+        """普通订单按配置保本，突破单入场所在K线收盘后按信号收盘价保护并保留1R保本。"""
         scan_tick = 0
         last_error: dict = {}
         last_attempt: dict = {}
         while True:
             await asyncio.sleep(1.0)
             try:
+                trading_hours = self.context.system._is_trading_hours()
                 if (
-                    not self.context.system._is_trading_hours()
-                    or not self.context.gateway._connected
+                    not self.context.gateway._connected
                     or self.context.collector.data_health()["stale"]
                 ):
                     continue
                 scan_tick += 1
                 active = self.context.order_mgr.list_lots(active_only=True)
+                market = self.context.collector.latest() or {}
                 if scan_tick % 30 == 0:
                     logger.info("自动保本循环扫描: %d 个活跃 lot", len(active))
                 now = time.time()
@@ -732,9 +750,36 @@ class MonitoringService:
                     lot_id = lot.get("lot_id")
                     if self.context.monitoring._is_pyramid_lot(lot):
                         continue
-                    if lot.get("state") != "ACTIVE" or lot.get("breakeven_reached"):
+                    if lot.get("state") != "ACTIVE":
                         continue
                     side = lot.get("side")
+                    breakout = bool((lot.get("signal_snapshot") or {}).get("opening_breakout_id"))
+                    if breakout and (not lot.get("avg_fill") or not lot.get("filled_qty")):
+                        continue
+                    if breakout:
+                        guard_key = f"signal_close:{lot_id}"
+                        if now - last_attempt.get(guard_key, 0) >= 5:
+                            outcome = await self.context.order_mgr.protect_breakout_signal_close(
+                                lot_id, market.get(lot.get("symbol"), {}), now=now,
+                            )
+                            action = outcome.get("action")
+                            if action not in ("waiting", "already"):
+                                last_attempt[guard_key] = now
+                            if outcome["ok"] and action in ("stop_updated", "stop_kept", "close_submitted"):
+                                self.context.events.record_event(
+                                    "breakout_close_protection", lot_id=lot_id,
+                                    symbol=lot.get("symbol"), side=side, **outcome,
+                                )
+                                logger.warning("突破五分钟收盘价保护 %s %s: %s", lot.get("symbol"), side, outcome)
+                            elif not outcome["ok"] and now - last_error.get(guard_key, 0) >= 30:
+                                last_error[guard_key] = now
+                                logger.warning("突破五分钟收盘价保护失败 %s: %s", lot.get("symbol"), outcome)
+                            if action == "close_submitted" or not outcome["ok"]:
+                                continue
+                    if breakout:
+                        continue  # 突破仅按入场K线收盘保护，不启用1R自动保本。
+                    if not trading_hours or lot.get("breakeven_reached"):
+                        continue
                     avg_fill = lot.get("avg_fill") or lot.get("entry_px")
                     init_entry = lot.get("init_entry_px") or lot.get("entry_px")
                     init_stop = lot.get("init_stop_px") or lot.get("stop_px")
@@ -749,15 +794,14 @@ class MonitoringService:
                     risk = abs(init_entry - init_stop)
                     if risk <= 0:
                         continue
-                    _snap = (self.context.collector.latest() or {}).get(
-                        lot.get("symbol"), {}
-                    )
+                    _snap = market.get(lot.get("symbol"), {})
                     _bar = _snap.get("bar") or {}
-                    price = _bar.get("high") if side == "long" else _bar.get("low")
+                    price = _bar.get("high" if side == "long" else "low")
                     if not price or price <= 0:
                         continue
                     profit = price - avg_fill if side == "long" else avg_fill - price
                     rr = profit / risk
+                    trigger = "profit_r"
                     if rr < config.AUTO_BREAKEVEN_R:
                         continue
                     if now - last_attempt.get(lot_id, 0) < 5.0:
@@ -779,6 +823,7 @@ class MonitoringService:
                             side=side,
                             unrealized_r=round(rr, 2),
                             new_stop=round(avg_fill, 2),
+                            trigger=trigger,
                         )
                         last_error.pop(lot_id, None)
                     elif now - last_error.get(lot_id, 0) >= 30:
@@ -902,7 +947,7 @@ class MonitoringService:
                         continue
                     if action == "close":
                         self.context.monitoring._fvg_reverse_alerts[lot_id] = {
-                            "kind": "close_failed",
+                            "kind": "reverse_warning",
                             "lot_id": lot_id,
                             "symbol": symbol,
                             "ticker": ticker,

@@ -352,3 +352,86 @@ def test_long_only_and_status_schema(tmp_path):
         assert row["master_lot_id"] == "d2" and row["master_state"] == "ACTIVE"
         assert st["name"] == "T" and st["halted"] is False
     run(go())
+
+
+def test_managed_follow_uses_actual_fills_and_reduces_to_target(tmp_path):
+    from execution.order_lot import OrderManager
+    from execution.risk import RiskConfig, RiskGate
+
+    follower, gw = make_follower(tmp_path, {
+        "size_mode": "multiplier", "size_multiplier": 1.0,
+    })
+    gw.enabled = False
+
+    async def realized_pnl():
+        return 0.0
+
+    gw.realized_pnl = realized_pnl
+    manager = OrderManager(gw, RiskGate(RiskConfig(), tmp_path), tmp_path / "managed.json")
+    follower = CopyFollower(
+        "managed", follower.cfg, dry_run=True, logs_dir=tmp_path,
+        gateway=gw, order_manager=manager,
+    )
+
+    async def scenario():
+        await follower.startup()
+        await follower.process_snapshot(snap([]))
+        await follower.process_snapshot(snap([
+            lot("a", "ACTIVE", qty=40, filled=10, avg=100, stop=99),
+        ]))
+        row, = manager.list_lots()
+        assert row["filled_qty"] == 10
+        await follower.process_snapshot(snap([
+            lot("a", "ACTIVE", qty=40, filled=7, avg=100, stop=99),
+        ]))
+        assert manager.get(row["lot_id"]).filled_qty == 7
+        await follower.process_snapshot(snap([
+            lot("a", "CLOSED", qty=40, filled=7, avg=100, stop=99),
+        ]))
+        assert manager.get(row["lot_id"]).state == "CLOSED"
+        await follower.process_snapshot(snap([
+            lot("a", "ACTIVE", qty=40, filled=10, avg=100, stop=99),
+        ]))
+        assert len(manager.list_lots()) == 1
+
+    run(scenario())
+
+
+def test_managed_map_corruption_preserves_file_and_blocks_entries(tmp_path):
+    from execution.order_lot import OrderManager
+    from execution.risk import RiskConfig, RiskGate
+
+    follower, gw = make_follower(tmp_path)
+    manager = OrderManager(gw, RiskGate(RiskConfig(), tmp_path), tmp_path / "managed.json")
+    follower = CopyFollower("managed", follower.cfg, logs_dir=tmp_path, gateway=gw, order_manager=manager)
+    follower.map_path.write_text("{broken", encoding="utf-8")
+
+    async def scenario():
+        await follower.startup()
+        frame = snap([lot("a", "ACTIVE", filled=10, avg=100, stop=99)])
+        frame["status"]["dry_run"] = False
+        await follower.process_snapshot(frame)
+        assert not manager.list_lots()
+        assert follower.map_path.read_text(encoding="utf-8") == "{broken"
+        assert "待" in follower._build_status()["last_error"] or "损坏" in follower._build_status()["last_error"]
+
+    run(scenario())
+
+
+def test_managed_disconnect_keeps_real_position_and_pending_order(tmp_path):
+    from execution.order_lot import OrderLot, OrderManager
+    from execution.risk import RiskConfig, RiskGate
+
+    _, gw = make_follower(tmp_path)
+    gw._connected = False
+    manager = OrderManager(gw, RiskGate(RiskConfig(), tmp_path), tmp_path / "managed.json")
+    active = OrderLot("active", "NASDAQ:NVDA", "long", 10, 100, 99, 0,
+                      state="ACTIVE", avg_fill=100, filled_qty=10)
+    pending = OrderLot("pending", "NASDAQ:NVDA", "long", 10, 100, 99, 0,
+                       state="PENDING")
+    manager._lots = {row.lot_id: row for row in (active, pending)}
+    assert not run(manager.close_lot("active", 101))[0]
+    assert not run(manager.close_half("active", 101))[0]
+    assert not run(manager.cancel_lot("pending"))[0]
+    assert (active.state, active.filled_qty, pending.state) == ("ACTIVE", 10, "PENDING")
+    assert not gw.calls

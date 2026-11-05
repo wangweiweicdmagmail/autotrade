@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """行情内容健康、stale 自动恢复与开仓硬闸门回归。"""
+import asyncio
 import time
+
+import pytest
 
 from engine.realtime_collector import RealtimeCollector
 from execution.order_lot import OrderManager
@@ -81,6 +84,34 @@ class _FakeProcess:
 
     async def wait(self):
         self.returncode = 0
+
+
+def test_watchdog_allows_recent_batch_progress_but_restarts_if_it_stalls(monkeypatch):
+    c = _collector()
+    c._proc = _FakeProcess()
+    c._last_launch = 1000.0
+    c._last_startup_progress = 1088.0
+    clock = iter([1090.0, 1095.0, 1105.0])
+    now = 0.0
+    restarts = []
+
+    async def advance(_):
+        nonlocal now
+        now = next(clock, None)
+        if now is None:
+            raise asyncio.CancelledError
+
+    async def restart(reason):
+        restarts.append((now, reason))
+
+    monkeypatch.setattr("engine.realtime_collector.asyncio.sleep", advance)
+    monkeypatch.setattr("engine.realtime_collector.time.time", lambda: now)
+    monkeypatch.setattr(c, "_is_trading_hours", lambda: True)
+    monkeypatch.setattr(c, "_restart", restart)
+    assert c.data_health(1090.0, trading=True)["trade_allowed"] is False
+    with pytest.raises(asyncio.CancelledError):
+        run(c._watchdog_loop())
+    assert restarts == [(1105.0, "transport_stale,content_stale,bar_stale")]
 
 
 def test_restart_terminates_old_process_before_launch(monkeypatch):
@@ -170,4 +201,52 @@ def test_fresh_allows_order_and_stale_does_not_block_close(tmp_path):
             "trade_allowed": False, "reason": "content_stale"}
         ok, err = await mgr.close_lot(lot.lot_id, ref_px=101.0)
         assert ok is True, err
+    run(go())
+
+
+def test_complete_watchlist_tick_larger_than_four_mb_is_read(monkeypatch):
+    """Previous 4MB pipe cut snapshots at 48/53. Exercise actual launch limit."""
+    import json
+    async def go():
+        c=RealtimeCollector([f'TEST:{i}' for i in range(53)])
+        c._running=True
+        payload={'type':'tick','symbols':{symbol:{'bar':{'time':1000,'close':100},
+                 'history_context':'x'*90000} for symbol in c.symbols}}
+        line=(json.dumps(payload)+'\n').encode()
+        assert len(line)>4*1024*1024
+        async def spawn(*args,**kwargs):
+            proc=_FakeProcess()
+            proc.stdout=asyncio.StreamReader(limit=kwargs['limit'])
+            proc.stderr=asyncio.StreamReader(limit=kwargs['limit'])
+            proc.stdout.feed_data(line)
+            proc.stdout.feed_eof()
+            proc.stderr.feed_eof()
+            return proc
+        monkeypatch.setattr('engine.realtime_collector.asyncio.create_subprocess_exec',spawn)
+        await c._launch()
+        await c._reader_task
+        await c._drain_task
+        assert len(c.latest())==53
+    run(go())
+
+
+def test_watchdog_recovers_dead_reader_outside_trading_hours(monkeypatch):
+    async def go():
+        c=_collector()
+        c._proc=_FakeProcess()
+        async def failed_reader():
+            raise ValueError('Separator is not found, and chunk exceed the limit')
+        task=asyncio.create_task(failed_reader())
+        with pytest.raises(ValueError):
+            await task
+        c._reader_task=task
+        calls=[]
+        async def sleep(_):
+            if calls: raise asyncio.CancelledError
+        async def restart(reason): calls.append(reason)
+        monkeypatch.setattr('engine.realtime_collector.asyncio.sleep',sleep)
+        monkeypatch.setattr(c,'_is_trading_hours',lambda:False)
+        monkeypatch.setattr(c,'_restart',restart)
+        with pytest.raises(asyncio.CancelledError): await c._watchdog_loop()
+        assert calls==['行情读取任务已停止']
     run(go())

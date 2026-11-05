@@ -1,0 +1,87 @@
+//@version=5
+indicator("ema9_autotrade", shorttitle="EMA9-ST-ATR", overlay=true)
+
+// ═══════════════════ 参数 ═══════════════════
+// 超级趋势（方向）
+stPeriod     = input.int(10,    "超级趋势周期", minval=1, group="方向：SuperTrend")
+stMultiplier = input.float(3.0, "超级趋势倍数", minval=0.1, step=0.1, group="方向：SuperTrend")
+
+// EMA9
+emaLen = input.int(7, "EMA 周期", minval=1, group="EMA")
+
+// ATR 止损（两个参数）
+atrLen  = input.int(14,   "ATR 周期", minval=1, group="止损：ATR")
+atrMult = input.float(1.2, "ATR 倍数", minval=0.1, step=0.1, group="止损：ATR")
+
+// ═══════════════════ 计算 ═══════════════════
+ema9 = ta.ema(close, emaLen)
+atr  = ta.atr(atrLen)
+
+[supertrend, dir] = ta.supertrend(stMultiplier, stPeriod)
+
+// 方向：dir < 0 为多头（价格在超级趋势线上方），dir > 0 为空头
+isLong  = dir < 0
+isShort = dir > 0
+
+// 止损线：多头放 EMA9 下方，空头放 EMA9 上方
+longStop  = ema9 - atr * atrMult
+shortStop = ema9 + atr * atrMult
+stopLine  = isLong ? longStop : shortStop
+
+
+
+// EMA 在四个已收盘间隔内的累计变化，以最近已收盘 ATR 归一化。
+emaSlopeAtr = not na(ema9[5]) and not na(atr[1]) and atr[1] > 0 ? (ema9[1] - ema9[5]) / atr[1] : na
+plot(emaSlopeAtr, "EMA_Slope_ATR", display=display.data_window, offset=0)
+
+// ═══════════════════ 状态值 ═══════════════════
+// 碰到 EMA9：K 线区间（最低价~最高价）包含 EMA9 即为 1，否则 0
+touchEma9 = low <= ema9 and high >= ema9 ? 1 : 0
+
+
+
+//
+vwapvalue = ta.vwap(close)
+plot(vwapvalue, "vwapvalue", color=color.white, linewidth=2)
+
+
+
+// ═══════════════════ 绘图 ═══════════════════
+
+//plot(isLong  ? supertrend : na, "ST 多头", color=color.new(color.green, 0), style=plot.style_linebr)
+//plot(isShort ? supertrend : na, "ST 空头", color=color.new(color.red,   0), style=plot.style_linebr)
+
+direction = isLong ? 1 : isShort ? -1 : 0
+
+plot(direction, "Direction", display=display.data_window)
+plot(atr, "ATR", display=display.data_window)
+
+
+
+plot(touchEma9, "Touch_EMA9", display=display.data_window)
+plot(ema9, "EMA_9", color=color.orange, linewidth=2)
+plot(isLong ? longStop : na, "Long_Stop", color=color.new(#4caf5b, 0), linewidth=2, style=plot.style_linebr)
+plot(isShort ? shortStop : na, "Short_Stop",color=color.new(#7dff52, 0), linewidth=2, style=plot.style_linebr )
+
+
+// 背景色提示方向
+//bgcolor(isLong ? color.new(color.green, 92) : color.new(color.red, 92), title="方向背景")
+
+// ═══════════════════ 信号 ═══════════════════
+longFlip  = isLong  and not isLong[1]
+shortFlip = isShort and not isShort[1]
+
+plotshape(longFlip,  "转多", style=shape.triangleup,   location=location.belowbar, color=color.green, size=size.small, text="多")
+plotshape(shortFlip, "转空", style=shape.triangledown, location=location.abovebar, color=color.red,   size=size.small, text="空")
+
+// 价格触及止损线警示（仅当前 K 线收盘价确认）
+longStopped  = isLong  and close < stopLine
+shortStopped = isShort and close > stopLine
+plotshape(longStopped,  "多头破位", style=shape.xcross, location=location.belowbar, color=color.new(color.red, 0), size=size.tiny)
+plotshape(shortStopped, "空头破位", style=shape.xcross, location=location.abovebar, color=color.new(color.green, 0), size=size.tiny)
+
+// ═══════════════════ 告警 ═══════════════════
+alertcondition(longFlip,     "转多头", "超级趋势转多")
+alertcondition(shortFlip,    "转空头", "超级趋势转空")
+alertcondition(longStopped,  "多头止损触发", "收盘价跌破多头止损线")
+alertcondition(shortStopped, "空头止损触发", "收盘价突破空头止损线")

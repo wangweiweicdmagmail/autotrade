@@ -5,8 +5,8 @@
 
 核心语义（2026-10-17 v3，配合 Web 下单控制台）：
 
-- 一次「下单」= 一个 **OrderLot（批次）** = 一个 LMT 入场单 + 一个 STP
-  固定止损子单（parentId 括号链，IBKRGateway.place_limit_with_stop）。
+- 一次「下单」= 一个 **OrderLot（批次）** = 一个 MKT/LMT 入场单 + 一个 STP
+  固定止损子单（parentId 括号链）。Pine 自动入场显式使用 MKT。
   止损单只有 STP 一种（2026-10-17 起，TRAIL 路径已删除）。
 - 同一只股票可以连续下多个 lot，每个 lot 拥有**独立的**止损触发价、
   订单号与盈亏（PnL）。
@@ -22,15 +22,19 @@ symbol 计 / 日亏损熔断 / qty 上限），「持仓数上限」按 symbol �
 """
 
 import asyncio
-import json
 import logging
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import config
+from engine.opening_breakout import RULES_VERSION, ET, entry_window
+from domain.contracts import finite_number, FillEvent, OrderPlan, OrderState, StopAmendment, OPEN_ORDER_VALUES
+from execution.state_store import ExecutionStateStore, PersistenceError, RecoveryRequired
+from execution.operations import OperationKind, OrderOperationCoordinator, serialized_placement, placement_received_at
 
 logger = logging.getLogger(__name__)
 
@@ -45,23 +49,23 @@ CANCELLED = "CANCELLED" # 已撤单
 FAILED = "FAILED"       # 下单失败
 CLOSED = "CLOSED"       # 已平仓
 
-_OPEN_STATES = {PENDING, ACTIVE, CLOSING}
+_OPEN_STATES = OPEN_ORDER_VALUES
 _CANCEL_WAIT_SECONDS = 8.0
 _WATCH_POLL_SECONDS = 1.0
 
 
 @dataclass
 class OrderLot:
-    """一个独立的下单批次：LMT 入场 + STP 固定止损子单（括号单）。"""
+    """一个独立的下单批次：MKT/LMT 入场 + STP 固定止损子单。"""
 
     lot_id: str
     symbol: str
     side: str                       # 'long' | 'short'
     qty: int                        # 目标股数
-    entry_px: float                 # LMT 限价（入场参考价）
+    entry_px: float                 # LMT 限价或 MKT 预期成交参考价；实际成交看 avg_fill
     stop_px: float                  # STP 止损触发价
     trail_amount: float             # 遗留字段（历史 TRAIL lot），新单恒为 0
-    init_entry_px: float = 0.0      # 下单时计划限价（R 风险基准，改价/成交后不变化）
+    init_entry_px: float = 0.0      # 下单时风险参考价（R 基准，改价/成交后不变化）
     init_stop_px: float = 0.0       # 下单时计划止损（R 风险基准，跟踪后不变化）
     init_risk_usd: float = 0.0      # 下单时计划风险金额（qty × 每股初始风险）
     max_position_pct: float = 0.0   # 下单时仓位上限%（0=不封顶；回踩改价股数封顶用）
@@ -81,6 +85,7 @@ class OrderLot:
 
     # ---- 复盘/绩效字段（平仓闭环）----
     limit_type: str = ""            # ema / channel / midpoint / retest / auto_* / adopted
+    entry_order_type: str = ""      # MKT / LMT; legacy snapshots may not record it
     reprice_bar_time: float = 0.0   # midpoint/retest 最近一次改价尝试的确认 bar 时间
     breakout_escalated: bool = False  # 中点单突破上根K线后已升级市价（一次性，不可逆）
     # ---- 中点 OCA 双腿（LMT 中点 + STP 突破，一成全撤）----
@@ -97,6 +102,8 @@ class OrderLot:
 
     # ---- 平仓/保护单生命周期（全部持久化，Trade 句柄除外）----
     close_order_id: Optional[int] = None
+    partial_exit: dict = field(default_factory=dict)  # durable partial-exit intent
+    close_submission_ref: str = ""
     close_permId: Optional[int] = None
     close_requested_qty: int = 0    # 当前平仓单委托数量
     close_order_filled_qty: int = 0 # 当前平仓单已入账成交数量
@@ -107,6 +114,12 @@ class OrderLot:
     trail_order_filled_qty: int = 0 # 当前保护单已入账成交数量
     trail_order_avg_fill: float = 0.0
     protection_restore_needed: bool = False
+    entry_submission_pending: bool = False  # durable intent: broker outcome not yet known
+    entry_cumulative_qty: int = 0
+    entry_cumulative_avg: float = 0.0
+    entry_broker_time: float = 0.0
+    last_fill_received_at: float = 0.0
+    last_fill_broker_time: float = 0.0
     trail_modify_blocked_until: float = 0.0  # IBKR 320/断连后的修改冷却时间
     protection_find_blocked_until: float = 0.0  # 保护单快照认回失败冷却（防每秒打全量订单快照）
     owned_order_ids: List[int] = field(default_factory=list)  # 含替换单/旧平仓单/permId
@@ -132,6 +145,10 @@ class OrderLot:
     close_trade: object = field(default=None, repr=False, compare=False)
     breakout_trade: object = field(default=None, repr=False, compare=False)
 
+    @property
+    def lifecycle(self) -> OrderState:
+        return OrderState.from_legacy(self.state)
+
     def recalc_pnl(self) -> None:
         """按 mark 价重算未实现盈亏（PENDING 未成交则为 0）。"""
         if self.state != ACTIVE or self.filled_qty <= 0 or self.last_px <= 0:
@@ -148,13 +165,18 @@ class OrderLot:
         d.pop("trail_trade", None)
         d.pop("close_trade", None)
         d.pop("breakout_trade", None)
+        status = getattr(getattr(self.trail_trade, "orderStatus", None), "status", None)
+        quantity = getattr(getattr(self.trail_trade, "order", None), "totalQuantity", None)
+        d["protection_order_status"] = status
+        d["protection_order_qty"] = quantity
         return d
 
     @staticmethod
     def from_dict(d: dict) -> "OrderLot":
         d = {k: v for k, v in d.items()
              if k not in ("entry_trade", "trail_trade", "close_trade",
-                          "breakout_trade")}
+                          "breakout_trade", "protection_order_status",
+                          "protection_order_qty")}
         return OrderLot(**d)
 
 
@@ -162,9 +184,21 @@ class OrderManager:
     """分批建仓的批次管理器：下单 / 聚合 / 改 STOP / 撤平 / 持久化。"""
 
     def __init__(self, gateway, risk_gate, state_path: Path = STATE_PATH) -> None:
+        self._operations = OrderOperationCoordinator()
+        self._placement_lock = asyncio.Lock()
+        self._reconcile_lock = asyncio.Lock()
         self._gw = gateway
         self._risk = risk_gate
         self._state_path = Path(state_path)
+        self._store = ExecutionStateStore(self._state_path)
+        self._needs_storage_recovery = False
+        self._pending_archives = {}
+        self._storage_error = ""
+        self._reconcile_phase = "not_checked"
+        self._reconcile_error = ""
+        self._reconciled_at = 0.0
+        self._reconcile_issues = []
+        self._position_differences = []
         self._lots: Dict[str, OrderLot] = {}
         self._pyramid_groups: dict = {}
         self._locks: Dict[str, asyncio.Lock] = {}       # 每 lot 串行化撤改平与 watcher
@@ -173,6 +207,8 @@ class OrderManager:
         self._revive_done: set = set()      # 已复活过的 lot（每 lot 只复活一次）
         self.on_lot_closed = None      # 平仓回调 fn(lot_dict)，由上层（console）注入
         self.on_lot_revived = None     # 对账复活回调 fn(lot_dict)，由上层（console）注入
+        self.on_entry_stage = None
+        self.on_fill_event = None      # Optional audit callback; never drives orders.
         # 价格提供者（console 注入 TV 现价；None 时回退 gateway.last_price）
         self.price_provider = None
         # 行情健康提供者（console 注入；回测/离线测试可为 None）
@@ -263,6 +299,7 @@ class OrderManager:
     # 下单（分批建仓：每次调用 = 一个独立 lot，LMT 父 + STP 子）
     # ------------------------------------------------------------------
 
+    @serialized_placement
     async def place_limit_stop_lot(self, symbol: str, side: str, qty: int,
                                    limit_px: float, stop_px: float,
                                    limit_type: str = "",
@@ -274,16 +311,70 @@ class OrderManager:
                                    max_position_pct: float = 0.0,
                                    atr_mult: float = 1.0,
                                    trader: str = "",
-                                   risk_ref_px: float = 0.0
+                                   risk_ref_px: float = 0.0,
+                                   entry_order_type: str = "",
+                                   manual_entry: bool = False,
+                                   submission_deadline: Optional[float] = None,
                                    ) -> Tuple[Optional[OrderLot], str]:
-        """限价单（父）+ 固定 STOP 止损（子，parentId 关联）下单一个批次。
+        """MKT/LMT 父单 + 固定 STOP 止损子单；兼容旧方法名。
 
+        entry_order_type 显式指定时不依赖手动 MARKET_ORDER_STRICT 开关。
         breakout_px > 0 时（中点单）改用 OCA 双腿：LMT 中点 + STP 突破
         入场一成全撤，止损子单挂 LMT 腿。"""
+        if getattr(self._gw, "enabled", False) and not getattr(self._gw, "_connected", False):
+            return None, "实盘券商未连接，禁止新入场；不会转为虚拟成交"
+        if self.recovery_status()["blocks_entry"]:
+            return None, "恢复或持久化问题尚未解决，禁止新入场；请查看恢复状态"
         symbol = symbol.strip().upper()
+        breakout_id = (signal_snapshot or {}).get("opening_breakout_id")
+        if breakout_id and any(lot.signal_snapshot.get("opening_breakout_id") == breakout_id
+                               for lot in self._lots.values()):
+            return None, "该突破信号已有订单记录，请在订单批次查看"
+        if breakout_id:
+            if not entry_window(time.time()):
+                return None, "10:30起停止突破下单"
+            if sum(bool(row.signal_snapshot.get("opening_breakout_id"))
+                   and (row.state in (PENDING, ACTIVE, CLOSING) or row.entry_submission_pending)
+                   for row in self._lots.values()) >= 5:
+                return None, "突破持仓及待处理订单已达5笔上限"
+            signal_time = finite_number((signal_snapshot or {}).get("breakout_signal_bar_time"))
+            if signal_time is None:
+                return None, "突破信号时间缺失"
+            day = datetime.fromtimestamp(signal_time, ET).date()
+            for row in self._lots.values():
+                old_time = finite_number(row.signal_snapshot.get("breakout_signal_bar_time"))
+                if (row.signal_snapshot.get("opening_breakout_id") and old_time is not None
+                        and row.symbol.split(":")[-1] == symbol.split(":")[-1]
+                        and datetime.fromtimestamp(old_time, ET).date() == day):
+                    return None, "该标的本日已有突破订单记录，不重复开仓"
+        if manual_entry and any(
+            lot.symbol.split(":")[-1] == symbol.split(":")[-1]
+            and lot.state in (ACTIVE, PENDING, CLOSING)
+            and lot.filled_qty > 0
+            and (
+                lot.trader == "auto"
+                or lot.limit_type.startswith("auto_")
+                or any(lot.signal_snapshot.get(key) for key in
+                       ("strategy_id", "auto_strategy", "pyramid_seed"))
+            )
+            for lot in self._lots.values()
+        ):
+            return None, "该标的已有自动策略仓位，禁止手动加仓"
         side = side.strip().lower()
         if side not in ("long", "short"):
             return None, f"方向非法: {side}（应为 long / short）"
+        if entry_order_type not in ("", "LMT", "MKT"):
+            return None, "入场订单类型无效"
+        actual_entry_type = entry_order_type or (
+            "MKT" if config.MARKET_ORDER_STRICT and limit_type in ("market", "chase") else "LMT"
+        )
+        if breakout_px > 0 and actual_entry_type == "MKT":
+            return None, "OCA 中点入场不能指定市价父单"
+        try:
+            plan = OrderPlan(symbol, side, qty, limit_px, stop_px, risk_usd, risk_ref_px,
+                             entry_order_type=actual_entry_type)
+        except ValueError as error:
+            return None, str(error)
         if self.market_health is not None:
             try:
                 health = self.market_health()
@@ -315,7 +406,7 @@ class OrderManager:
         if ownership.get("strategy_id"):
             key += (ownership["strategy_id"], ownership.get("strategy_instance_id", "default"),
                     ownership.get("group_id"), ownership.get("entry_index"))
-        now = time.time()
+        now = placement_received_at.get() or time.time()
         last = self._recent_places.get(key)
         if last is not None and now - last < 2.0:
             logger.warning("重复下单拦截 %s %s @%.2f/%.2f", symbol, side,
@@ -325,55 +416,113 @@ class OrderManager:
 
         open_positions = len({l.symbol for l in self._lots.values()
                               if l.state in _OPEN_STATES})
+        lot_id = f"lot-{uuid.uuid4().hex[:8]}"
+        audit_meta = signal_snapshot or {}
+
+        def audit(stage, **details):
+            if actual_entry_type != "MKT" or self.on_entry_stage is None:
+                return
+            try:
+                self.on_entry_stage(
+                    stage=stage, lot_id=lot_id, symbol=symbol, side=side, qty=qty,
+                    group_id=audit_meta.get("group_id"),
+                    strategy_id=audit_meta.get("strategy_id"),
+                    strategy_instance_id=audit_meta.get("strategy_instance_id"),
+                    entry_index=audit_meta.get("entry_index"),
+                    **details,
+                )
+            except Exception:
+                logger.exception("入场审计回调失败 %s", lot_id)
+
+        audit("risk_check_started", placement_requested_at=placement_received_at.get())
         realized = await self._gw.realized_pnl()  # 熔断基准：今日已实现盈亏
         ok, why = self._risk.check_new_order(
             symbol, side, limit_px, stop_px, qty,
             open_positions=open_positions, daily_pnl=realized, risk_usd=risk_usd,
             open_risk_usd=self.risk_exposure()["total"],
             risk_ref_px=risk_ref_px)
+        audit("risk_check_finished", allowed=ok, reason=why)
         if not ok:
             logger.warning("🚫 风控拦截 %s %s: %s", symbol, side, why)
             return None, why
 
+        if breakout_id and not entry_window(time.time()):
+            return None, "10:30起停止突破下单"
+        if submission_deadline is not None and time.time() >= submission_deadline:
+            return None, "收盘开仓预约已超时，未下单"
+
         # R 风险基准锚定预期成交价（market/chase 单 = 现价；其余 = 限价），
         # 溢价只做券商成交保护不进风险/RR 口径
-        anchor_entry = float(risk_ref_px) if risk_ref_px > 0 else float(limit_px)
+        anchor_entry = plan.reference_price
         lot = OrderLot(
-            lot_id=f"lot-{uuid.uuid4().hex[:8]}",
+            lot_id=lot_id,
             symbol=symbol, side=side, qty=int(qty),
             entry_px=float(limit_px), stop_px=float(stop_px),
             init_entry_px=anchor_entry, init_stop_px=float(stop_px),
-            init_risk_usd=round(abs(anchor_entry - float(stop_px)) * int(qty), 2),
+            init_risk_usd=plan.planned_risk,
             max_position_pct=float(max_position_pct or 0.0),
             atr_mult=float(atr_mult or 1.0),
             trail_amount=0.0,
-            reason=reason or f"{limit_type} 限价单",
-            note=f"limit+stop ({limit_type})",
+            reason=reason or f"{limit_type} {actual_entry_type} 入场",
+            note=f"{actual_entry_type}+stop ({limit_type})",
             limit_type=limit_type or "",
+            entry_order_type=actual_entry_type,
             reprice_bar_time=float(reprice_bar_time or 0.0),
             signal_snapshot=signal_snapshot or {},
             trader=trader or "",
         )
+        lot.entry_submission_pending = True
+        self._lots[lot.lot_id] = lot
+        audit("intent_save_started")
+        try:
+            self._save()  # intent must be durable before the first broker side effect
+        except PersistenceError:
+            audit("intent_save_failed")
+            self._lots.pop(lot.lot_id, None)  # broker has not been called
+            raise
+        audit("intent_saved")
+        if breakout_id and (not entry_window(time.time()) or (
+                submission_deadline is not None and time.time() >= submission_deadline)):
+            # A durable local intent is not a broker submission. Record the known
+            # rejection before returning; never leave an unsent intent uncertain.
+            lot.entry_submission_pending = False
+            lot.state = CANCELLED
+            lot.updated_at = time.time()
+            self._save()
+            audit("entry_window_expired_before_gateway")
+            return None, "突破下单窗口已结束，未向券商发送"
+        references = ({"order_ref": f"autotrade:{lot.lot_id}"}
+                      if getattr(self._gw, "supports_order_refs", False) is True else {})
         if breakout_px > 0:
             lot.oca_group = f"OCA-{lot.lot_id}"
             lot.breakout_px = round(float(breakout_px), 2)
             result = await self._gw.place_midpoint_oca(
                 symbol, side, qty, limit_px, breakout_px, stop_px,
-                lot.oca_group)
+                lot.oca_group, **references)
             lot.breakout_order_id = result.get("breakout_order_id")
             lot.breakout_trade = result.get("breakout_trade")
         else:
-            if (config.MARKET_ORDER_STRICT
-                    and limit_type in ("market", "chase")):
+            if actual_entry_type == "MKT":
                 # 严格市价成交（只做实时行情标的）：MKT 父 + STP 子括号单
-                result = await self._gw.place_market_with_stop(
-                    symbol, side, qty, stop_px)
+                audit("gateway_call_started")
+                try:
+                    result = await self._gw.place_market_with_stop(
+                        symbol, side, qty, stop_px, **references)
+                except Exception:
+                    audit("gateway_call_failed")
+                    raise
+                audit(
+                    "gateway_call_finished", order_id=result.get("entry_order_id"),
+                    stop_order_id=result.get("stop_order_id"), status=result.get("status"),
+                    stop_status=result.get("stop_status"), dry_run=bool(result.get("dry_run")),
+                )
                 # MKT 无挂单价：entry 记录预期成交价（现价），成交后 avg_fill 为准
                 if risk_ref_px > 0:
                     lot.entry_px = float(risk_ref_px)
             else:
                 result = await self._gw.place_limit_with_stop(
-                    symbol, side, qty, limit_px, stop_px)
+                    symbol, side, qty, limit_px, stop_px, **references)
+        lot.entry_submission_pending = result.get("entry_order_id") is None
         lot.entry_order_id = result.get("entry_order_id")
         lot.trail_order_id = result.get("stop_order_id")  # 复用字段存 STOP 单 id
         lot.entry_trade = result.get("trade")
@@ -391,7 +540,7 @@ class OrderManager:
             # 有 orderId 就说明订单可能已到券商；即使返回失败，也必须等对账
             # 排除实际成交，不能直接制造 FAILED 孤儿。
             lot.state = PENDING if lot.entry_order_id is not None else FAILED
-            lot.note = f"限价+STOP 单失败: {result.get('error')}"
+            lot.note = f"{actual_entry_type}+STOP 单失败: {result.get('error')}"
             if lot.state == PENDING:
                 lot.note += "；订单号已分配，保留 PENDING 等对账确认实际成交"
             self._lots[lot.lot_id] = lot
@@ -408,8 +557,8 @@ class OrderManager:
             lot.entry_time = time.time()   # dry-run 成交时间
             self._set_targets(lot)
             lot.recalc_pnl()
-            logger.info("[DRY-RUN] lot %s %s %s x%d 限价 %.2f STOP %.2f 虚拟成交",
-                        lot.lot_id, symbol, side, lot.qty, limit_px, stop_px)
+            logger.info("[DRY-RUN] lot %s %s %s x%d %s 参考价 %.2f STOP %.2f 虚拟成交",
+                        lot.lot_id, symbol, side, lot.qty, actual_entry_type, lot.entry_px, stop_px)
 
         self._lots[lot.lot_id] = lot
         self._save()
@@ -424,11 +573,17 @@ class OrderManager:
         lot = self._lots.get(lot_id)
         if lot is None:
             return False, f"lot 不存在: {lot_id}"
-        async with self._lot_lock(lot):
+        async with self._operations.run(lot_id, OperationKind.EXIT, lock=self._lot_lock(lot)) as decision:
+            if not decision.allowed:
+                return False, decision.reason
+            if lot.partial_exit:
+                return False, "部分退出尚未核对完成，禁止叠加全量平仓"
             if lot.state != ACTIVE:
                 return False, f"lot 状态 {lot.state} 不可平仓（仅 ACTIVE 可平）"
             if lot.filled_qty <= 0:
                 return False, "lot 没有可平仓的实际余仓"
+            if self._gw.enabled and not self._gw._connected:
+                return False, "实盘券商未连接，平仓未提交"
 
             is_live = bool(self._gw.enabled and self._gw._connected)
             px = ref_px or lot.last_px or lot.avg_fill
@@ -495,10 +650,14 @@ class OrderManager:
                 return False, lot.note
 
             lot.close_requested_qty = lot.filled_qty
+            lot.close_submission_ref = f"autotrade:{lot.lot_id}:close:{uuid.uuid4().hex}"
+            self._save()  # persist exit quantity before broker submission
             lot.close_order_filled_qty = 0
             lot.close_order_avg_fill = 0.0
             result = await self._gw.place_close(
-                lot.symbol, lot.side, lot.close_requested_qty, px)
+                lot.symbol, lot.side, lot.close_requested_qty, px,
+                **({"order_ref": lot.close_submission_ref}
+                   if getattr(self._gw, "supports_order_refs", False) is True else {}))
             lot.close_order_id = result.get("order_id")
             lot.close_trade = result.get("trade")
             lot.close_permId = (result.get("permId")
@@ -554,7 +713,8 @@ class OrderManager:
 
     async def close_half(self, lot_id: str,
                          ref_px: Optional[float] = None,
-                         exit_reason: str = "partial") -> Tuple[bool, str]:
+                         exit_reason: str = "partial", *,
+                         quantity: Optional[int] = None) -> Tuple[bool, str]:
         """平仓一半：先收缩 STOP 保护单到剩余数量，再 marketable 平一半；lot 保持 ACTIVE。
 
         关键顺序（防裸仓）：先减保护单数量 → 再平一半。平掉后 STOP 只保护剩余余仓。
@@ -562,12 +722,20 @@ class OrderManager:
         lot = self._lots.get(lot_id)
         if lot is None:
             return False, f"lot 不存在: {lot_id}"
-        async with self._lot_lock(lot):
+        async with self._operations.run(lot_id, OperationKind.REDUCE, lock=self._lot_lock(lot)) as decision:
+            if not decision.allowed:
+                return False, decision.reason
             if lot.state != ACTIVE:
                 return False, f"lot 状态 {lot.state} 不可平仓一半（仅 ACTIVE）"
+            if lot.partial_exit:
+                return False, "已有部分退出待核对，禁止重复提交"
             if lot.filled_qty <= 1:
                 return False, "余仓 ≤1 股，无法平仓一半"
-            close_qty = lot.filled_qty // 2        # 平掉一半（向下取整）
+            if self._gw.enabled and not self._gw._connected:
+                return False, "实盘券商未连接，减仓未提交"
+            close_qty = lot.filled_qty // 2 if quantity is None else quantity
+            if not isinstance(close_qty, int) or not 0 < close_qty < lot.filled_qty:
+                return False, "减仓股数必须小于实际余仓且大于零"
             remain_qty = lot.filled_qty - close_qty
 
             is_live = bool(self._gw.enabled and self._gw._connected)
@@ -585,12 +753,21 @@ class OrderManager:
 
             # 1. 先收缩 STOP 保护单数量到剩余（防裸仓）
             trail = lot.trail_trade
+            if trail is not None and int(trail.orderStatus.filled or 0) > lot.trail_order_filled_qty:
+                self._start_exit_watch(lot)
+                return False, "保护单有未入账成交，等待余仓核对"
             if trail is None and lot.trail_order_id is not None:
                 # 缺句柄则券商侧 STOP 数量未知，平一半后会留下超额 STOP
                 # （触发即变反向仓）；与 close_lot 同款守卫
                 return False, "缺保护单句柄，无法安全收缩保护数量；请先对账恢复句柄"
+            lot.partial_exit = {"qty": close_qty, "ref": f"autotrade:{lot.lot_id}:partial:{uuid.uuid4().hex}"}
+            lot.close_order_id = None
+            lot.close_trade = None
+            self._save()  # persist before shrinking protection or submitting the reduction
             if trail is not None and not trail.isDone():
                 if not await self._gw.modify_stop_qty(trail, remain_qty):
+                    lot.partial_exit = {}
+                    self._save()
                     return False, "收缩止损单数量失败，中止平仓一半"
 
             if px <= 0:
@@ -598,10 +775,14 @@ class OrderManager:
             if px <= 0:
                 if trail is not None and not trail.isDone():
                     await self._gw.modify_stop_qty(trail, lot.filled_qty)
+                lot.partial_exit = {}
+                self._save()
                 return False, "无法确定平仓参考价"
 
             # 2. 平一半（marketable LIMIT，place_close 内部 2.5s 核对）
-            result = await self._gw.place_close(lot.symbol, lot.side, close_qty, px)
+            result = await self._gw.place_close(lot.symbol, lot.side, close_qty, px,
+                **({"order_ref": lot.partial_exit["ref"]}
+                   if getattr(self._gw, "supports_order_refs", False) is True else {}))
             lot.close_order_id = result.get("order_id")
             lot.close_trade = result.get("trade")
             lot.close_permId = (result.get("permId")
@@ -610,9 +791,11 @@ class OrderManager:
                                  self._trade_order_id(lot.close_trade),
                                  self._trade_perm_id(lot.close_trade))
             if not result.get("ok"):
-                if trail is not None and not trail.isDone():
-                    await self._gw.modify_stop_qty(trail, lot.filled_qty)
-                return False, result.get("error") or "平仓一半失败"
+                lot.note = "部分退出返回失败，受理或成交结果待核对，禁止重发"
+                self._save()
+                if lot.close_trade is not None:
+                    self._start_partial_watch(lot, close_qty)
+                return False, result.get("error") or lot.note
 
             # 3. 统一交 partial watcher 记账（按实际成交回报，避免重复记账）
             lot.note = f"平仓一半已提交：平 {close_qty}，余 {remain_qty}"
@@ -621,28 +804,36 @@ class OrderManager:
             self._start_partial_watch(lot, close_qty)
             return True, ""
 
+    async def _handle_partial_terminal(self, lot, close_qty):
+        trade = lot.close_trade
+        if trade is None or not trade.isDone():
+            return False
+        event = FillEvent.from_trade(lot.lot_id, "partial", trade, time.time())
+        if event.cumulative_qty > 0 and event.average_price <= 0:
+            lot.note = "部分退出数量已返回但均价未知，等待真实成交回报，禁止重发"
+            self._save()
+            return False
+        actual = min(event.cumulative_qty, close_qty)
+        if actual > 0:
+            self._apply_partial_fill(lot, actual, event.average_price, "partial")
+            self._emit_fill(lot, event, actual)
+        lot.partial_exit = {}
+        lot.note = f"部分退出已核对：平 {actual}，余 {lot.filled_qty}"
+        # Commit accounting before an awaited repair; a crash cannot book the reduction twice.
+        lot.protection_restore_needed = True
+        self._save()
+        # A cancelled or underfilled reduction leaves more shares than the shrunk stop.
+        await self._restore_protection(lot)
+        lot.updated_at = time.time()
+        self._save()
+        return True
+
     async def _watch_partial(self, lot: "OrderLot", close_qty: int) -> None:
-        """监控平一半单成交：按实际成交记账（partial），lot 保持 ACTIVE。"""
         while True:
             async with self._lot_lock(lot):
-                trade = lot.close_trade
-                if trade is None:
+                if not lot.partial_exit or lot.close_trade is None:
                     return
-                if trade.isDone():
-                    filled = int(trade.orderStatus.filled or 0)
-                    status = trade.orderStatus.status
-                    if filled > 0:
-                        avg = float(trade.orderStatus.avgFillPrice or 0.0)
-                        if avg <= 0:
-                            avg = lot.last_px or lot.avg_fill
-                        actual = min(filled, close_qty)
-                        self._apply_partial_fill(lot, actual, avg, "partial")
-                        lot.note = (f"平仓一半成交：平 {actual}，余 {lot.filled_qty}"
-                                    f"（{status}）")
-                    else:
-                        lot.note = f"平一半单终态 {status} 无成交，保护单已收缩，可重试"
-                    lot.updated_at = time.time()
-                    self._save()
+                if await self._handle_partial_terminal(lot, close_qty):
                     return
             await asyncio.sleep(_WATCH_POLL_SECONDS)
 
@@ -691,8 +882,8 @@ class OrderManager:
             if ownership_changed:
                 self._remember_order(lot, order_id, perm_id)
         try:
-            filled = int(trade.orderStatus.filled or 0)
-            avg = float(trade.orderStatus.avgFillPrice or 0.0)
+            event = FillEvent.from_trade(lot.lot_id, source, trade, time.time())
+            filled, avg = event.cumulative_qty, event.average_price
         except (AttributeError, TypeError, ValueError):
             return ownership_changed
         if source == "close":
@@ -705,7 +896,8 @@ class OrderManager:
             logger.warning("lot %s %s 成交数量回退 %d -> %d，忽略异常快照",
                            lot.lot_id, source, previous, filled)
             return ownership_changed
-        delta = filled - previous
+        increment = event.delta_from(previous, previous_avg)
+        delta = increment.quantity
         if delta == 0 and (avg <= 0 or abs(avg - previous_avg) < 0.000001):
             return ownership_changed
 
@@ -715,7 +907,7 @@ class OrderManager:
         if avg > 0 and not (old_closed > 0 and lot.close_avg_fill <= 0):
             # orderStatus.avgFillPrice 是当前订单全部成交的均价；减去该订单
             # 上次已入账金额，避免部分成交轮询重复或错误加权。
-            amount = old_amount + avg * filled - previous_avg * previous
+            amount = old_amount + increment.amount
             lot.close_avg_fill = (round(amount / new_closed, 4)
                                   if new_closed > 0 else 0.0)
         elif delta > 0:
@@ -731,12 +923,31 @@ class OrderManager:
             lot.trail_order_filled_qty = filled
             lot.trail_order_avg_fill = avg
         lot.updated_at = time.time()
+        self._emit_fill(lot, event, delta)
         self._recompute_realized(lot)
         if delta > 0:
             logger.info("lot %s %s 实际平仓成交 +%d，累计 %d，余仓 %d @%s",
                         lot.lot_id, source, delta, lot.close_filled_qty,
                         lot.filled_qty, lot.close_avg_fill or "价格未知")
         return True
+
+    def _emit_fill(self, lot: OrderLot, event: FillEvent, delta: int) -> None:
+        lot.last_fill_received_at = event.received_at
+        lot.last_fill_broker_time = event.broker_time or 0
+        if self.on_fill_event is not None:
+            try:
+                self.on_fill_event({
+                    "lot_id": lot.lot_id, "symbol": lot.symbol,
+                    "source": event.source, "order_id": event.order_id,
+                    "quantity_delta": delta, "cumulative_qty": event.cumulative_qty,
+                    "average_price": event.average_price,
+                    "received_at": event.received_at, "broker_time": event.broker_time,
+                    "strategy_id": lot.signal_snapshot.get("strategy_id"),
+                    "strategy_instance_id": lot.signal_snapshot.get("strategy_instance_id"),
+                    "group_id": lot.signal_snapshot.get("group_id"),
+                })
+            except Exception:
+                logger.exception("成交审计回调失败 %s", lot.lot_id)
 
     async def _actual_exit_px(self, lot: OrderLot) -> float:
         if lot.close_avg_fill > 0:
@@ -905,25 +1116,32 @@ class OrderManager:
         if trade is None:
             return False
         try:
-            filled = int(trade.orderStatus.filled or 0)
-            avg = float(trade.orderStatus.avgFillPrice or 0.0)
+            event = FillEvent.from_trade(lot.lot_id, "entry", trade, time.time())
+            filled, avg = event.cumulative_qty, event.average_price
         except (AttributeError, TypeError, ValueError):
             return False
-        if filled < lot.filled_qty:
+        previous = max(lot.entry_cumulative_qty, lot.filled_qty + lot.close_filled_qty)
+        if filled < previous:
             logger.warning("lot %s 入场成交数量回退 %d -> %d，忽略异常快照",
-                           lot.lot_id, lot.filled_qty, filled)
+                           lot.lot_id, previous, filled)
             return False
-        changed = filled != lot.filled_qty
+        increment = event.delta_from(previous, lot.entry_cumulative_avg or lot.avg_fill)
+        changed = filled != lot.entry_cumulative_qty
         if avg > 0 and abs(avg - lot.avg_fill) >= 0.000001:
             changed = True
         if not changed:
             return False
-        lot.filled_qty = filled
+        lot.filled_qty += increment.quantity
+        lot.entry_cumulative_qty = filled
+        lot.entry_cumulative_avg = avg
         if avg > 0:
             lot.avg_fill = avg
             lot.last_px = avg
         if filled > 0 and lot.entry_time <= 0:
             lot.entry_time = time.time()
+        if event.broker_time is not None and not lot.entry_broker_time:
+            lot.entry_broker_time = event.broker_time
+        self._emit_fill(lot, event, increment.quantity)
         lot.updated_at = time.time()
         return True
 
@@ -983,7 +1201,8 @@ class OrderManager:
                 except (TypeError, ValueError):
                     atr = 0.0
                 fill = lot.avg_fill or lot.entry_px
-                if atr > 0 and fill > 0:
+                if (lot.signal_snapshot.get("stop_source") != "opening_bar_extreme"
+                        and atr > 0 and fill > 0):
                     new_stop = round(fill + (-1 if lot.side == "long" else 1)
                                      * atr * lot.atr_mult, 2)
                     if ((lot.side == "long" and new_stop < fill)
@@ -1161,6 +1380,8 @@ class OrderManager:
         total = int(entry_qty + brk_qty)
         if total <= 0:
             return False
+        lot.entry_cumulative_qty = total
+        lot.entry_cumulative_avg = round((entry_qty * entry_avg + brk_qty * brk_avg) / total, 4)
         if brk_qty > 0:
             lot.breakout_filled = True
             if entry_qty <= 0:
@@ -1494,11 +1715,62 @@ class OrderManager:
     # 对账（启动后 + 周期性）：重挂 watcher / 收敛本 lot 自有订单
     # ------------------------------------------------------------------
 
+    async def _recover_submission(self, lot, trades):
+        references = {}
+        if lot.entry_submission_pending:
+            prefix = f"autotrade:{lot.lot_id}"
+            references = {prefix + ":entry": "entry_order_id",
+                          prefix + ":stop": "trail_order_id",
+                          prefix + ":breakout": "breakout_order_id"}
+        elif lot.partial_exit and lot.close_order_id is None:
+            references = {lot.partial_exit["ref"]: "close_order_id"}
+        elif lot.state == CLOSING and lot.close_order_id is None and lot.close_submission_ref:
+            references = {lot.close_submission_ref: "close_order_id"}
+        if not references:
+            return
+        matches = {reference: set() for reference in references}
+        ticker = lot.symbol.split(":")[-1].upper()
+        for trade in trades.values():
+            reference = getattr(trade.order, "orderRef", "")
+            symbol = getattr(getattr(trade, "contract", None), "symbol", "").upper()
+            if reference in matches and symbol == ticker:
+                matches[reference].add(self._trade_order_id(trade))
+        if getattr(self._gw, "supports_order_refs", False) is True:
+            fills = await self._gw.submission_order_ids(lot.symbol, list(references))
+            if fills is None:
+                return
+            for reference, ids in fills.items():
+                matches[reference].update(ids)
+        if any(len(ids) > 1 for ids in matches.values()):
+            lot.note = "同一操作引用匹配多个订单，保持暂停，需人工核查"
+            return
+        for reference, ids in matches.items():
+            if ids:
+                setattr(lot, references[reference], next(iter(ids)))
+        if lot.entry_submission_pending and lot.entry_order_id is not None:
+            lot.entry_submission_pending = False
+            lot.state = PENDING
+            lot.note = "按持久化操作引用认回入场单，继续核对成交与保护"
+        self._remember_order(lot, lot.entry_order_id, lot.trail_order_id,
+                             lot.breakout_order_id, lot.close_order_id)
+        self._save()
+
     async def reconcile(self) -> None:
+        async with self._reconcile_lock:
+            try:
+                await self._reconcile_once()
+            except BaseException as error:
+                self._reconcile_phase = "unavailable"
+                self._reconcile_error = str(error) or type(error).__name__
+                raise
+
+    async def _reconcile_once(self) -> None:
         """按本 lot 自有订单对账；快照未知或无法归因时只保留并告警。"""
         if not (self._gw.enabled and self._gw._connected):
             return
-        open_lots = [l for l in self._lots.values() if l.state in _OPEN_STATES]
+        self._reconcile_phase = "checking"
+        self._reconcile_issues = []
+        open_lots = [l for l in self._lots.values() if l.state in _OPEN_STATES or l.entry_submission_pending]
         # 复活候选：已终结但本地零成交的 lot（OCA 竞态漏报的受害者）
         revive_candidates = [
             l for l in self._lots.values()
@@ -1507,14 +1779,21 @@ class OrderManager:
             and l.entry_order_id is not None
             and l.lot_id not in self._revive_done]
         if not open_lots and not revive_candidates:
+            self._reconcile_phase = "checked"
+            self._reconcile_error = ""
+            self._reconciled_at = time.time()
             return
         try:
             trades = await self._gw.trade_map()
             broker_pos = await self._gw.positions()
         except Exception as exc:
+            self._reconcile_phase = "unavailable"
+            self._reconcile_error = str(exc)
             logger.warning("对账快照查询异常，禁止本轮撤改平: %s", exc)
             return
         if trades is None or broker_pos is None:
+            self._reconcile_phase = "unavailable"
+            self._reconcile_error = "券商订单或持仓快照不可用，等待重新对账"
             logger.warning("对账快照不可用（trade_map=%s positions=%s），"
                            "禁止本轮任何撤改平", type(trades).__name__,
                            type(broker_pos).__name__)
@@ -1547,12 +1826,23 @@ class OrderManager:
 
         for lot in open_lots:
             async with self._lot_lock(lot):
+                await self._recover_submission(lot, trades)
+                if lot.entry_submission_pending:
+                    continue  # no broker identity means unknown, never infer CANCELLED
                 if lot.state not in _OPEN_STATES:
                     continue
                 try:
                     ticker = lot.symbol.split(":")[-1].upper()
                     held = broker_pos.get(ticker, 0)
                     await self._dedupe_protective_orders(lot, trades)
+                    if lot.partial_exit:
+                        lot.close_trade = trades.get(lot.close_order_id)
+                        if lot.close_trade is not None:
+                            if not await self._handle_partial_terminal(lot, lot.partial_exit["qty"]):
+                                self._start_partial_watch(lot, lot.partial_exit["qty"])
+                        else:
+                            lot.note = "部分退出订单不可见，保持意图等待成交核查，禁止重发"
+                        continue
                     if lot.state == PENDING:
                         trade = trades.get(lot.entry_order_id)
                         if trade is None:
@@ -1663,9 +1953,23 @@ class OrderManager:
                                    "但净持仓不能归因到单 lot，保持 ACTIVE，不撤单、"
                                    "不推断数量、不补登 external_close",
                                    lot.lot_id, held)
-                except Exception:
+                except Exception as error:
+                    self._reconcile_issues.append({"kind": "reconcile", "lot_id": lot.lot_id, "symbol": lot.symbol, "reason": str(error)})
                     logger.exception("对账处理 lot %s 失败，保留原状态待下轮", lot.lot_id)
         self._save()
+        local = {}
+        for item in self._lots.values():
+            if item.state in _OPEN_STATES:
+                ticker = item.symbol.split(":")[-1].upper()
+                local[ticker] = local.get(ticker, 0) + item.filled_qty * (1 if item.side == "long" else -1)
+        self._position_differences = [
+            {"symbol": ticker, "local_qty": local.get(ticker, 0), "broker_qty": broker_pos.get(ticker, 0)}
+            for ticker in sorted(set(local) | set(broker_pos))
+            if local.get(ticker, 0) != broker_pos.get(ticker, 0)]
+        self._needs_initial_reconcile = False
+        self._reconcile_error = ""
+        self._reconciled_at = time.time()
+        self._reconcile_phase = "checked"
 
     # ------------------------------------------------------------------
     # 查询与聚合
@@ -1788,7 +2092,9 @@ class OrderManager:
         lot = self._lots.get(lot_id)
         if lot is None:
             return False, f"lot 不存在: {lot_id}"
-        async with self._lot_lock(lot):
+        async with self._operations.run(lot_id, OperationKind.REPRICE, lock=self._lot_lock(lot)) as decision:
+            if not decision.allowed:
+                return False, decision.reason
             if lot.limit_type != "midpoint":
                 return False, "仅中点限价单支持逐 bar 改价"
             if lot.state != PENDING:
@@ -1850,7 +2156,9 @@ class OrderManager:
         lot = self._lots.get(lot_id)
         if lot is None:
             return False, f"lot 不存在: {lot_id}"
-        async with self._lot_lock(lot):
+        async with self._operations.run(lot_id, OperationKind.REPRICE, lock=self._lot_lock(lot)) as decision:
+            if not decision.allowed:
+                return False, decision.reason
             if lot.limit_type != "retest":
                 return False, "仅回踩限价单支持逐 bar 改价"
             if lot.state != PENDING:
@@ -1912,7 +2220,9 @@ class OrderManager:
         lot = self._lots.get(lot_id)
         if lot is None:
             return False, f"lot 不存在: {lot_id}"
-        async with self._lot_lock(lot):
+        async with self._operations.run(lot_id, OperationKind.REPRICE, lock=self._lot_lock(lot)) as decision:
+            if not decision.allowed:
+                return False, decision.reason
             if lot.limit_type != "midpoint":
                 return False, "仅中点限价单支持突破升级"
             if lot.state != PENDING:
@@ -1937,14 +2247,15 @@ class OrderManager:
         """不加锁的止损修改核心；调用方必须已持有对应 lot 锁。"""
         if lot.state not in (PENDING, ACTIVE):
             return False, f"lot 已非活跃状态 ({lot.state})"
-        if new_stop <= 0:
-            return False, "触发价必须为正"
         now = time.time()
         if lot.trail_modify_blocked_until > now:
             remain = round(lot.trail_modify_blocked_until - now)
             return False, f"IBKR 止损修改冷却中，剩余 {remain}s，请检查 TWS 连接"
         cur = lot.stop_px
-        new = max(cur, new_stop) if lot.side == "long" else min(cur, new_stop)
+        try:
+            new = StopAmendment(lot.side, cur, new_stop).tightened_price()
+        except ValueError as error:
+            return False, str(error)
         if abs(new - cur) < 0.01:
             return False, f"触发价未变（{cur}）"
         ok = await self._gw.modify_stop(lot, round(new, 2))
@@ -1973,15 +2284,129 @@ class OrderManager:
         lot = self._lots.get(lot_id)
         if lot is None:
             return False, f"lot 不存在: {lot_id}"
-        async with self._lot_lock(lot):
+        async with self._operations.run(lot_id, OperationKind.STOP, lock=self._lot_lock(lot)) as decision:
+            if not decision.allowed:
+                return False, decision.reason
             return await self._update_trail_unlocked(lot, new_stop)
+
+    async def protect_breakout_signal_close(
+        self, lot_id: str, snapshot: dict, *, now: float,
+    ) -> dict:
+        """When the filled candle closes, tighten to the signal candle close."""
+        lot = self._lots.get(lot_id)
+        if lot is None:
+            return {"ok": False, "action": "missing", "detail": "订单不存在"}
+        result = {"ok": True, "action": "waiting"}
+        async with self._operations.run(lot_id, OperationKind.STOP, lock=self._lot_lock(lot)) as decision:
+            if not decision.allowed:
+                return {"ok": False, "action": "blocked", "detail": decision.reason}
+            if (lot.state != ACTIVE or lot.filled_qty <= 0
+                    or not lot.signal_snapshot.get("opening_breakout_id")):
+                return result
+            if lot.partial_exit:
+                return {"ok": False, "action": "blocked", "detail": "部分退出尚未核对完成"}
+            meta = lot.signal_snapshot
+            anchor = meta.get("breakout_close_protection") or {}
+            broker_times = [
+                fill.time.timestamp() for fill in (getattr(lot.entry_trade, "fills", None) or [])
+                if isinstance(getattr(fill, "time", None), datetime) and fill.time.tzinfo is not None
+            ]
+            entry = min(broker_times) if broker_times else (
+                finite_number(lot.entry_broker_time) or finite_number(lot.entry_time)
+            )
+            current = snapshot.get("bar") or {}
+            current_time = finite_number(current.get("time"))
+            price = finite_number(current.get("close"))
+            if (current_time is None or not current_time <= now < current_time + 300
+                    or price is None or price <= 0):
+                return result
+            observed = finite_number(snapshot.get("price_observed_at"))
+            if observed is not None and not 0 <= now - observed <= 15:
+                return result
+            if (meta.get("breakout_rules_version") == RULES_VERSION and entry is not None
+                    and now >= int(entry) // 300 * 300 + 900
+                    and current_time >= int(entry) // 300 * 300 + 900):
+                result.update(price=price, exit_reason="breakout_three_bar_timeout")
+            elif anchor.get("done"):
+                return {"ok": True, "action": "already"}
+            if "exit_reason" not in result:
+                if not anchor:
+                    if entry is None or entry <= 0:
+                        return result
+                    signal_time = finite_number(meta.get("breakout_signal_bar_time"))
+                    if signal_time is None:
+                        signal_time = finite_number(meta.get("stop_bar_time"))
+                    if signal_time is None or signal_time <= 0 or signal_time + 300 > entry:
+                        return result
+                    signal_close = finite_number(meta.get("breakout_signal_close"))
+                    if signal_close is None:
+                        candidates = [snapshot.get("bar_c") or {}]
+                        candidates.extend(
+                            {"time": row[0], "close": row[4]}
+                            for row in snapshot.get("opening_breakout_history", [])
+                            if isinstance(row, (list, tuple)) and len(row) >= 5
+                        )
+                        signal_bar = next((bar for bar in candidates if bar.get("time") == signal_time), {})
+                        signal_close = finite_number(signal_bar.get("close"))
+                    if signal_close is None or signal_close <= 0:
+                        return result
+                    anchor = {
+                        "signal_bar_time": signal_time, "target_stop": round(signal_close, 2),
+                        "entry_time": entry, "due_at": int(entry) // 300 * 300 + 300,
+                        "timer_rule": "entry_bar_close", "done": False,
+                        "entry_time_basis": "broker" if broker_times or lot.entry_broker_time else "received",
+                    }
+                    meta["breakout_close_protection"] = anchor
+                    try:
+                        self._save()
+                    except Exception:
+                        meta.pop("breakout_close_protection", None)
+                        raise
+                target = finite_number(anchor.get("target_stop"))
+                anchor_entry = finite_number(anchor.get("entry_time"))
+                signal_time = finite_number(anchor.get("signal_bar_time"))
+                if (target is None or target <= 0 or anchor_entry is None or anchor_entry <= 0
+                        or signal_time is None or signal_time <= 0):
+                    return {"ok": False, "action": "invalid", "detail": "信号收盘价保护锚点异常"}
+                due_at = int(anchor_entry) // 300 * 300 + 300
+                if anchor.get("due_at") != due_at or anchor.get("timer_rule") != "entry_bar_close":
+                    anchor.update(due_at=due_at, timer_rule="entry_bar_close")
+                    self._save()
+                if now < due_at or current_time < due_at:
+                    return result
+                result.update(signal_bar_time=signal_time, due_at=due_at,
+                              target_stop=target, price=price)
+                tighter = lot.stop_px >= target if lot.side == "long" else lot.stop_px <= target
+                if tighter:
+                    anchor.update(done=True, action="stop_kept", applied_at=now)
+                    self._save()
+                    return {**result, "action": "stop_kept", "new_stop": lot.stop_px}
+                crossed = price <= target if lot.side == "long" else price >= target
+                if crossed:
+                    anchor.update(action="close_requested", requested_at=now)
+                    self._save()
+                else:
+                    ok, detail = await self._update_trail_unlocked(lot, target)
+                    if ok:
+                        anchor.update(done=True, action="stop_updated", applied_at=now)
+                        self._save()
+                    return {**result, "ok": ok, "action": "stop_updated" if ok else "failed",
+                            "new_stop": lot.stop_px, "detail": detail}
+        # Exit has terminal priority and rechecks actual remaining quantity.
+        ok, detail = await self.close_lot(
+            lot_id, ref_px=result["price"], exit_reason=result.get("exit_reason", "breakout_signal_close_stop"),
+        )
+        return {**result, "ok": ok, "action": "close_submitted" if ok else "failed",
+                "detail": detail}
 
     async def breakeven(self, lot_id: str) -> Tuple[bool, str]:
         """保本：优先认回并修改原括号子单；确认缺失后才恢复独立 STOP。"""
         lot = self._lots.get(lot_id)
         if lot is None:
             return False, f"lot 不存在: {lot_id}"
-        async with self._lot_lock(lot):
+        async with self._operations.run(lot_id, OperationKind.STOP, lock=self._lot_lock(lot)) as decision:
+            if not decision.allowed:
+                return False, decision.reason
             if lot.state != ACTIVE:
                 return False, f"lot 状态 {lot.state} 不可保本（仅 ACTIVE）"
             if lot.filled_qty <= 0:
@@ -2054,7 +2479,11 @@ class OrderManager:
         lot = self._lots.get(lot_id)
         if lot is None:
             return False, f"lot 不存在: {lot_id}"
-        async with self._lot_lock(lot):
+        async with self._operations.run(lot_id, OperationKind.CANCEL, lock=self._lot_lock(lot)) as decision:
+            if not decision.allowed:
+                return False, decision.reason
+            if self._gw.enabled and not self._gw._connected:
+                return False, "实盘券商未连接，撤单未提交"
             if lot.state not in (PENDING, ACTIVE):
                 return False, f"lot 状态 {lot.state} 不可撤单"
 
@@ -2152,47 +2581,78 @@ class OrderManager:
     # ------------------------------------------------------------------
 
     def _archive(self, lot: "OrderLot") -> None:
-        """平仓后追加到当日历史归档（append，永不覆盖）。"""
-        try:
-            self._state_path.parent.mkdir(parents=True, exist_ok=True)
-            day = time.strftime("%Y%m%d")
-            path = self._state_path.parent / f"trades-{day}.json"
-            records = []
-            if path.exists():
-                try:
-                    records = json.loads(path.read_text(encoding="utf-8"))
-                except Exception:
-                    records = []
-            records.append(lot.to_dict())
-            path.write_text(json.dumps(records, ensure_ascii=False, indent=2),
-                            encoding="utf-8")
-        except Exception as e:
-            logger.warning("归档平仓记录失败: %s", e)
+        # The finalized lot and its history row commit together; repeated calls upsert.
+        self._save(archive=(time.strftime("%Y%m%d"), lot.to_dict()))
 
-    def _save(self) -> None:
+    def _save(self, *, archive=None) -> None:
+        if self._needs_storage_recovery:
+            raise PersistenceError("未完成的本地事务尚未恢复，必须先取得写锁并重新加载")
+        if archive:
+            day, row = archive
+            self._pending_archives[(row["lot_id"], row.get("closed_at", 0))] = archive
         try:
-            self._state_path.parent.mkdir(parents=True, exist_ok=True)
-            payload = {"lots": [l.to_dict() for l in self._lots.values()],
-                       "pyramid_groups": self._pyramid_groups,
-                       "saved_at": time.time()}
-            temporary = self._state_path.with_suffix(self._state_path.suffix + ".tmp")
-            temporary.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2),
-                encoding="utf-8")
-            temporary.replace(self._state_path)
-        except OSError:
-            logger.exception("lot 状态落盘失败")
+            self._store.save({"lots": [lot.to_dict() for lot in self._lots.values()],
+                              "pyramid_groups": self._pyramid_groups}, archives=self._pending_archives.values())
+            self._pending_archives.clear()
+            self._storage_error = ""
+        except Exception as error:
+            self._storage_error = str(error)
+            logger.exception("执行状态持久化失败，禁止新入场")
+            raise PersistenceError(self._storage_error) from error
 
-    def _load(self) -> None:
-        if not self._state_path.exists():
-            return
+    def _load(self, *, allow_recovery=False) -> None:
         try:
-            payload = json.loads(self._state_path.read_text(encoding="utf-8"))
-            self._pyramid_groups = payload.get("pyramid_groups") or {}
-            for d in payload.get("lots", []):
-                lot = OrderLot.from_dict(d)
-                self._lots[lot.lot_id] = lot
-            logger.info("已恢复 %d 个 lot 批次（%s）", len(self._lots),
-                        self._state_path.name)
-        except (OSError, ValueError, TypeError) as e:
-            logger.warning("lot 状态加载失败: %s", e)
+            payload = self._store.load(allow_recovery=allow_recovery)
+            lots = {}
+            for row in payload["lots"]:
+                lot = OrderLot.from_dict(row)
+                if lot.state not in _OPEN_STATES | {CLOSED, CANCELLED, FAILED}:
+                    raise ValueError(f"未知订单状态 {lot.state}")
+                if lot.side not in ("long", "short") or not lot.symbol:
+                    raise ValueError("订单方向或标的无效")
+                for name in ("qty", "filled_qty", "close_filled_qty", "entry_cumulative_qty"):
+                    value = getattr(lot, name)
+                    if type(value) is not int or value < 0:
+                        raise ValueError(f"订单数量无效 {name}")
+                lots[lot.lot_id] = lot
+            self._needs_initial_reconcile = bool(getattr(self._gw, "enabled", False) and any(
+                lot.state in _OPEN_STATES or lot.entry_submission_pending for lot in lots.values()))
+            self._lots = lots  # assign only after the entire snapshot is validated
+            self._pyramid_groups = payload.get("pyramid_groups", {})
+            self._needs_storage_recovery = False
+        except RecoveryRequired:
+            self._needs_storage_recovery = True
+            self._needs_initial_reconcile = True
+        except Exception as error:
+            raise PersistenceError(f"执行账本无法恢复，禁止以空账本启动：{error}") from error
+
+    def recovery_status(self) -> dict:
+        issues = list(self._reconcile_issues)
+        if self._needs_storage_recovery:
+            issues.append({"kind": "storage", "reason": "未完成事务待写锁恢复，当前账本尚未加载"})
+        if self._needs_initial_reconcile:
+            issues.append({"kind": "reconcile", "reason": "重启后尚未完成券商对账，暂停新入场"})
+        if self._reconcile_error:
+            issues.append({"kind": "reconcile", "reason": self._reconcile_error})
+        if self._storage_error:
+            issues.append({"kind": "storage", "reason": self._storage_error})
+        for lot in self._lots.values():
+            reason = ""
+            if lot.entry_submission_pending:
+                reason = "入场受理结果不明，禁止重发；需核对券商订单/成交与订单引用"
+            elif lot.partial_exit:
+                reason = "部分退出尚未完成核对，禁止重复减仓或叠加全量平仓"
+            elif lot.state == CLOSING and lot.close_trade is None:
+                reason = "退出尚未完成，等待核对自有订单与成交，禁止重复平仓"
+            elif lot.state == ACTIVE and (lot.protection_restore_needed or (
+                    getattr(self._gw, "enabled", False) and (lot.trail_trade is None or lot.trail_trade.isDone()))):
+                reason = "保护止损单尚未确认，等待对账恢复或人工核查"
+            if reason:
+                issues.append({"kind": "order", "lot_id": lot.lot_id,
+                               "symbol": lot.symbol, "state": lot.state, "reason": reason})
+        return {"storage": "sqlite" if self._store.revision else "legacy_or_new",
+                "schema_version": self._store.SCHEMA, "revision": self._store.revision,
+                "phase": self._reconcile_phase, "checked_at": self._reconciled_at,
+                "error": self._reconcile_error, "export_error": self._store.export_error,
+                "blocks_entry": bool(issues), "issues": issues,
+                "position_differences": self._position_differences}

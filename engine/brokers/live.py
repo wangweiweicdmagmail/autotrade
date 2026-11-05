@@ -1,10 +1,11 @@
 """OrderManager 的执行适配；风险和成交事实仍由执行层处理。"""
 
 from typing import Optional
+from domain.contracts import OrderPlan
 
 
 class LiveBroker:
-    """实盘网关：包装 OrderManager（LMT 父 + STP 子，dry-run 虚拟成交）。"""
+    """实盘适配：显式选择 MKT/LMT 入场，始终保留 STP 保护子单。"""
 
     def __init__(self, order_mgr) -> None:
         self._om = order_mgr
@@ -29,15 +30,20 @@ class LiveBroker:
         reason: str = "",
         meta: Optional[dict] = None,
     ):
+        plan = OrderPlan(symbol, side, qty, limit_px, stop_px, (meta or {}).get("risk_budget", 0),
+                         (meta or {}).get("risk_reference_price", 0),
+                         entry_order_type=(meta or {}).get("entry_order_type", "LMT"))
         lot, err = await self._om.place_limit_stop_lot(
-            symbol=symbol,
-            side=side,
-            qty=qty,
-            limit_px=limit_px,
-            stop_px=stop_px,
+            symbol=plan.symbol,
+            side=plan.side,
+            qty=plan.qty,
+            limit_px=plan.entry_price,
+            stop_px=plan.stop_price,
             limit_type=limit_type,
             reason=reason,
-            risk_usd=(meta or {}).get("risk_budget", 0),
+            risk_usd=plan.risk_budget,
+            risk_ref_px=plan.reference_price,
+            entry_order_type=plan.entry_order_type,
             signal_snapshot={**(meta or {}), "auto_strategy": True},
             trader="auto",
         )  # 策略引擎下单归属标记（与人工单区分）

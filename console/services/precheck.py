@@ -33,6 +33,8 @@ class PrecheckService:
         bt = self.context.collector.latest_bar_time or 0
         age = time.time() - bt if bt else None
         fresh = age is not None and age < 600
+        data_ready = not missing and fresh
+        waiting_for_market = not data_ready and getattr(self.context.collector, "starting_up", False)
         detail = (
             f"标的 {n_syms}/{n_watch}"
             + (
@@ -55,8 +57,8 @@ class PrecheckService:
             self.context.precheck._pc_item(
                 "data_flow",
                 "数据流",
-                "ok" if n_syms >= n_watch and fresh else "bad",
-                detail,
+                "ok" if data_ready else "neutral" if waiting_for_market else "bad",
+                f"启动加载中；{detail}" if waiting_for_market else detail,
             )
         )
         n_attack = sum(
@@ -80,10 +82,10 @@ class PrecheckService:
                 self.context.precheck._pc_item(
                     "attack_zone",
                     "盘前区间注入",
-                    "ok" if n_syms and n_attack >= n_syms else "bad",
+                    "ok" if data_ready and n_attack >= n_syms else "neutral",
                     f"{n_attack}/{n_syms} 标的已注入盘前区间"
-                    if n_syms
-                    else "无快照数据（数据流先修）",
+                    if data_ready
+                    else "等待数据流就绪",
                 )
             )
         status = await self.context.accounts.get_status_cached()
@@ -208,6 +210,8 @@ class PrecheckService:
                         alerts.pop(rec.get("key"), None)
             except OSError:
                 alerts = {}
+            # TWS is checked against the current connection above.
+            alerts.pop("tws_down", None)
             crits = {k: v for k, v in alerts.items() if v[0] == "critical"}
             if crits:
                 items.append(
@@ -240,6 +244,7 @@ class PrecheckService:
             "ts": time.time(),
             "day": now.strftime("%Y-%m-%d"),
             "overall": overall,
+            "waiting_for_market": waiting_for_market,
             "items": items,
         }
 
@@ -254,6 +259,8 @@ class PrecheckService:
         if hm < 9 * 60 + 25 or day_key in done_days:
             return False
         report = await self.context.precheck.run_precheck()
+        if report.get("waiting_for_market"):
+            return False
         path = (
             self.context.precheck._PRECHECK_DIR
             / f"precheck-{day_key.replace('-', '')}.json"

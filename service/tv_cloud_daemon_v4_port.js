@@ -197,7 +197,7 @@ function attackFromPeriod(p) {
   // plot 键名 = 标题剥离非 ASCII。用户改过指标后 premarketHigh/premarketLow
   // 的标题变成中文/空标题，v4 键名规则：空标题回退 plot_N、剥非 ASCII 后
   // 空串加后缀 _2（实测：plot_1=盘前高，_2=盘前低）——三套键名都兼容。
-  // K/K_2 = 第二区间（双区间之开盘区间，暂不使用）。
+  // K/K_2 = 旧版开盘前三根 5M K 线高低点。
   const pmhRaw = p.premarketHigh != null ? p.premarketHigh : p.plot_1;
   const pmlRaw = p.premarketLow != null ? p.premarketLow : p._2;
   return {
@@ -205,6 +205,9 @@ function attackFromPeriod(p) {
     bar_color: finite(p.Bar_Color),
     pmh: finite(pmhRaw),
     pml: finite(pmlRaw),
+    opening3High: finite(p.opening3High ?? p.K),
+    opening3Low: finite(p.opening3Low ?? p.K_2),
+    opening3Distance: finite(p.Opening3_Distance),
   };
 }
 

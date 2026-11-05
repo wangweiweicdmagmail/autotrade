@@ -2,7 +2,7 @@
 
 from pydantic import BaseModel
 from pydantic import Field
-from typing import List
+from typing import List, Literal
 from typing import Optional
 
 
@@ -23,6 +23,16 @@ class LimitStopOrderRequest(BaseModel):
     force: bool = False
     twap_batches: int = 0
     twap_interval_s: int = 60
+
+
+class OpeningBreakoutOrderRequest(BaseModel):
+    signal_id: str = Field(..., min_length=1, max_length=160)
+    max_position_pct: float = Field(0, ge=0, le=200)
+
+
+class OpeningBreakoutPrepareRequest(OpeningBreakoutOrderRequest):
+    side: Literal["long", "short"]
+    cancel: bool = False
 
 
 class ClientRegisterRequest(BaseModel):
@@ -78,6 +88,7 @@ class SettingsRequest(BaseModel):
     screen_premarket_filter: Optional[bool] = Field(
         None, description="选股盘前区间过滤开关"
     )
+    screen_opening_range_filter: Optional[bool] = Field(None, description="选股小区间过滤开关")
     fvg_premarket_filter: Optional[bool] = Field(
         None, description="FVG 监控盘前区间过滤开关"
     )
@@ -100,6 +111,7 @@ class TvShowRequest(BaseModel):
 
 
 class AutoStartRequest(BaseModel):
+    confirmed_directions: dict[str, int] = Field(default_factory=dict)
     instance_id: str = "default"
     strategy: str = "ema9_pyramid"
     symbols: List[str] = Field(
@@ -118,6 +130,12 @@ class AutoAdoptRequest(BaseModel):
     initial_risk_usd: float = 0
 
 
+class AutoInstanceBreakevenRequest(BaseModel):
+    group_id: str = Field(..., min_length=1, max_length=128)
+    qty: int = Field(..., gt=0, strict=True)
+    avg_cost: float = Field(..., gt=0, allow_inf_nan=False)
+
+
 class AutoRejectRequest(BaseModel):
     reason: str = ""
 
@@ -128,6 +146,13 @@ class BtLoadRequest(BaseModel):
     strategy: str = "ema9_pyramid"
     params: dict = Field(default_factory=dict)
     bars: int = 500
+
+
+class BtRunRequest(BtLoadRequest):
+    """A complete, request-local execution backtest with a manual start time."""
+
+    start_time: str = Field(default="09:45", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    bars: int = Field(default=500, ge=1, le=5000)
 
 
 class ReportSourceAddRequest(BaseModel):

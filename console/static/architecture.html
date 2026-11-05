@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>系统架构 · autotrade</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/static/architecture.css">
+  <script src="/static/architecture.js" defer></script>
+</head>
+<body>
+  <header class="page-header">
+    <div><a href="/" class="back-link">← 交易控制台</a><h1>系统架构</h1><p>Pine 驱动的量化交易执行系统</p></div>
+    <span class="read-only">架构与开发文档</span>
+  </header>
+  <main>
+    <nav class="doc-nav" aria-label="架构文档">
+      <button type="button" data-doc="overview" aria-pressed="true">架构总览</button>
+      <button type="button" data-doc="terminology" aria-pressed="false">模块与术语</button>
+      <button type="button" data-doc="pine-contract" aria-pressed="false">策略输出规范</button>
+      <button type="button" data-doc="architecture" aria-pressed="false">架构说明</button>
+      <button type="button" data-doc="opening-breakout" aria-pressed="false">突破规则</button>
+      <button type="button" data-doc="night-test" aria-pressed="false">夜盘模拟说明</button>
+      <button type="button" data-doc="pine-prompt" aria-pressed="false">指标开发模板</button>
+    </nav>
+    <section id="overview" aria-label="系统架构总览">
+      <div class="concepts">
+        <article><h2>策略模型</h2><p>Pine 决定方向、入场条件、入场参考价和策略止损。首个模型为 EMA9-ST-ATR。</p></article>
+        <article><h2>执行模型</h2><p>Python 定义公共执行规则，由交易执行引擎管理风险定量、订单、成交、保护、退出和恢复。</p></article>
+      </div>
+      <div class="diagram-toolbar">
+        <label for="zoom">缩放 <output id="zoom-value" for="zoom">适应宽度</output></label>
+        <input id="zoom" type="range" min="50" max="200" step="10" value="100">
+        <button id="fit" type="button">适应宽度</button>
+        <a href="/system-docs/architecture.svg" target="_blank" rel="noopener">查看原图 ↗</a>
+        <a href="/system-docs/architecture.png?download=true" download>下载 PNG</a>
+        <a href="/system-docs/architecture.svg?download=true" download>下载 SVG</a>
+      </div>
+      <p class="reading-tip">沿中间从上往下阅读实盘主链路；两侧是注册、配置、回测、风控与运行保障。实时快照用于入场，确认快照用于反向退出和止损管理。</p>
+      <div class="diagram-viewport" tabindex="0" role="region" aria-label="可滚动的系统架构图">
+        <img id="architecture-image" src="/system-docs/architecture.svg" alt="系统架构图：Pine 策略模型通过输出契约、行情与信号接入层和执行编排服务进入交易执行引擎，经实盘适配器、订单管理、券商连接网关到达 IBKR；两侧展示配置、回测、风控、恢复及控制台。">
+      </div>
+      <p id="image-error" class="error" role="alert" hidden>架构图加载失败，请刷新页面重试。也可使用上方链接查看或下载图片。</p>
+      <p class="footnote">图中按逻辑职责划分模块，部分职责跨文件协作。历史 OHLC 回测无法还原真实根内成交顺序。</p>
+    </section>
+    <section id="document" aria-label="项目文档正文" hidden>
+      <div class="document-toolbar"><a id="source-link" target="_blank" rel="noopener">查看文档原文 ↗</a><button id="retry" type="button" hidden>重新加载</button></div>
+      <div id="doc-status" role="status" aria-live="polite"></div>
+      <article id="doc-content"></article>
+    </section>
+  </main>
+</body>
+</html>

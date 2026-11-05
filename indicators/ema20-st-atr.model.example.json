@@ -1,0 +1,23 @@
+{
+  "id": "ema20_pullback",
+  "name": "EMA20-ST-ATR",
+  "indicator_id": null,
+  "realtime_key": "e20",
+  "confirmed_key": "e20_c",
+  "plots": {
+    "entry_signal": "Entry_Signal",
+    "direction": "Direction",
+    "entry_price": "Entry_Price",
+    "long_stop": "Long_Stop",
+    "short_stop": "Short_Stop",
+    "atr": "ATR"
+  },
+  "fields": {
+    "entry_signal": "entry_signal",
+    "direction": "direction",
+    "entry_price": "entry_price",
+    "long_stop": "long_stop",
+    "short_stop": "short_stop"
+  },
+  "execution_profile": "single_entry"
+}

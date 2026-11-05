@@ -238,8 +238,11 @@ def test_api_reports_why_recovered_group_cannot_resume(console_app, monkeypatch)
     monkeypatch.setattr(app, 'auto_engine', engine)
     monkeypatch.setattr(app.automatic, '_auto_enabled', False)
     monkeypatch.setattr(app.automatic, '_auto_strategy_name', '')
-    monkeypatch.setattr(app.collector, 'latest', lambda: {SYM: {'e9': _e9(100, 1, 1)}})
-    result = run(app.automatic.api_auto_start(schemas.AutoStartRequest(symbols=[SYM]), trader='master'))
+    monkeypatch.setattr(app.collector, 'latest', lambda: {
+        SYM: {'e9': _e9(100, 1, 1)}, 'NASDAQ:QQQ': {'e9': {'direction': 1}},
+    })
+    req = schemas.AutoStartRequest(symbols=[SYM], confirmed_directions={SYM: 1, 'NASDAQ:QQQ': 1})
+    result = run(app.automatic.api_auto_start(req, trader='master'))
     assert result['started'] == []
     assert result['skipped_reasons'] == {SYM: '首仓风险基准缺失'}
 

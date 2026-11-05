@@ -17,6 +17,7 @@ import selectors
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -36,6 +37,7 @@ INDICATORS = {
     "fvg_finder": "USER;5ec7d04179b3429ca9286db452352d85",
     "smart_stop": "USER;ca26e3ab587841e2adb38cfbfd0bec41",
     "ema9_autotrade": "USER;a17a52ae5b6642e0a3ddbba23edc9ff3",
+    "ema7_autotrade_v2": "USER;c6caeb4e10144cd98f2ea19b9300eba9",
     "attack_zone": "USER;8ab4f534e5874b47b24a5ce5c49acace",
 }
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -185,17 +187,23 @@ async def capture_official_texts(required):
 
 
 def atomic_write(payload):
-    tmp = OUT_PATH.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, OUT_PATH)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=OUT_PATH.parent,
+                                     delete=False) as file:
+        tmp = Path(file.name)
+        try:
+            json.dump(payload, file, ensure_ascii=False)
+            file.close()
+            os.replace(tmp, OUT_PATH)
+        finally:
+            tmp.unlink(missing_ok=True)
 
 
-def validate_subscription():
+def validate_subscription(cache_path, required_outputs=None):
+    remaining = set(required_outputs or {})
     proc = subprocess.Popen(
         ["node", "tv_cloud_daemon.js", "--symbols", "NASDAQ:QQQ"],
         cwd=SERVICE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, bufsize=1)
+        text=True, bufsize=1, env={**os.environ, "AUTOTRADE_PINE_VALIDATION_CACHE": str(cache_path)})
     sel = selectors.DefaultSelector()
     sel.register(proc.stdout, selectors.EVENT_READ, "stdout")
     sel.register(proc.stderr, selectors.EVENT_READ, "stderr")
@@ -215,10 +223,16 @@ def validate_subscription():
                     msg = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if msg.get("type") == "indicator_startup":
+                    remaining.discard(msg.get("loaded_id"))
                 if msg.get("type") != "tick":
                     continue
                 data = (msg.get("symbols") or {}).get("NASDAQ:QQQ") or {}
                 ts_c = data.get("ts_c") or {}
+                if (required_outputs and not remaining and data.get("bar")
+                        and all(any((data.get(key) or {}).get(field) is not None for field in fields)
+                                for key, fields in required_outputs.values())):
+                    return {}
                 attack = data.get("attack_c") or {}
                 checks = {
                     "bar": bool(data.get("bar")),
@@ -228,7 +242,7 @@ def validate_subscription():
                                    or ts_c.get("smart_stop_short") is not None),
                     "attack": attack.get("pmh") is not None and attack.get("pml") is not None,
                 }
-                if all(checks.values()):
+                if not required_outputs and all(checks.values()):
                     return {"pmh": attack["pmh"], "pml": attack["pml"]}
             if proc.poll() is not None:
                 break
@@ -257,12 +271,25 @@ def verify_live():
 
 
 def main():
+    models = json.loads((SERVICE / "pine_strategies.json").read_text())["strategies"]
+    known_ids = set(INDICATORS.values()) | {model["indicator_id"] for model in models}
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--restart", action="store_true", help="验证后重启并核验实盘")
+    parser.add_argument("--indicator", action="append", choices=sorted(known_ids),
+                        help="只修复指定指标，可重复指定")
     args = parser.parse_args()
+    selected = {pid: pid for pid in args.indicator} if args.indicator else INDICATORS
+    outputs = {
+        INDICATORS["trend_state"]: ("ts_c", ("trend_state",)),
+        INDICATORS["fvg_finder"]: ("fvg_c", ("fvg_cum_count",)),
+        INDICATORS["smart_stop"]: ("ts_c", ("smart_stop_long", "smart_stop_short")),
+        INDICATORS["attack_zone"]: ("attack_c", ("time",)),
+        **{model["indicator_id"]: (model["confirmed_key"], (model["fields"]["direction"],))
+           for model in models},
+    }
     creds = load_creds()
     candidates = {}
-    for name, pine_id in INDICATORS.items():
+    for name, pine_id in selected.items():
         remote = remote_indicator(pine_id, creds)
         candidates[pine_id] = remote
         print(f"{name}: 远端 v{remote['version']}，translate 正文 {len(remote['text'])} 字节", flush=True)
@@ -271,7 +298,7 @@ def main():
         captured = asyncio.run(capture_official_texts(missing))
         for pine_id, meta in captured.items():
             candidates[pine_id] = meta
-    for name, pine_id in INDICATORS.items():
+    for name, pine_id in selected.items():
         meta = candidates[pine_id]
         if not meta["text"] or not same_version(meta["version"], remote_indicator(pine_id, creds)["version"]):
             raise RuntimeError(f"正文版本校验失败: {name}")
@@ -281,17 +308,20 @@ def main():
     updated = dict(old)
     for pine_id, meta in candidates.items():
         updated[pine_id] = {"version": meta["version"], "text": meta["text"]}
+    with tempfile.TemporaryDirectory() as tmp:
+        candidate = Path(tmp) / "pine_texts.json"
+        candidate.write_text(json.dumps(updated, ensure_ascii=False), encoding="utf-8")
+        result = validate_subscription(candidate, {pid: outputs[pid] for pid in args.indicator or ()})
+    # Another refresh may have added unrelated entries while validation was running.
+    updated = json.loads(OUT_PATH.read_text(encoding="utf-8")) if OUT_PATH.exists() else {}
+    updated.update(candidates)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     backup = ROOT / "logs" / f"pine_texts.backup-{stamp}.json"
     if OUT_PATH.exists():
         shutil.copy2(OUT_PATH, backup)
     atomic_write(updated)
-    try:
-        result = validate_subscription()
-    except Exception:
-        atomic_write(old)
-        raise
-    print(f"真实订阅验证通过: 盘前区间 {result['pmh']}~{result['pml']}；备份 {backup}", flush=True)
+    detail = f"盘前区间 {result['pmh']}~{result['pml']}" if result else "目标指标加载及行情订阅通过"
+    print(f"{detail}；备份 {backup}", flush=True)
     if args.restart:
         subprocess.run([str(ROOT / "restart_live.sh")], cwd=ROOT, check=True)
         verify_live()

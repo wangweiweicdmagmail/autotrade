@@ -1,12 +1,21 @@
 """trading application functions and owned state. No console.app dependency."""
 
+from engine.opening_breakout import RULES_VERSION, entry_window
 from fastapi import HTTPException
 from typing import List
 from typing import Optional
 import asyncio
+import math
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 import config
+from domain.contracts import finite_number
 from console.shared import logger
-from console.schemas import LimitStopOrderRequest, UpdateTrailRequest
+from console.schemas import LimitStopOrderRequest, OpeningBreakoutOrderRequest, UpdateTrailRequest
+
+
+ET = ZoneInfo("America/New_York")
 
 
 class TradingService:
@@ -76,7 +85,7 @@ class TradingService:
         dist = close - ssl if side == "long" else ssl - close
         return dist if dist > 0 else None
 
-    def _midpoint_prices(self, data: dict, side: str):
+    def _midpoint_prices(self, data: dict, side: str, *, opening_stop=None):
         """由上一根已收盘 5M bar 计算中点限价、ATR 止损与突破触发价。
 
         突破触发价：多单 = bar 高点 + 0.01，空单 = bar 低点 - 0.01，
@@ -90,10 +99,10 @@ class TradingService:
             raise ValueError("缺少已收盘 5M K 线，无法计算中点限价")
         if high < low:
             raise ValueError("5M K 线 high/low 数据非法")
-        if not atr or atr <= 0:
+        if opening_stop is None and (not atr or atr <= 0):
             raise ValueError("ATR 数据缺失，无法计算中点单止损")
         limit = round((high + low) / 2, 2)
-        stop = round(
+        stop = opening_stop if opening_stop is not None else round(
             limit
             + (-1 if side == "long" else 1)
             * self.context.trading._smart_stop_dist(data, side, limit, atr),
@@ -106,7 +115,7 @@ class TradingService:
             raise ValueError("多仓止损必须低于中点限价")
         if side == "short" and stop <= limit:
             raise ValueError("空仓止损必须高于中点限价")
-        return (limit, stop, breakout, bar, float(atr))
+        return (limit, stop, breakout, bar, float(atr or 0))
 
     def _retest_prices(self, data: dict, side: str):
         """由上上根已收盘 5M bar（bar_c2，periods[2]）计算回踩限价与逻辑止损。
@@ -130,7 +139,7 @@ class TradingService:
             raise ValueError("空仓止损必须高于回踩限价")
         return (limit, stop, bar)
 
-    def _fvg_chase_prices(self, data: dict, side: str, symbol: str):
+    def _fvg_chase_prices(self, data: dict, side: str, symbol: str, *, opening_stop=None):
         """FVG 追价定价（服务端，不信浏览器价）：
         以该 symbol + 方向在 4h 缓冲内的最新 FVG 事件边沿为锚（多=top / 空=bottom），
         现价距边沿 ≤ FVG_CHASE_MAX_ATR_RATIO × ATR 才允许追价；
@@ -160,7 +169,7 @@ class TradingService:
             )
         premium = config.ENTRY_LIMIT_PREMIUM_PCT / 100
         limit = round(close * (1 + premium if side == "long" else 1 - premium), 2)
-        stop = round(
+        stop = opening_stop if opening_stop is not None else round(
             close
             + (-1 if side == "long" else 1)
             * self.context.trading._smart_stop_dist(data, side, close, atr),
@@ -170,7 +179,7 @@ class TradingService:
             raise ValueError("追价限价/止损必须为正")
         return (limit, stop)
 
-    def _market_prices(self, data: dict, side: str):
+    def _market_prices(self, data: dict, side: str, *, opening_stop=None):
         """市价单定价（服务端，不信浏览器价）：marketable 限价 =
         实时 close × (1 ± ENTRY_LIMIT_PREMIUM_PCT/100)（不用裸 MARKET：延迟行情
         会被券商拒单 error 10349），止损 = 现价 ∓ N×ATR（ts_c 确认值，
@@ -181,11 +190,11 @@ class TradingService:
         atr = ts.get("atr")
         if close is None or close <= 0:
             raise ValueError("缺少实时价格，无法下市价单")
-        if not atr or atr <= 0:
+        if opening_stop is None and (not atr or atr <= 0):
             raise ValueError("ATR 数据缺失，无法计算市价单止损")
         premium = config.ENTRY_LIMIT_PREMIUM_PCT / 100
         limit = round(close * (1 + premium if side == "long" else 1 - premium), 2)
-        stop = round(
+        stop = opening_stop if opening_stop is not None else round(
             close
             + (-1 if side == "long" else 1)
             * self.context.trading._smart_stop_dist(data, side, close, atr),
@@ -196,7 +205,7 @@ class TradingService:
         return (limit, stop)
 
     def _check_trend_filter(
-        self, symbol: str, side: str, force: bool = False, reason: str = ""
+        self, symbol: str, side: str, force: bool = False, reason: str = "", *, require_atr=True
     ) -> None:
         """SuperTrend 方向闸门（下单拦截）：
         做多需 ts_c.direction == 1（SuperTrend 多头），做空需 == -1；
@@ -210,7 +219,7 @@ class TradingService:
         snap = (self.context.collector.latest() or {}).get(symbol, {})
         ts = self.context.trading._ts_c(snap)
         direction = ts.get("direction")
-        if ts.get("atr") is None:
+        if require_atr and ts.get("atr") is None:
             raise HTTPException(
                 400,
                 f"{symbol} ATR 数据缺失，请检查图表上的 trend_state 指标（Atr Value plot）",
@@ -352,6 +361,10 @@ class TradingService:
                     except ValueError as e:
                         logger.warning("%s 回踩单改价跳过: %s", lot["symbol"], e)
                         continue
+                    if (lot.get("signal_snapshot") or {}).get("stop_source") == "opening_bar_extreme":
+                        new_stop = lot["stop_px"]
+                        if not (new_stop < new_limit if lot["side"] == "long" else new_stop > new_limit):
+                            continue
                     qty_new = 0
                     if not lot.get("filled_qty"):
                         init_risk = lot.get("init_risk_usd") or 0
@@ -417,14 +430,44 @@ class TradingService:
     async def api_positions(self) -> List[dict]:
         return self.context.order_mgr.aggregate()
 
+    async def api_place_opening_breakout(
+        self, req: OpeningBreakoutOrderRequest, trader: str, *, deadline: float | None = None,
+    ) -> dict:
+        now = datetime.now(ET)
+        signal = next((row for row in self.context.signals.opening_breakouts(now.timestamp())
+                       if row["id"] == req.signal_id), None)
+        if signal is None:
+            raise HTTPException(404, "找不到本交易日的小区间突破信号")
+        if deadline is None and req.signal_id in self.context.signals._opening_orders:
+            raise HTTPException(409, "该信号已有收盘开仓预约，请查看预约状态")
+        signal_open = finite_number(signal.get("open"))
+        if signal_open is None or signal_open <= 0:
+            raise HTTPException(409, "突破信号缺少开盘价，请等待信号数据更新")
+        if signal.get("rules_version") != RULES_VERSION:
+            raise HTTPException(409, "信号规则版本已更新，请等待新信号")
+        if not entry_window(now.timestamp()) or not signal["time"] <= now.timestamp() < signal["time"] + 20:
+            raise HTTPException(409, "已超过突破收盘开仓窗口，未下单")
+        deadline = min(deadline or signal["time"] + 20, signal["time"] + 20)
+        stop = round((signal_open + signal["close"]) / 2, 2)
+        return await self.api_place_limit_stop(
+            LimitStopOrderRequest(
+                symbol=signal["symbol"], side=signal["side"], limit_type="market",
+                limit_px=signal["close"], stop_px=stop, reason="小区间突破收盘确认开仓" if deadline is not None else "小区间突破手动开仓",
+                max_position_pct=req.max_position_pct,
+            ),
+            trader=trader, opening_breakout=signal, deadline=deadline,
+        )
+
     async def api_place_limit_stop(
-        self, req: LimitStopOrderRequest, trader: str = None
+        self, req: LimitStopOrderRequest, trader: str = None, *, opening_breakout: dict | None = None, deadline: float | None = None
     ) -> dict:
         """LMT 父单 + STP 子单下单；midpoint/retest 由服务端按已收盘 bar 定价。
         方向必须与 ts_c.direction（SuperTrend 方向）同向（1 多 / -1 空），震荡可开；
         force=执意开仓放行（需原因）。"""
         if req.side not in ("long", "short"):
             raise HTTPException(400, f"方向非法: {req.side}")
+        if req.qty < 0 or not math.isfinite(req.max_position_pct):
+            raise HTTPException(400, "股数或最大仓位比例无效")
         if req.limit_type not in (
             "ema",
             "channel",
@@ -436,23 +479,43 @@ class TradingService:
             raise HTTPException(400, f"不支持的限价类型: {req.limit_type}")
         if not config.ALLOW_SHORT and req.side == "short":
             raise HTTPException(400, "当前仅允许做多（空头已屏蔽）")
+        now = datetime.now(ET)
+        opening = now.weekday() < 5 and 570 <= now.hour * 60 + now.minute < 580
+        data = (self.context.collector.latest() or {}).get(req.symbol, {})
+        bar = data.get("bar") or {}
+        if opening_breakout:
+            if not entry_window(now.timestamp()):
+                raise HTTPException(400, "突破开仓仅限09:45至10:30之前")
+            bar_time = finite_number(bar.get("time"))
+            close = finite_number(bar.get("close"))
+            if (bar_time is None or not bar_time <= now.timestamp() < bar_time + 300
+                    or close is None or close <= 0):
+                raise HTTPException(400, "当前标的行情未就绪，暂不能开仓")
+        opening_stop = None
+        if opening:
+            bar_time = finite_number(bar.get("time"))
+            low, high = finite_number(bar.get("low")), finite_number(bar.get("high"))
+            if (
+                bar_time is None or not bar_time <= now.timestamp() < bar_time + 300
+                or low is None or high is None or not 0 < low <= high
+            ):
+                raise HTTPException(400, "当前 5 分钟 K 线高低点未就绪，无法设置开盘止损")
+            opening_stop = round(low if req.side == "long" else high, 2)
         self.context.trading._check_trend_filter(
-            req.symbol, req.side, req.force, req.reason
+            req.symbol, req.side, req.force, req.reason, require_atr=not opening and not opening_breakout,
         )
         limit_px, stop_px = (req.limit_px, req.stop_px)
         reprice_bar_time = 0.0
         breakout_px = 0.0
         if req.limit_type == "midpoint":
-            data = (self.context.collector.latest() or {}).get(req.symbol, {})
             try:
                 limit_px, stop_px, breakout_px, bar, _ = (
-                    self.context.trading._midpoint_prices(data, req.side)
+                    self.context.trading._midpoint_prices(data, req.side, opening_stop=opening_stop)
                 )
             except ValueError as e:
                 raise HTTPException(400, str(e))
             reprice_bar_time = bar["time"]
         elif req.limit_type == "retest":
-            data = (self.context.collector.latest() or {}).get(req.symbol, {})
             try:
                 limit_px, stop_px, bar = self.context.trading._retest_prices(
                     data, req.side
@@ -461,41 +524,58 @@ class TradingService:
                 raise HTTPException(400, str(e))
             reprice_bar_time = bar["time"]
         elif req.limit_type == "chase":
-            data = (self.context.collector.latest() or {}).get(req.symbol, {})
             try:
                 limit_px, stop_px = self.context.trading._fvg_chase_prices(
-                    data, req.side, req.symbol
+                    data, req.side, req.symbol, opening_stop=opening_stop
                 )
             except ValueError as e:
                 raise HTTPException(400, str(e))
+        elif opening_breakout:
+            limit_px = close
+            if not (0 < stop_px < close if req.side == "long" else 0 < close < stop_px):
+                raise HTTPException(400, "现价已触及或越过突破 K 线止损，无法开仓")
         elif req.limit_type == "market":
-            data = (self.context.collector.latest() or {}).get(req.symbol, {})
             try:
-                limit_px, stop_px = self.context.trading._market_prices(data, req.side)
+                limit_px, stop_px = self.context.trading._market_prices(data, req.side, opening_stop=opening_stop)
             except ValueError as e:
                 raise HTTPException(400, str(e))
-        qty = req.qty
+        risk_budget = config.RISK_PER_TRADE_USD
+        reference_px = limit_px
         risk_ref_px = 0.0
-        if req.limit_type in ("market", "chase"):
-            data2 = (self.context.collector.latest() or {}).get(req.symbol, {})
-            risk_ref_px = (data2.get("bar") or {}).get("close") or 0
-            dist = abs(risk_ref_px - stop_px) if risk_ref_px > 0 else 0
-            if dist <= 0:
-                raise HTTPException(400, "风险距离无效（现价/止损缺失），拒绝下单")
-            equity = self.context.accounts._equity_cache.get("equity") or 0
-            risk_budget = req.risk_usd or config.RISK_PER_TRADE_USD
-            q_risk = int(risk_budget / dist)
-            q_pct = (
-                int(equity * req.max_position_pct / 100 / limit_px)
-                if equity > 0 and req.max_position_pct > 0
-                else q_risk
-            )
-            qty = max(0, min(q_risk, q_pct, config.RISK_MAX_ORDER_QTY))
-        if qty == 0:
-            equity = await self.context.gateway.net_liquidation()
-            qty = self.context.risk_gate.size_position(limit_px, stop_px, equity)
+        reprice_qty = req.limit_type in ("market", "chase")
+        if reprice_qty:
+            risk_ref_px = (data.get("bar") or {}).get("close") or 0
+            reference_px = risk_ref_px
+        if opening:
+            stop_px = opening_stop
+            if not (0 < stop_px < reference_px if req.side == "long" else 0 < reference_px < stop_px):
+                raise HTTPException(400, "当前 K 线极值未形成有效止损距离，暂不能开仓")
+        dist = abs(reference_px - stop_px)
+        if not math.isfinite(dist) or reference_px <= 0 or stop_px <= 0 or dist <= 0:
+            raise HTTPException(400, "风险距离无效（参考价/止损缺失），拒绝下单")
+        qty = min(int(risk_budget / dist), config.RISK_MAX_ORDER_QTY)
+        equity = self.context.accounts._equity_cache.get("equity") or 0
+        if equity > 0 and req.max_position_pct > 0 and limit_px > 0:
+            qty = min(qty, int(equity * req.max_position_pct / 100 / limit_px))
+        if not reprice_qty and req.qty > 0:
+            qty = min(qty, req.qty)
         if qty <= 0:
             raise HTTPException(400, "无法确定有效股数（请显式填写 qty）")
+        signal_snapshot = self.context.trading._snapshot_for(symbol=req.symbol)
+        if opening:
+            signal_snapshot.update(stop_source="opening_bar_extreme", stop_bar_time=data["bar"]["time"])
+        if opening_breakout:
+            signal_snapshot.update(
+                stop_source="opening_breakout_body_midpoint",
+                stop_bar_time=opening_breakout["time"] - 300,
+                opening_breakout_id=opening_breakout["id"],
+                breakout_protection_rule="signal_midpoint_then_close_5m",
+                breakout_rules_version=RULES_VERSION,
+                breakout_rule_evidence=dict(opening_breakout),
+                breakout_signal_open=opening_breakout["open"],
+                breakout_signal_close=opening_breakout["close"],
+                breakout_signal_bar_time=opening_breakout.get("bar_time", opening_breakout["time"] - 300),
+            )
         lot, err = await self.context.order_mgr.place_limit_stop_lot(
             symbol=req.symbol,
             side=req.side,
@@ -504,14 +584,17 @@ class TradingService:
             stop_px=stop_px,
             limit_type=req.limit_type,
             reason=req.reason,
-            risk_usd=req.risk_usd,
-            signal_snapshot=self.context.trading._snapshot_for(symbol=req.symbol),
+            risk_usd=risk_budget,
+            signal_snapshot=signal_snapshot,
             reprice_bar_time=reprice_bar_time,
             breakout_px=breakout_px,
             max_position_pct=req.max_position_pct,
             atr_mult=self.context.settings._stop_atr_mult(),
             trader=trader,
             risk_ref_px=risk_ref_px,
+            manual_entry=True,
+            entry_order_type="MKT" if opening_breakout else "",
+            **({"submission_deadline": deadline} if deadline is not None else {}),
         )
         if lot is None:
             raise HTTPException(400, err)
@@ -526,7 +609,7 @@ class TradingService:
             limit_type=req.limit_type,
             breakout_px=breakout_px,
             trader=trader,
-            risk_usd=req.risk_usd,
+            risk_usd=risk_budget,
             force=req.force,
             reason=req.reason,
         )

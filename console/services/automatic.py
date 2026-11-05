@@ -57,14 +57,17 @@ class AutomaticService:
     async def api_auto_models(self) -> dict:
         return {"models": self.context.auto_service.registry.describe()}
 
-    async def api_auto_start(self, req: AutoStartRequest, trader: str = None) -> dict:
+    async def api_auto_start(self, req: AutoStartRequest, trader: str = None, *, preview=False) -> dict:
         self.context.auto_service.watchlist = config.WATCHLIST
         try:
             result = self.context.auto_service.start(
-                req.strategy, req.symbols, req.params, req.instance_id
+                req.strategy, req.symbols, {"initial_risk_usd": config.RISK_PER_TRADE_USD}, req.instance_id,
+                preview=preview, confirmed_directions=req.confirmed_directions,
             )
         except AutoServiceError as error:
             raise HTTPException(error.status, error.detail)
+        if preview:
+            return result
         (
             self.context.automatic._auto_enabled,
             self.context.automatic._auto_strategy_name,
@@ -103,7 +106,7 @@ class AutomaticService:
             result = await self.context.auto_service.adopt(
                 req.symbol,
                 req.lot_id,
-                req.initial_risk_usd,
+                config.RISK_PER_TRADE_USD,
                 req.strategy,
                 req.instance_id,
             )
@@ -127,6 +130,14 @@ class AutomaticService:
             return await self.context.auto_service.stop_instance(
                 symbol, close_positions, strategy, instance_id
             )
+        except AutoServiceError as error:
+            raise HTTPException(error.status, error.detail)
+
+    async def api_auto_instance_breakeven(self, symbol, req, trader=None,
+                                         strategy="ema9_pyramid", instance_id="default"):
+        try:
+            return await self.context.auto_service.breakeven_instance(
+                symbol, req.group_id, req.qty, req.avg_cost, strategy, instance_id)
         except AutoServiceError as error:
             raise HTTPException(error.status, error.detail)
 

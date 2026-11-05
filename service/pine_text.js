@@ -48,7 +48,8 @@ async function fetchScriptText(id, creds) {
 
 function loadTextCache() {
   try {
-    return JSON.parse(fs.readFileSync(path.join(__dirname, 'pine_texts.json'), 'utf8'));
+    const cachePath = process.env.AUTOTRADE_PINE_VALIDATION_CACHE || path.join(__dirname, 'pine_texts.json');
+    return JSON.parse(fs.readFileSync(cachePath, 'utf8'));
   } catch (e) {
     return {};
   }
@@ -89,7 +90,12 @@ async function loadIndicatorWithText(TradingView, id, creds, options = {}) {
     }
   }
   if (!text) {
-    throw new Error(`[pine_text] ${id} 无匹配正文（远端 v${indic.pineVersion}）: ${fallbackError}`);
+    const error = new Error(`[pine_text] ${id} 无匹配正文（远端 v${indic.pineVersion}）: ${fallbackError}`);
+    error.cacheIssue = {
+      cached_version: cache[id]?.text ? (cache[id].version || '未知') : null,
+      remote_version: indic.pineVersion,
+    };
+    throw error;
   }
   return new TradingView.PineIndicator({
     pineId: indic.pineId, pineVersion: indic.pineVersion,

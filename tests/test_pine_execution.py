@@ -183,6 +183,17 @@ def test_runtime_uses_each_models_snapshot_keys_and_latest_price():
     assert len(runtime.last_bars) == 2
 
 
+def test_start_preview_uses_selected_model_for_qqq():
+    market = {
+        SYM: {"fixture": fixture_output(direction=-1)},
+        "NASDAQ:QQQ": {"fixture": fixture_output(direction=-1), "e9": {"direction": 1}},
+    }
+    service = AutoService(StateBroker(), SimpleNamespace(latest=lambda: market), None, registry=registry())
+    preview = service.start("fixture_pullback", [SYM], {}, preview=True)
+    assert preview["directions"] == {SYM: -1, "NASDAQ:QQQ": -1}
+    assert not service.engines()
+
+
 def test_registry_rejects_collisions_and_unregistered_models():
     models = registry()
     with pytest.raises(ValueError, match="重复"):
@@ -237,8 +248,10 @@ def test_backtest_can_replay_another_pine_mapping():
         registry=registry(),
     )
     result = run(session.run_all())
-    assert result["orders"][0]["qty"] == 100
-    assert result["orders"][0]["pnl"] == 50
+    assert result["orders"][0]["entry_order_type"] == "MKT"
+    assert result["orders"][0]["filled"]["px"] == 101  # first long-side extreme observation
+    assert result["orders"][0]["qty"] == 50  # $100 / (101 observed - 99 stop)
+    assert result["orders"][0]["pnl"] == -25
     assert result["params"]["risk_ratios"] == [1.0]
 
 
@@ -293,3 +306,63 @@ def test_recovery_does_not_act_on_a_misaligned_confirmed_direction():
     runtime.adopt_tick = 4
     run(runtime.step(market, 600, trading=True))
     assert broker.lots["lot-1"].state == "ACTIVE"
+
+
+def test_opening_range_blocks_entry_without_consuming_same_bar_signal(monkeypatch):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    t = datetime(2026, 11, 3, 9, 50, tzinfo=ZoneInfo("America/New_York")).timestamp()
+    monkeypatch.setattr("console.runtime.strategy.time.time", lambda: t + 1)
+    broker = StateBroker()
+    engine = PineExecutionEngine(broker)
+    engine.start([SYM], 100, {SYM: 1})
+    runtime = StrategyRuntime(SimpleNamespace(
+        engines=lambda: [engine],
+        record_event=lambda *args, **kwargs: None,
+    ), require_opening_range=True)
+    data = {
+        "bar": {"time": t, "close": 100},
+        "bar_c": {"time": t - 300, "close": 100},
+        "e9": _e9(100, 1, 1, t),
+        "attack_c": {"time": t - 300, "opening3High": 101, "opening3Low": 99},
+    }
+    run(runtime.step({SYM: data}, 590, trading=True))
+    assert not broker.calls
+    assert "小区间" in engine.get_instance(SYM).last_decision_reason
+    data["bar"]["close"] = 102
+    run(runtime.step({SYM: data}, 590, trading=True))
+    run(runtime.step({SYM: data}, 590, trading=True))
+    assert len(broker.calls) == 1
+
+
+def test_service_restores_same_session_watch_and_position_only():
+    from datetime import date, datetime
+    from zoneinfo import ZoneInfo
+
+    broker = StateBroker()
+    manager = SimpleNamespace(
+        list_lots=lambda: [row_for(lot) for lot in broker.lots.values()],
+        pyramid_states=broker.pyramid_states,
+    )
+    first = AutoService(broker, None, manager)
+    engine = first.engine()
+    symbols = [SYM, "NASDAQ:AMD", "NASDAQ:STOP", "NASDAQ:OLD"]
+    engine.start(symbols, 700, {symbol: 1 for symbol in symbols})
+    run(engine.on_price(SYM, 100, _e9(100, 1, 1), 600))
+    stamp = datetime(2026, 11, 3, 10, tzinfo=ZoneInfo("America/New_York")).timestamp()
+    for symbol in symbols:
+        inst = engine.get_instance(symbol)
+        inst.started_at = stamp if symbol != "NASDAQ:OLD" else stamp - 86400
+        engine._persist(inst)
+    engine.stop_symbol("NASDAQ:STOP")
+
+    restarted = AutoService(broker, None, manager)
+    run(restarted.restore(date(2026, 11, 3)))
+    restored = {row["symbol"]: row for row in restarted.instances()}
+    assert set(restored) == {SYM, "NASDAQ:AMD"}
+    assert all(row["restored"] and row["enabled"] for row in restored.values())
+    assert restored["NASDAQ:AMD"]["start_direction"] == 1
+    assert restored["NASDAQ:AMD"]["initial_risk_usd"] == 700
+    assert restored[SYM]["lot_ids"] == ["lot-1"]
+    assert len(broker.calls) == 1

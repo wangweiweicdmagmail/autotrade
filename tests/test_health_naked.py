@@ -255,3 +255,134 @@ def test_naked_alive_via_snapshot_handle_lost(app, monkeypatch):
         assert not app.notifier.active_alerts()
         assert app.order_mgr.restore_calls == []
     run(go())
+
+
+def test_external_cleanup_does_not_resell_managed_stop_fill(monkeypatch):
+    from types import SimpleNamespace
+
+    import config
+    from console.services.monitoring import MonitoringService
+
+    monkeypatch.setattr(config, "EXTERNAL_ORDER_CLEANUP_ENABLED", True)
+    row = {"symbol": "NASDAQ:SPCX", "state": "ACTIVE"}
+    events = []
+
+    async def positions():
+        row["state"] = "CLOSED"
+        return {"SPCX": 1512}  # Broker's position update trails the stop execution.
+
+    async def trade_map():
+        return {}
+
+    async def accounts():
+        return []
+
+    async def place_close(*args, **kwargs):
+        pytest.fail("stale position difference must not submit another sell")
+
+    context = SimpleNamespace(
+        gateway=SimpleNamespace(enabled=True, _connected=True, positions=positions,
+                                trade_map=trade_map, fa_accounts=accounts, place_close=place_close),
+        order_mgr=SimpleNamespace(list_lots=lambda **kwargs: [row], aggregate=lambda: []),
+        events=SimpleNamespace(record_event=lambda name, **data: events.append((name, data))),
+    )
+    context.monitoring = MonitoringService(context)
+    context.monitoring._external_alert_last = {}
+    stats = run(context.monitoring._external_cleanup_once())
+    assert stats["skipped"] == 1
+    assert events[0][0] == "external_position_alert"
+
+
+@pytest.mark.parametrize("trading_hours,already_breakeven", [(True, False), (False, False), (True, True)])
+def test_breakout_skips_one_r_and_delegates_signal_close_protection(
+    app, monkeypatch, trading_hours, already_breakeven,
+):
+    import asyncio
+    import time
+    from types import SimpleNamespace
+
+    now = time.time()
+    lots = []
+    market = {}
+    for name, side, price, age in (
+        ("one_r", "long", 103, 60),
+        ("timed", "short", 99.5, 601),
+        ("too_early", "long", 100.5, 599),
+        ("underwater", "long", 99.5, 601),
+    ):
+        lots.append({
+            "lot_id": name, "symbol": name, "side": side, "state": "ACTIVE",
+            "breakeven_reached": already_breakeven,
+            "signal_snapshot": {"opening_breakout_id": name},
+            "avg_fill": 100, "entry_px": 98, "init_entry_px": 98,
+            "init_stop_px": 97 if side == "long" else 103, "filled_qty": 1,
+            "entry_broker_time": now - age, "entry_time": now - 1,
+        })
+        market[name] = {"bar": {"close": price, "high": 110, "low": 90}}
+    attempts = []
+    signal_close_checks = []
+
+    async def protect_signal_close(lot_id, snapshot, *, now):
+        signal_close_checks.append(lot_id)
+        return {"ok": True, "action": "waiting"}
+
+    async def breakeven(lot_id):
+        attempts.append(lot_id)
+        return True, ""
+
+    monkeypatch.setattr(app.monitoring.context, "order_mgr", SimpleNamespace(
+        list_lots=lambda **kwargs: lots, breakeven=breakeven,
+        protect_breakout_signal_close=protect_signal_close))
+    monkeypatch.setattr(app.system, "_is_trading_hours", lambda: trading_hours)
+    monkeypatch.setattr(app.gateway, "_connected", True)
+    monkeypatch.setattr(app.collector, "latest", lambda: market)
+    monkeypatch.setattr(app.collector, "data_health", lambda: {"stale": False})
+    monkeypatch.setattr(app.events, "record_event", lambda *args, **kwargs: None)
+    first_tick = True
+
+    async def sleep(_):
+        nonlocal first_tick
+        if not first_tick:
+            raise asyncio.CancelledError
+        first_tick = False
+
+    monkeypatch.setattr("console.services.monitoring.asyncio.sleep", sleep)
+    with pytest.raises(asyncio.CancelledError):
+        run(app.monitoring._auto_breakeven_loop())
+    assert attempts == []
+    assert signal_close_checks == ["one_r", "timed", "too_early", "underwater"]
+
+
+def test_breakout_waiting_for_bar_close_is_checked_again_next_tick(app, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    ticks = 0
+    calls = []
+    lot = {"lot_id": "bar-close", "symbol": "NASDAQ:QQQ", "side": "long",
+           "state": "ACTIVE", "avg_fill": 100, "filled_qty": 1, "breakeven_reached": True,
+           "signal_snapshot": {"opening_breakout_id": "signal"}}
+
+    async def sleep(_):
+        nonlocal ticks
+        ticks += 1
+        if ticks > 2:
+            raise asyncio.CancelledError
+
+    async def protect(lot_id, snapshot, *, now):
+        calls.append(now)
+        return {"ok": True, "action": "waiting" if len(calls) == 1 else "stop_updated",
+                "target_stop": 100}
+
+    monkeypatch.setattr("console.services.monitoring.asyncio.sleep", sleep)
+    monkeypatch.setattr("console.services.monitoring.time.time", lambda: 1000+ticks)
+    monkeypatch.setattr(app.system, "_is_trading_hours", lambda: True)
+    monkeypatch.setattr(app.gateway, "_connected", True)
+    monkeypatch.setattr(app.collector, "latest", lambda: {})
+    monkeypatch.setattr(app.collector, "data_health", lambda: {"stale": False})
+    monkeypatch.setattr(app.events, "record_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(app.monitoring.context, "order_mgr", SimpleNamespace(
+        list_lots=lambda **kwargs: [lot], protect_breakout_signal_close=protect))
+    with pytest.raises(asyncio.CancelledError):
+        run(app.monitoring._auto_breakeven_loop())
+    assert calls == [1001, 1002]

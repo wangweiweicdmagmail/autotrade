@@ -332,12 +332,30 @@ def test_backtest_receives_independent_pyramid_parameters():
 
 def test_api_start_uses_current_risk_and_requires_e9(console_app, monkeypatch):
     app = console_app
-    monkeypatch.setattr(app.collector, 'latest', lambda: {'NASDAQ:NVDA': {'e9': {'ema_9': 207.37, 'direction': 1}}})
+    market = {'NASDAQ:NVDA': {'e9': {'ema_9': 207.37, 'direction': 1}},
+              'NASDAQ:QQQ': {'e9': {'direction': 1}}}
+    monkeypatch.setattr(app.collector, 'latest', lambda: market)
     calls = []
     monkeypatch.setattr(app.auto_engine, 'start', lambda symbols, risk, directions: calls.append((symbols, risk, directions)) or symbols)
     req = schemas.AutoStartRequest(symbols=['NVDA'], params={'initial_risk_usd': 450})
+    preview = run(app.automatic.api_auto_start(req, trader='master', preview=True))
+    assert preview['directions'] == {'NASDAQ:NVDA': 1, 'NASDAQ:QQQ': 1}
+    with pytest.raises(app.HTTPException, match='尚未确认'):
+        run(app.automatic.api_auto_start(req, trader='master'))
+    req.confirmed_directions = preview['directions']
+    for direction, reason in [(-1, '方向不一致'), (0, '方向未就绪')]:
+        market['NASDAQ:QQQ']['e9']['direction'] = direction
+        with pytest.raises(app.HTTPException, match=reason):
+            run(app.automatic.api_auto_start(req, trader='master'))
+    market['NASDAQ:QQQ']['e9']['direction'] = -1
+    market['NASDAQ:NVDA']['e9']['direction'] = -1
+    with pytest.raises(app.HTTPException, match='已变化'):
+        run(app.automatic.api_auto_start(req, trader='master'))
+    assert calls == []
+    market['NASDAQ:QQQ']['e9']['direction'] = 1
+    market['NASDAQ:NVDA']['e9']['direction'] = 1
     result = run(app.automatic.api_auto_start(req, trader='master'))
-    assert calls == [(['NASDAQ:NVDA'], 450.0, {'NASDAQ:NVDA': 1})]
+    assert calls == [(['NASDAQ:NVDA'], 700.0, {'NASDAQ:NVDA': 1})]
     assert result['params']['risk_ratios'] == [1.0, 2.0 / 3.0, 1.0 / 3.0]
 
 def test_api_start_rejects_missing_e9(console_app, monkeypatch):

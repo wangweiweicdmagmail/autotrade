@@ -74,6 +74,8 @@ const fs = require('fs');
 const path = require('path');
 const TradingView = require('@mathieuc/tradingview');
 const { loadIndicatorWithText } = require('./pine_text.js');
+const { chartRetryReason } = require('./chart_health.js');
+const { priorBodyEma10, priorRegularEngulfing4, breakoutContext, historicalBreakoutContext } = require('./candle_metrics.js');
 const { emaFromPeriods } = require('./ema.js');
 const { loadPineModels, outputFromPeriod } = require('./pine_models.js');
 const PINE_MODELS = loadPineModels();
@@ -123,6 +125,7 @@ function tsFromPeriod(p) {
   const upCh = finite(p.Uptrend_Channel);
   const downCh = finite(p.Downtrend_Channel);
   return {
+    time: p.$time,
     trend_state: finite(p.Trend_State),
     direction: up !== null ? 1 : (down !== null ? -1 : 0),
     ema_fast: finite(p.EMA_Fast),
@@ -157,7 +160,7 @@ function attackFromPeriod(p) {
   // plot 键名 = 标题剥离非 ASCII。用户改过指标后 premarketHigh/premarketLow
   // 的标题变成中文/空标题，WS 键名退化为 plot_1/_2（实测 HOOD 验证：
   // plot_1=98.1=周五盘前高，_2=96=盘前低）——两套键名都兼容。
-  // K/K_2 = 第二区间（双区间之开盘区间，暂不使用）。
+  // K/K_2 = 旧版开盘前三根 5M K 线高低点。
   const pmhRaw = p.premarketHigh != null ? p.premarketHigh : p.plot_1;
   const pmlRaw = p.premarketLow != null ? p.premarketLow : p._2;
   return {
@@ -165,6 +168,9 @@ function attackFromPeriod(p) {
     bar_color: finite(p.Bar_Color),
     pmh: finite(pmhRaw),
     pml: finite(pmlRaw),
+    opening3High: finite(p.opening3High ?? p.K),
+    opening3Low: finite(p.opening3Low ?? p.K_2),
+    opening3Distance: finite(p.Opening3_Distance),
   };
 }
 
@@ -191,32 +197,62 @@ function fvgFromPeriod(p, periods, idx) {
   };
 }
 
+function closedAtrSma10(periods, start = 1) {
+  if (periods.length < start + 11) return null;
+  let total = 0;
+  for (let i = start; i < start + 10; i++) {
+    const bar = periods[i];
+    const high = finite(bar.max);
+    const low = finite(bar.min);
+    const previousClose = finite(periods[i + 1].close);
+    if (high === null || low === null || previousClose === null
+        || low <= 0 || high < low || previousClose <= 0) return null;
+    total += Math.max(high - low, Math.abs(high - previousClose), Math.abs(low - previousClose));
+  }
+  return total / 10;
+}
+
 async function main() {
   const args = _args;
   const creds = JSON.parse(fs.readFileSync(args.creds, 'utf8'));
 
+  let loaded = 0;
+  const total = PINE_MODELS.length + 4;
+  const report = (event) => process.stdout.write(JSON.stringify({
+    type: 'indicator_startup', loaded, total, ...event,
+  }) + '\n');
+  async function loadStartupIndicator(id, name) {
+    report({ name });
+    try {
+      const indicator = await loadIndicatorWithText(TradingView, id, creds);
+      loaded++;
+      report({ loaded_id: id, name });
+      return indicator;
+    } catch (error) {
+      if (error.cacheIssue) report({ cache_issue: { id, name, ...error.cacheIssue } });
+      throw error;
+    }
+  }
+
   // 加密正文注入（2026-10-27 起 create_study 必须携带 text，见 pine_text.js）
-  const trendStateIndic = await loadIndicatorWithText(
-    TradingView, TREND_STATE_ID, creds);
+  const trendStateIndic = await loadStartupIndicator(TREND_STATE_ID, "趋势状态");
   // 输入全部用指标默认值（ATR 10 / Factor 3.0 / Channel 1.0 / 回看 6 /
   // EMA差值>1×ATR），与图表上的指标所见即所得，不做 setOption 覆盖
-  const fvgIndic = await loadIndicatorWithText(
-    TradingView, FVG_ID, creds);
+  const fvgIndic = await loadStartupIndicator(FVG_ID, "FVG Finder+");
   // FVG 同样用指标默认输入（过滤器 Off / ST 3.0×10 等），与图表所见即所得
-  const ssIndic = await loadIndicatorWithText(
-    TradingView, SMART_STOP_ID, creds);
+  const ssIndic = await loadStartupIndicator(SMART_STOP_ID, "智能止损");
   // smart_stop 同样用默认输入（ATR10 / 回看 3 / 钳制 1~2×ATR）
   const modelIndicators = [];
   for (const model of PINE_MODELS) {
     try {
-      modelIndicators.push({ model, indicator: await loadIndicatorWithText(TradingView, model.indicator_id, creds) });
+      modelIndicators.push({ model, indicator: await loadStartupIndicator(model.indicator_id, model.name || model.id) });
     } catch (e) {
       console.error(`[pine:${model.id}] 指标加载失败，该模型不可启动: ${(e.message || e).toString().slice(0, 240)}`);
     }
   }
   let attackIndic = null;
   try {
-    attackIndic = await loadIndicatorWithText(TradingView, ATTACK_ZONE_ID, creds);
+    attackIndic = await loadStartupIndicator(ATTACK_ZONE_ID, "5M 进攻区域");
   } catch (e) {
     console.error(`[attack] 指标加载失败，降级为无进攻区域数据，核心行情继续: ${(e.message || e).toString().slice(0, 240)}`);
   }
@@ -236,6 +272,12 @@ async function main() {
   // state[symbol] 对象跨重建复用（推送循环只认 state，无感）
   function spawnChart(symbol, rebuilds = 0) {
     const chart = new client.Session.Chart();
+    const snapshot = state[symbol];
+    snapshot.breakoutBars = [];
+    snapshot.breakoutAtr = null;
+    snapshot.breakoutRanges = null;
+    snapshot.breakoutChartPeriods = [];
+    snapshot.breakoutModelPeriods = null;
     chart.setMarket(symbol, { timeframe: '5', range: 200, session: 'extended' });
     const tsStudy = new chart.Study(trendStateIndic);
     const fvgStudy = new chart.Study(fvgIndic);
@@ -243,26 +285,39 @@ async function main() {
     const modelStudies = modelIndicators.map(({ model, indicator }) => ({ model, study: new chart.Study(indicator) }));
     const attackStudy = attackIndic ? new chart.Study(attackIndic) : null;
     entries[symbol] = {
-      chart, studies: { attack: attackStudy },
+      chart, studies: { attack: attackStudy, trend: tsStudy },
       createdAt: Date.now(), rebuilds, rebuilding: false, gaveUp: false,
     };
 
     chart.onUpdate(() => {
+      if (entries[symbol]?.chart !== chart) return;
       const ent = entries[symbol];
       if (ent) ent.rebuilding = false;   // 首批数据到达 = 重建完成
       if (chart.periods && chart.periods.length) {
+        state[symbol].breakoutChartPeriods = chart.periods.slice(0, 175);
         state[symbol].ema_9 = emaFromPeriods(chart.periods, 0, 9);
         state[symbol].ema_9_c = emaFromPeriods(chart.periods, 1, 9);
         const b = chart.periods[0];   // periods 倒序 [0]=最新（实时，未收盘）
         state[symbol].bar = {
           time: b.time, open: b.open, high: b.max,
           low: b.min, close: b.close, volume: b.volume,
+          atr_sma10: closedAtrSma10(chart.periods, 0),
+          body_ema10: priorBodyEma10(chart.periods, 0),
+          prior_engulfing4: priorRegularEngulfing4(chart.periods, 0),
         };
+        state[symbol].breakoutBars = chart.periods.slice(1, 161).map((p, index) => [
+          p.time, p.open, p.max, p.min, p.close, closedAtrSma10(chart.periods, index + 1),
+          priorBodyEma10(chart.periods, index + 1), priorRegularEngulfing4(chart.periods, index + 1),
+        ]);
+        state[symbol].closedPrices = new Map(chart.periods.slice(1, 21).map(p => [p.time, p.close]));
         const bc = chart.periods[1];  // 上一根已收盘（稳定）
         if (bc) {
           state[symbol].bar_c = {
             time: bc.time, open: bc.open, high: bc.max,
             low: bc.min, close: bc.close, volume: bc.volume,
+            atr_sma10: closedAtrSma10(chart.periods),
+            body_ema10: priorBodyEma10(chart.periods, 1),
+            prior_engulfing4: priorRegularEngulfing4(chart.periods, 1),
           };
         }
         const b2 = chart.periods[2];  // 上上根已收盘（回踩单定价基准，随新 bar 滚动）
@@ -275,13 +330,16 @@ async function main() {
       }
     });
     tsStudy.onUpdate(() => {
+      if (entries[symbol]?.chart !== chart) return;
       const ps = tsStudy.periods;
       if (ps && ps.length) {
+        state[symbol].breakoutAtr = new Map(ps.slice(1, 161).map(p => [p.$time, finite(p.Atr_Value)]));
         state[symbol].ts = tsFromPeriod(ps[0]);    // 实时（盘中会抖，仅显示）
         if (ps[1]) state[symbol].ts_c = tsFromPeriod(ps[1]);  // 确认（策略用）
       }
     });
     ssStudy.onUpdate(() => {
+      if (entries[symbol]?.chart !== chart) return;
       // smart_stop 存独立字段（ss/ss_c），推送时才合并进 ts/ts_c——
       // 直接 Object.assign 进 ts 会被 tsStudy 的下一次整对象覆盖（竞态丢值）
       const ps = ssStudy.periods;
@@ -291,6 +349,7 @@ async function main() {
       }
     });
     fvgStudy.onUpdate(() => {
+      if (entries[symbol]?.chart !== chart) return;
       const ps = fvgStudy.periods;
       if (ps && ps.length) {
         state[symbol].fvg = fvgFromPeriod(ps[0], ps, 0);      // 实时（仅显示）
@@ -298,17 +357,30 @@ async function main() {
       }
     });
     for (const { model, study } of modelStudies) study.onUpdate(() => {
+      if (entries[symbol]?.chart !== chart) return;
       const ps = study.periods;
       if (ps && ps.length) {
         state[symbol][model.realtime_key] = outputFromPeriod(model, ps[0]);
         if (ps[1]) state[symbol][model.confirmed_key] = outputFromPeriod(model, ps[1]);
+        if (model.id === 'ema9_pyramid') {
+          state[symbol].breakoutModelPeriods = new Map(ps.slice(0, 175).map(p => [
+            p.$time, outputFromPeriod(model, p),
+          ]));
+          state[symbol].ema7_closed = ps.slice(1, 79).map(p => ({
+            time: p.$time, ema: finite(p.EMA_9),
+          }));
+        }
       }
     });
     if (attackStudy) attackStudy.onUpdate(() => {
+      if (entries[symbol]?.chart !== chart) return;
       // 进攻区域存独立字段（attack/attack_c），推送时直接下发——
       // 同 ss 的教训：不 Object.assign 进别的通道，防整对象覆盖竞态
       const ps = attackStudy.periods;
       if (ps && ps.length) {
+        state[symbol].breakoutRanges = new Map(ps.slice(1, 161).map(p => [
+          p.$time, [finite(p.opening3High ?? p.K), finite(p.opening3Low ?? p.K_2)],
+        ]));
         state[symbol].attack = attackFromPeriod(ps[0]);       // 实时（仅显示）
         if (ps[1]) state[symbol].attack_c = attackFromPeriod(ps[1]);  // 确认（盘前区间注入用）
       }
@@ -319,7 +391,8 @@ async function main() {
 
   async function rebuildChart(symbol, why) {
     const e = entries[symbol];
-    if (!e || e.rebuilding || e.gaveUp) return;
+    if (!e || e.gaveUp) return;
+    if (e.rebuilding && Date.now() - e.createdAt <= READY_GRACE_MS) return;
     e.rebuilding = true;
     const n = e.rebuilds + 1;
     try { e.chart.delete(); } catch (_) { /* 旧 session 可能已死，忽略 */ }
@@ -342,14 +415,43 @@ async function main() {
   for (const symbol of args.symbols) {
     state[symbol] = { bar: null, bar_c: null, bar_c2: null, ts: {}, ts_c: {}, fvg: {}, fvg_c: {}, ss: {}, ss_c: {}, attack: {}, attack_c: {}, ema_9: null, ema_9_c: null, e9: {}, e9_c: {} };
   }
+  // 每秒输出一次最新快照
+  setInterval(() => {
+    const symbols = {};
+    for (const [sym, s] of Object.entries(state)) {
+      // smart_stop（ss/ss_c 独立通道）推送时合并进 ts/ts_c，消费方无感知
+      if (s.bar) symbols[sym] = {
+        opening_breakout_history: (s.breakoutBars || []).flatMap((row, index) => {
+          const time = row[0];
+          const range = s.breakoutRanges?.get(time);
+          if (!range || !s.breakoutAtr?.has(time)) return [];
+          return [[...row.slice(0, 6), s.breakoutAtr.get(time), ...range, null, row[6], row[7],
+            historicalBreakoutContext(s.breakoutChartPeriods || [], index + 1, s.breakoutModelPeriods)]];
+        }),
+        bar: { ...s.bar, ...breakoutContext(s.breakoutChartPeriods || [], 0, s.breakoutModelPeriods) },
+        bar_c: s.bar_c ? { ...s.bar_c, ...breakoutContext(s.breakoutChartPeriods || [], 1, s.breakoutModelPeriods) } : null,
+        bar_c2: s.bar_c2, ts: { ...s.ts, ...s.ss, ema_9: s.ema_9 }, ts_c: { ...s.ts_c, ...s.ss_c, ema_9: s.ema_9_c }, fvg: s.fvg, fvg_c: s.fvg_c, attack: s.attack, attack_c: s.attack_c, ema7_closed: (s.ema7_closed || []).map(row => ({ ...row, close: finite(s.closedPrices?.get(row.time)) })), ...Object.fromEntries(PINE_MODELS.flatMap(model => [
+        [model.realtime_key, s[model.realtime_key] || {}],
+        [model.confirmed_key, s[model.confirmed_key] || {}],
+      ])) };
+    }
+    if (Object.keys(symbols).length > 0) {
+      process.stdout.write(JSON.stringify({
+        type: 'tick', ts: Date.now() / 1000, symbols,
+      }) + '\n');
+    }
+  }, PUSH_INTERVAL_MS);
+
   for (let i = 0; i < args.symbols.length; i += BATCH_SIZE) {
     const batch = args.symbols.slice(i, i + BATCH_SIZE);
     for (const symbol of batch) spawnChart(symbol);
-    console.error(`[batch] 已发起 ${Math.min(i + BATCH_SIZE, args.symbols.length)}/${args.symbols.length} 个 chart`);
+    const subscribed = Math.min(i + BATCH_SIZE, args.symbols.length);
+    process.stdout.write(JSON.stringify({ type: 'startup_progress', subscribed }) + '\n');
+    console.error(`[batch] 已发起 ${subscribed}/${args.symbols.length} 个 chart`);
     if (i + BATCH_SIZE < args.symbols.length) await sleep(BATCH_DELAY_MS);
   }
 
-  // 只有核心 K 线缺失才重建 chart。attack 缺值仅聚合告警，不能因可选
+  // 核心 K 线或确认趋势指标缺失时重建 chart。attack 缺值仅聚合告警，不能因可选
   // 区间数据反复销毁同 session 的 K 线、trend、FVG 和 smart_stop。
   let sweeping = false;   // 单飞：一轮重建 54 chart×1.5s 远超巡检间隔，
                           // 不拦会叠扫→同一 chart 连环重建（实测 40ms 内 3 次）
@@ -361,13 +463,15 @@ async function main() {
     const dead = [];
     const attackMissing = [];
     for (const [sym, e] of Object.entries(entries)) {
-      if (e.rebuilding || e.gaveUp) continue;
+      if (e.gaveUp) continue;
       const age = now - e.createdAt;
       const hasBars = !!(e.chart.periods && e.chart.periods.length);
       const attack = e.studies.attack;
       const aps = attack ? attack.periods : null;
       const hasAttack = !!(aps && aps.length && finite(aps[0].premarketHigh != null ? aps[0].premarketHigh : aps[0].plot_1) !== null);
-      if (age > READY_GRACE_MS && !hasBars) dead.push([sym, '无K线数据']);
+      const why = chartRetryReason(e, e.chart.periods,
+        finite(e.studies.trend?.periods?.[1]?.Trend_State), now, READY_GRACE_MS);
+      if (why) dead.push([sym, why]);
       else if (attackIndic && age > ATTACK_GRACE_MS && hasBars && !hasAttack) attackMissing.push(sym);
     }
     if (attackMissing.length && now - lastAttackWarn >= 300000) {
@@ -385,23 +489,6 @@ async function main() {
       }
     })();
   }, INSPECT_INTERVAL_MS);
-
-  // 每秒输出一次最新快照
-  setInterval(() => {
-    const symbols = {};
-    for (const [sym, s] of Object.entries(state)) {
-      // smart_stop（ss/ss_c 独立通道）推送时合并进 ts/ts_c，消费方无感知
-      if (s.bar) symbols[sym] = { bar: s.bar, bar_c: s.bar_c, bar_c2: s.bar_c2, ts: { ...s.ts, ...s.ss, ema_9: s.ema_9 }, ts_c: { ...s.ts_c, ...s.ss_c, ema_9: s.ema_9_c }, fvg: s.fvg, fvg_c: s.fvg_c, attack: s.attack, attack_c: s.attack_c, ...Object.fromEntries(PINE_MODELS.flatMap(model => [
-        [model.realtime_key, s[model.realtime_key] || {}],
-        [model.confirmed_key, s[model.confirmed_key] || {}],
-      ])) };
-    }
-    if (Object.keys(symbols).length > 0) {
-      process.stdout.write(JSON.stringify({
-        type: 'tick', ts: Date.now() / 1000, symbols,
-      }) + '\n');
-    }
-  }, PUSH_INTERVAL_MS);
 
   // 心跳
   setInterval(() => {

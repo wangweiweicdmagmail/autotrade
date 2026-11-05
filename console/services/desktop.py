@@ -315,7 +315,7 @@ class DesktopService:
         await asyncio.to_thread(_activate)
 
     async def _workspace_ensure_browser(self) -> Optional[str]:
-        """同一调试 Chrome 内准备控制台和 TV 两个独立标签页。"""
+        """准备专用 Chrome，并组合为左控制台、右 TV 的原生分屏。"""
         if not await self.context.desktop._cdp_alive():
             logger.info("启动交易工作区浏览器（控制台 + TradingView）...")
             proc = await asyncio.create_subprocess_exec(
@@ -326,8 +326,9 @@ class DesktopService:
                 "--remote-debugging-port=9222",
                 f"--user-data-dir={self.context.desktop._TV_CHROME_PROFILE}",
                 "--no-first-run",
-                self.context.desktop._TV_CHART_URL,
+                "--new-window",
                 self.context.desktop._CONSOLE_URL,
+                self.context.desktop._TV_CHART_URL,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
@@ -353,12 +354,57 @@ class DesktopService:
             await self.context.desktop._activate_console_tab()
         except Exception as e:
             logger.info("控制台标签页置前失败（静默）: %s", e)
+        if self.context.desktop._CONSOLE_AUTO_SPLIT_BROWSER:
+            try:
+                await self.context.desktop._workspace_arrange_split()
+                self.context.lifecycle._startup_state["split_ready"] = True
+                self.context.lifecycle._startup_state["split_error"] = ""
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Do not retry native menu actions forever or hold the trading
+                # readiness gate closed for a desktop permission problem.
+                self.context.lifecycle._startup_state["split_ready"] = False
+                reason = str(e).strip() or f"自动分屏失败（{type(e).__name__}）"
+                self.context.lifecycle._startup_state["split_error"] = reason
+                logger.warning("浏览器已打开，自动分屏未完成: %s", reason)
         return None
+
+    async def _workspace_arrange_split(self) -> None:
+        from controller import tv_cdp
+        from controller.browser_workspace import arrange_split
+
+        await arrange_split(tv_cdp.config.CDP_HTTP_ENDPOINT, self._CONSOLE_URL)
+
+    async def _console_http_ready(self) -> bool:
+        """Wait for an actual HTTP response, not full trading readiness.
+
+        Lifespan background tasks start before Uvicorn binds its socket. Full
+        readiness includes the browser, so waiting for `ready` would deadlock.
+        """
+        from urllib.parse import urljoin
+        from urllib.request import ProxyHandler, build_opener
+
+        def probe():
+            try:
+                opener = build_opener(ProxyHandler({}))
+                url = urljoin(self._CONSOLE_URL, "api/startup")
+                with opener.open(url, timeout=2) as response:
+                    payload = json.load(response)
+                    return response.status == 200 and isinstance(payload, dict) and isinstance(payload.get("stages"), list)
+            except Exception:
+                return False
+
+        return await asyncio.to_thread(probe)
 
     async def _startup_prepare(self) -> None:
         """打开工作区并等待全链路首次就绪；就绪锁定后不再因断线退回加载页。"""
         await asyncio.sleep(0.5)
         if self.context.desktop._CONSOLE_AUTO_OPEN_BROWSER:
+            while not await self.context.desktop._console_http_ready():
+                self.context.lifecycle._startup_state["browser_error"] = "等待控制台 HTTP 服务可访问后打开浏览器"
+                await asyncio.sleep(0.5)
+            self.context.lifecycle._startup_state["browser_error"] = ""
             while not self.context.lifecycle._startup_state["browser_ready"]:
                 try:
                     error = await self.context.desktop._workspace_ensure_browser()

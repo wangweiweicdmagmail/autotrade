@@ -38,9 +38,6 @@ createApp({
       lots: [],
       orderSymbolFilter: '',
       orderKindFilter: 'all',
-      riskUsd: (() => {   // 单笔资金（最大风险，美元，localStorage 持久化）
-        try { const v = parseFloat(localStorage.getItem('risk_usd')); return isFinite(v) && v > 0 ? v : 300; } catch (e) { return 300; }
-      })(),
       maxPositionPct: (() => {   // 最大仓位比例（%，localStorage 持久化）
         try { const v = parseFloat(localStorage.getItem('max_position_pct')); return isFinite(v) && v > 0 ? v : 100; } catch (e) { return 100; }
       })(),
@@ -50,8 +47,9 @@ createApp({
       pyramidBreakevenR: 3.0,
       pyramidAddUnlockR: 2.0,
       pyramidParamsDirty: false,
+      screenOpeningRangeFilter: false,
       screenPmFilter: false,  // 选股盘前区间过滤开关（快照 status.screen_premarket_filter 同步）
-      fvgPmFilter: false,     // FVG 监控盘前区间过滤开关（快照 status.fvg_premarket_filter 同步）
+      fvgPmFilter: true,     // FVG 监控盘前区间过滤开关（快照 status.fvg_premarket_filter 同步）
       imessageRecipient: '',  // iMessage 告警收件人（快照 status.imessage_recipient 同步，空=跳过该通道）
       imessageDirty: false,   // 收件人输入框编辑中标记（编辑时不被快照覆盖）
       alerts: [],             // 活跃告警（后端 Notifier，快照 msg.alerts）
@@ -61,11 +59,28 @@ createApp({
       now: Date.now() / 1000,   // 前端实时时钟（每秒更新，驱动时钟走秒）
       selectRefs: {},           // el-select 实例引用（读内部 query）
       logs: [],                 // 运行日志（后端环形缓冲区）
-      bottomTab: 'fvg',         // 主区=自动策略；底部 tab：fvg(FVG监控，默认) / orders / screen / log ...
+      bottomTab: 'instances',  // 默认将完整内容区留给执行实例列表
+      workspaceGroup: 'execution',
+      workspaceExpanded: false,
+      workspaceLayouts: {},
+      settingsVisible: false,
+      globalControlsVisible: false,
+      executionParamsOpen: false,
+      workspaceTabs: {
+        execution: ['instances', 'orders', 'fvg', 'screen', 'momentum', 'openingBreakouts'], validation: ['backtest', 'night'],
+        research: ['reports', 'news', 'shadow', 'returns', 'perf'],
+        operations: ['log', 'events', 'copy'],
+      },
+      workspaceNames: { execution: '执行监控', validation: '回测验证', research: '研究复盘', operations: '系统运维' },
+      workspaceTabNames: { instances: '执行监控', orders: '订单批次', fvg: 'FVG 监控', backtest: '回测验证', night: '夜盘模拟',
+        screen: '选股', momentum: '推进力', reports: '盘前报告', news: '盘前新闻', shadow: '影子', returns: '收益对比', perf: '绩效',
+        openingBreakouts: '小区间突破', log: '运行日志', events: '事件', copy: '跟单管理' },
       bottomPanelHeight: (() => {
         try { const v = parseInt(localStorage.getItem('bottom_panel_height'), 10); return v >= 180 && v <= 800 ? v : 420; } catch (e) { return 420; }
       })(),
       panelResizing: false,
+      momentum: { long: [], short: [], ready_count: 0 },
+      momentumBreakoutsOnly: false,
       screen: { long: [], short: [] },  // 横截面选股（多头/空头两列）
       screenSort: 'divergence',   // divergence=EMA发散度 / duration=ST持续 / push=ST推进
       performance: null,          // 复盘绩效统计
@@ -103,6 +118,10 @@ createApp({
       events: [],                 // 历史事件（持久日志回溯）
       eventFilter: 'all',         // 事件类型过滤
       shadow: { stats: {}, events: [] },   // 当日影子回测（统计 + 回踩事件）
+      strategyShadowReport: null,
+      strategyShadowDay: '',
+      strategyShadowLoading: false,
+      strategyShadowError: '',
       shadowTypeFilter: 'all',             // 影子 tab 信号类型筛选（all/pullback/proposal/fvg_event/fvg_retest/fvg_warn/breakout）
       reportDay: '',                       // 日报日期（缺省=当天）
       report: null,                        // 每日复盘报告（/api/shadow/report）
@@ -148,10 +167,15 @@ createApp({
       fvgInitDone: false,          // 首屏基线标记（首次快照不补报历史事件）
       lastFvgDataTime: null,       // 上一次数据时钟（bar 收盘滴答用，首次仅建基线）
       breakoutSignals: [],         // 盘前突破信号（后端快照，今日已确认）
+      openingBreakouts: [],
+      openingBreakoutCoverage: null,
+      openingBreakoutsInitialized: false,
+      openingFeedDrag: null,
       breakoutSeenIds: {},         // 已通报过的突破信号（按 id 去重）
       breakoutInitDone: false,     // 突破信号首屏基线标记
       auto: { enabled: false, strategy: '', instances: [], proposals: [] },
       expandedAutoOrders: {},
+      autoBreakevenBusy: {},
       demoMode: (() => { try { return localStorage.getItem('demo_mode') === '1'; } catch (e) { return false; } })(),
       demoAutoInstances: [
         { inst_id: 'demo-nvda', enabled: true, last_order_budget: 200, last_order_risk: 198.9, last_order_qty: 90, last_order_stop: 208.22, symbol: 'NASDAQ:NVDA', strategy: 'ema9_pyramid', state: 'ACTIVE', side: 'short', source: 'manual_seed', entries: 2, avg_cost: 207.0931, entry_px: 207.0931, qty: 442, stop_px: 207.09, initial_risk_usd: 300, initial_r: 0.85, unlocked: true, breakeven_done: true, unrealized_r: 1.662, mfe_r: 3.2, second_mfe_r: 0.5, max_notional: 137820.69, max_position_pct: 63.28, lot_ids: ['demo-nvda-1', 'demo-nvda-2'] },
@@ -172,9 +196,23 @@ createApp({
       lastAutoEntryProposals: {}, // 已提醒过的开仓候选（按 proposal_id 去重）
       wbSymbol: '',               // 回测工作台：标的
       wbDay: '',                  // 回测工作台：交易日
+      wbStartTime: '09:45',       // 人工观察后启动执行实例的时间（ET）
+      wbModel: 'ema9_pyramid',
+      wbRiskUsd: 300,
+      wbEquity: 100000,
+      wbAutoBreakeven: true,
+      wbBreakevenR: 3,
+      wbAddUnlockR: 2,
       wbLoading: false,
       wbError: '',
       wb: null,                   // 回测会话状态（进度/实例/订单生命周期）
+      wbExpected: '',
+      wbReview: '',
+      wbExpectationSnapshot: '',
+      night: {}, nightBusy: false,
+      nightForm: { symbol: 'NASDAQ:NVDA', strategy: 'ema9_pyramid', session: '24h', risk_budget: 100, window_start: '20:00', window_end: '04:00' },
+      wbChartSelection: 0,
+      wbPrevious: null,
       decisionCollapsed: {},       // 连续同原因忽略组：默认折叠，点击展开
       btSymbol: '',               // 历史回测表单：标的
       btDay: '',                  // 历史回测表单：交易日（默认昨日）
@@ -207,6 +245,59 @@ createApp({
   },
 
   computed: {
+    openingBreakoutGroups() {
+      const groups = new Map();
+      for (const row of this.openingBreakouts) {
+        const barTime = this.openingBreakoutBarTime(row);
+        if (!groups.has(barTime)) groups.set(barTime, []);
+        groups.get(barTime).push(row);
+      }
+      return Array.from(groups, ([time, rows]) => ({
+        time, rows: rows.sort((a, b) => (b.body_atr ?? -1) - (a.body_atr ?? -1)),
+      }))
+        .sort((a, b) => b.time - a.time);
+    },
+    visibleMomentumRows() {
+      if (!this.momentumBreakoutsOnly) return this.momentum;
+      return {
+        long: this.momentum.long.filter(row => row.breakout_distance > 0),
+        short: this.momentum.short.filter(row => row.breakout_distance > 0),
+      };
+    },
+    wbStartTimes() {
+      return Array.from({ length: 24 * 12 }, (_, index) => {
+        const hour = String(Math.floor(index / 12)).padStart(2, '0');
+        const minute = String((index % 12) * 5).padStart(2, '0');
+        return hour + ':' + minute;
+      });
+    },
+    riskUsd() { return this.status.risk_per_trade_usd || 0; },
+    nightChart() {
+      const rows = (this.night.bars || []).slice(-90);
+      const fields = new Map((this.night.history_outputs || []).map(row => [row.time, row]));
+      const valid = value => typeof value === 'number' && Number.isFinite(value) && value > 0;
+      const prices = rows.flatMap(row => [row.high, row.low, fields.get(row.time)?.entry_price,
+        fields.get(row.time)?.long_stop, fields.get(row.time)?.short_stop]).filter(valid);
+      if (!rows.length || !prices.length) return { candles: [], paths: [], labels: [] };
+      const low = Math.min(...prices), high = Math.max(...prices), span = Math.max(high - low, 0.1);
+      const x = index => 30 + index * 920 / Math.max(rows.length - 1, 1);
+      const y = price => 230 - (price - low) / span * 205;
+      return {
+        candles: rows.filter(row => [row.open, row.high, row.low, row.close].every(valid)).map(row => {
+          const index = rows.indexOf(row), out = fields.get(row.time) || {};
+          return { x: x(index), top: y(Math.max(row.open, row.close)), bottom: y(Math.min(row.open, row.close)),
+            high: y(row.high), low: y(row.low), up: row.close >= row.open,
+            title: `${this.nightTime(row.time)} ET  O ${row.open} H ${row.high} L ${row.low} C ${row.close} | 方向 ${out.direction ?? '—'} 信号 ${out.entry_signal == null ? '—' : Number(out.entry_signal)} 参考 ${out.entry_price ?? '—'} 多止损 ${out.long_stop ?? '—'} 空止损 ${out.short_stop ?? '—'}` };
+        }),
+        paths: [['entry_price', '#eab85c', '入场参考价'], ['long_stop', '#54b892', '多头止损'], ['short_stop', '#ea7474', '空头止损']].map(([field, color, label]) => {
+          let gap = true;
+          const d = rows.map((row, i) => { const value = fields.get(row.time)?.[field];
+            if (!valid(value)) { gap = true; return ''; } const command = gap ? 'M' : 'L'; gap = false; return `${command}${x(i)},${y(value)}`; }).join(' ');
+          return { d, color, label };
+        }),
+        labels: [0, Math.floor(rows.length / 2), rows.length - 1].map(i => ({ x: x(i), text: this.nightTime(rows[i].time) })),
+      };
+    },
     equity() { return this.status.equity || 0; },
     // 总风险敞口占预算比例：>100% 红色、>80% 琥珀色、预算 0（不限制）不着色
     totalRiskClass() {
@@ -220,7 +311,56 @@ createApp({
         a.split(':').pop().localeCompare(b.split(':').pop()));
     },
     logPanelStyle() {
-      return { height: `${this.bottomPanelHeight}px`, flex: `0 1 ${this.bottomPanelHeight}px`, minHeight: '140px' };
+      if (this.bottomTab === 'instances') return { display: 'none' };
+      if (this.workspaceExpanded) return { flex: '1 1 auto', minHeight: '240px' };
+      return { height: `min(${this.bottomPanelHeight}px, 35vh)`, flex: `0 1 min(${this.bottomPanelHeight}px, 35vh)`, minHeight: '140px' };
+    },
+    selectedAutoModel() { return this.autoModels.find(m => m.id === this.autoModel) || {}; },
+    executionOverview() {
+      const rows = (this.auto && this.auto.instances) || [];
+      return {
+        active: rows.filter(i => i.enabled && i.state !== 'DONE').length,
+        blocked: rows.filter(i => i.recovery_block_reason || i.exit_requested_reason).length,
+        paused: rows.filter(i => !i.enabled && i.state !== 'DONE').length,
+      };
+    },
+    wbPriceChart() {
+      const rows = (this.wb && this.wb.replay_bars) || [];
+      if (!rows.length) return null;
+      const prices = rows.map(r => r.close).filter(Number.isFinite);
+      for (const row of rows) if (row.execution_stop > 0) prices.push(row.execution_stop);
+      const orders = this.wb.orders || [];
+      for (const order of orders) for (const key of ['filled', 'closed']) {
+        if (order[key] && Number.isFinite(order[key].px)) prices.push(order[key].px);
+      }
+      if (!prices.length) return null;
+      let low = Math.min(...prices), high = Math.max(...prices);
+      const margin = Math.max((high - low) * 0.12, 0.01); low -= margin; high += margin;
+      const x = index => 62 + index * 900 / Math.max(1, rows.length - 1);
+      const y = price => 215 - (price - low) * 185 / (high - low);
+      const point = (stamp, price) => {
+        const index = rows.findIndex(r => r.time === stamp);
+        return index < 0 ? null : { x: x(index), y: y(price), index };
+      };
+      const fills = [], exits = [];
+      for (const order of orders) {
+        const filled = order.filled && point(order.filled.t, order.filled.px);
+        const closed = order.closed && point(order.closed.t, order.closed.px);
+        if (filled) fills.push({ ...filled, lot_id: order.lot_id });
+        if (closed) exits.push({ ...closed, lot_id: order.lot_id });
+      }
+      const selected = Math.min(this.wbChartSelection, rows.length - 1);
+      let stopPath = '', penDown = false;
+      rows.forEach((row, index) => {
+        if (row.execution_stop > 0) { stopPath += `${penDown ? 'L' : 'M'}${x(index)},${y(row.execution_stop)} `; penDown = true; }
+        else penDown = false;
+      });
+      return { path: rows.map((r, i) => `${i ? 'L' : 'M'}${x(i)},${y(r.close)}`).join(' '),
+        stopPath,
+        signals: rows.flatMap((r, i) => r.entry_signal ? [{ x: x(i), y: y(r.close), index: i }] : []),
+        fills, exits, selected: { ...rows[selected], x: x(selected), y: y(rows[selected].close) },
+        ticks: [low, (low + high) / 2, high].map(price => ({ price, y: y(price) })),
+        first: rows[0].hm, last: rows[rows.length - 1].hm };
     },
     sortedScreenLong() { return this.sortScreenRows(this.screen.long); },
     sortedScreenShort() { return this.sortScreenRows(this.screen.short); },
@@ -335,11 +475,24 @@ createApp({
       }
       return groups;
     },
+    wbSelectedModel() {
+      return this.autoModels.find(model => model.id === this.wbModel) || {};
+    },
     autoView() {
       return this.demoMode
-        ? { enabled: true, strategy: 'ema9_pyramid', instances: this.demoAutoInstances, proposals: [] }
+        ? { enabled: true, strategy: 'ema9_pyramid', instances: this.demoAutoInstances.map(i => ({
+          ...i, execution_profile: 'ema9_legacy_pyramid', risk_budgets: [300, 200, 100],
+          auto_breakeven: true, breakeven_r: 3, add_unlock_r: 2,
+          start_direction: i.side === 'long' ? 1 : -1,
+        })), proposals: [] }
         : this.auto;
     },
+    orderedAutoInstances() {
+      // Sort a copy: snapshot order and relative order within each tier stay intact.
+      const priority = i => this.instanceHasPosition(i) ? 0 : this.instanceInactive(i) ? 2 : 1;
+      return [...(this.autoView.instances || [])].sort((a, b) => priority(a) - priority(b));
+    },
+    inactiveAutoCount() { return this.orderedAutoInstances.filter(i => this.instanceInactive(i)).length; },
     allowShort() { return this.status.allow_short !== false; },
     // 各服务器跟踪订单聚合（附加服务器名；follower 侧无映射的 master 单后端不会下发，无需补）
     copyOrders() {
@@ -417,7 +570,6 @@ createApp({
 
   // 参数持久化：单笔资金/最大仓位/FVG 时间窗口改动即写 localStorage（各浏览器独立）
   watch: {
-    riskUsd(v) { try { localStorage.setItem('risk_usd', String(v)); } catch (e) { /* 忽略 */ } },
     maxPositionPct(v) { try { localStorage.setItem('max_position_pct', String(v)); } catch (e) { /* 忽略 */ } },
     fvgWindow(v) { try { localStorage.setItem('fvg_window', String(v)); } catch (e) { /* 忽略 */ } },
     deckCollapsed(v) { try { localStorage.setItem('deck_collapsed', v ? '1' : '0'); } catch (e) { /* 忽略 */ } },
@@ -425,7 +577,13 @@ createApp({
   },
 
   mounted() {
+    try {
+      const saved = JSON.parse(localStorage.getItem('workspace_layouts') || '{}');
+      this.workspaceLayouts = saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
+    } catch (_) { this.workspaceLayouts = {}; }
     this.fetchAutoModels();
+    this.fetchNightStatus();
+    setInterval(() => { if (this.bottomTab === 'night') this.fetchNightStatus(); }, 2000);
     // 先确认本客户端身份（master 以服务端判定为准，不在前端猜 IP），未确认前每 5s 轮询
     this.checkIdentity();
     setInterval(() => this.checkIdentity(), 5000);
@@ -476,6 +634,88 @@ createApp({
   },
 
   methods: {
+    nightTime(ts) { return ts ? new Date(ts * 1000).toLocaleString('zh-CN', { timeZone: 'America/New_York', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }) : '—'; },
+    async fetchNightStatus() {
+      try { const response = await fetch('/api/night-test/status'); if (response.ok) this.night = await response.json(); } catch (_) { /* show current sample until connection returns */ }
+    },
+    async nightAction(action) {
+      if (this.nightBusy) return;
+      this.nightBusy = true;
+      try {
+        const body = action === 'connect' ? { symbol: this.nightForm.symbol.toUpperCase(), strategy: this.nightForm.strategy, session: this.nightForm.session }
+          : action === 'start' ? { risk_budget: this.nightForm.risk_budget, window_start: this.nightForm.window_start, window_end: this.nightForm.window_end } : {};
+        const response = await fetch(`/api/night-test/${action}`, { method: 'POST', headers: this.tradeHeaders(true), body: JSON.stringify(body) });
+        this.checkWrite403(response);
+        const result = await response.json();
+        if (!response.ok) throw new Error(typeof result.detail === 'string' ? result.detail : '测试请求失败');
+        this.night = result;
+      } catch (error) { this.$message.error(error.message || '测试请求失败'); }
+      finally { this.nightBusy = false; }
+    },
+    selectWorkspace(group, tab) {
+      if (this.workspaceTabs && !this.workspaceTabs[group]) return;
+      if (tab && !this.workspaceTabs[group].includes(tab)) return;
+      this.saveWorkspaceLayout();
+      this.workspaceGroup = group;
+      const saved = this.workspaceLayouts[group] || {};
+      this.bottomTab = tab || (this.workspaceTabs[group].includes(saved.tab) && saved.tab) || this.workspaceTabs[group][0];
+      this.workspaceExpanded = this.bottomTab === 'instances' ? false : tab ? true : (saved.expanded ?? true);
+      if (saved.height >= 180) this.bottomPanelHeight = saved.height;
+      this.onBottomTabChange(this.bottomTab);
+    },
+    saveWorkspaceLayout() {
+      this.workspaceLayouts[this.workspaceGroup] = { tab: this.bottomTab, expanded: this.workspaceExpanded, height: this.bottomPanelHeight };
+      try { localStorage.setItem('workspace_layouts', JSON.stringify(this.workspaceLayouts)); } catch (_) { /* presentation only */ }
+    },
+    toggleWorkspace() { this.workspaceExpanded = !this.workspaceExpanded; this.saveWorkspaceLayout(); },
+    profileName(profile) { return { single_entry: '单次建仓', ema9_legacy_pyramid: 'EMA9-ST-ATR 金字塔兼容' }[profile] || profile || '未提供'; },
+    instanceTitle(i) { return `${this.autoModelName(i.strategy)} / ${i.strategy_instance_id || 'default'} / ${i.symbol}`; },
+    instanceHasPosition(i) {
+      if (Number(i.qty) > 0) return true;
+      return this.autoLotRows(i).some(order => Number(order.filled_qty) > 0
+        && !['CLOSED', 'DONE', 'CANCELLED', 'FAILED'].includes(order.state));
+    },
+    instanceInactive(i) {
+      return i.state === 'DONE' && i.qty != null && Number(i.qty) === 0 && !this.instanceHasPosition(i)
+        && !(i.lot_ids || []).length && !i.pending_lot_id
+        && !i.exit_requested_reason && !i.recovery_block_reason;
+    },
+    instanceState(i) {
+      if (i.exit_requested_reason || i.state === 'CLOSING') return '退出中';
+      if (i.recovery_block_reason) return '恢复待核验';
+      if (i.state === 'DONE') return '已结束';
+      return { WATCHING: '等待信号', PENDING: '委托中', ACTIVE: '持仓中', AWAITING_CONFIRM: '等待确认' }[i.state] || i.state || '未知';
+    },
+    orderState(state) { return { ACTIVE: '持仓中', PENDING: '委托中', CLOSING: '退出中', CLOSED: '已平仓', DONE: '已结算', CANCELLED: '已撤单', FAILED: '失败' }[state] || state; },
+    entryOrderTypeText(order) {
+      return { MKT: '市价 MKT', LMT: '限价 LMT' }[order.entry_order_type] || '类型未记录';
+    },
+    instanceMaxEntries(i) { return Array.isArray(i.risk_budgets) ? i.risk_budgets.length : null; },
+    instanceRuleText(i) {
+      if (i.breakeven_done) return '已执行整组保本';
+      if (i.auto_breakeven == null) return '保本配置未提供';
+      if (!i.auto_breakeven) return '自动保本关闭';
+      return i.breakeven_r > 0 ? `自动保本门槛 ${i.breakeven_r}R` : '保本门槛未提供';
+    },
+    protectionText(order) {
+      if (order.state !== 'ACTIVE' || !order.filled_qty) return '未持仓 / 不适用';
+      if (this.demoMode && (order.lot_id || '').startsWith('demo-')) return '演示：非券商订单';
+      if (this.status.dry_run) return '模拟执行：无券商确认';
+      if (order.protection_restore_needed) return '保护单待恢复';
+      const status = order.protection_order_status;
+      if (['Submitted', 'PreSubmitted'].includes(status)) {
+        if (!(order.protection_order_qty >= order.filled_qty)) return `保护数量待核验（${order.protection_order_qty ?? '未知'}/${order.filled_qty}）`;
+        return `券商回报：已受理 ${status}${this.status.connected ? '' : ' · 当前连接已断开'}`;
+      }
+      return status ? `券商回报：${status}` : '券商确认未提供';
+    },
+    guardDemoOrder(row) {
+      if (this.demoMode || (row.lot_id || '').startsWith('demo-')) {
+        this.$message.info('实例与订单批次演示不执行交易操作');
+        return true;
+      }
+      return false;
+    },
     async fetchPerformance() {
       try {
         const r = await fetch('/api/performance');
@@ -497,14 +737,34 @@ createApp({
         document.removeEventListener('pointermove', this._panelResizeMove);
         document.removeEventListener('pointerup', this._panelResizeEnd);
         try { localStorage.setItem('bottom_panel_height', String(this.bottomPanelHeight)); } catch (e) { /* 忽略 */ }
+        this.saveWorkspaceLayout();
       };
       document.addEventListener('pointermove', this._panelResizeMove);
       document.addEventListener('pointerup', this._panelResizeEnd);
     },
 
     onBottomTabChange(name) {
+      if (this.workspaceLayouts) this.saveWorkspaceLayout();
+      if (name === 'shadow') this.loadStrategyShadow();
       if (name === 'returns' && !this.returnsData && !this.returnsLoading) {
         this.fetchReturnsComparison();
+      }
+    },
+
+    async loadStrategyShadow() {
+      if (this.strategyShadowLoading) return;
+      this.strategyShadowLoading = true;
+      this.strategyShadowError = '';
+      try {
+        const response = await fetch('/api/shadow/strategy-report?day=' + encodeURIComponent(this.strategyShadowDay || ''));
+        const report = await response.json();
+        if (!response.ok) throw new Error(typeof report.detail === 'string' ? report.detail : '影子复盘读取失败');
+        this.strategyShadowReport = report;
+      } catch (error) {
+        this.strategyShadowReport = null;
+        this.strategyShadowError = error.message;
+      } finally {
+        this.strategyShadowLoading = false;
       }
     },
 
@@ -836,6 +1096,8 @@ createApp({
 
     eventTypeText(t) {
       const m = {
+        execution_fill: '成交增量 / 均价核对',
+        pine_confirmation_unverified: '确认输出时间待核验',
         order_placed: '下单', order_closed: '平仓', order_close_requested: '平仓请求',
         order_close_failed: '平仓失败', order_cancelled: '撤单',
         order_cancel_failed: '撤单失败', position_scan_alert: '平仓提醒',
@@ -843,6 +1105,7 @@ createApp({
         external_position_alert: '外部订单/持仓提醒',
         pullback_event: '回踩事件', shadow_settled: '影子结算',
         breakout_signal: '盘前突破',
+        opening_range_breakout: '开盘小区间突破',
         midpoint_limit_repriced: '中点单改价', midpoint_limit_reprice_failed: '中点单改价失败',
         retest_limit_repriced: '回踩单改价', retest_limit_reprice_failed: '回踩单改价失败',
         lot_revived: '对账复活',
@@ -857,7 +1120,7 @@ createApp({
         auto_started: '实例启动', auto_stopped: '实例停止',
         auto_order_placed: '策略建仓', auto_filled: '策略成交',
         auto_order_failed: '策略下单失败', auto_expired: '埋单过期',
-        auto_breakeven: '移动保本', auto_trail: 'ST跟踪',
+        auto_breakeven: '移动保本', breakout_first_bar_protection: '突破首根K线保护', breakout_close_protection: '突破五分钟保护', auto_trail: 'ST跟踪',
         auto_reverse_close: '反向平仓', auto_done: '实例结束',
         auto_adopted: '收养人工仓',
         auto_entry_proposed: '开仓候选', auto_entry_approved: '确认开仓候选',
@@ -871,10 +1134,12 @@ createApp({
       if (i.state === 'CLOSING' || i.exit_requested_reason) return '退出中：撤单 / 平仓确认';
       if (i.recovery_block_reason) return i.recovery_block_reason;
       if (i.pending_lot_id || i.state === 'PENDING') return '等待挂单实际成交';
-      if (i.enabled === false) return '加仓已暂停，继续管理持仓';
-      if (!i.entries) return '等EMA9或手动首仓';
-      if (i.entries >= (i.risk_budgets?.length || 3)) return '仅管理，等整组退出';
-      const unlockR = i.add_unlock_r ?? this.pyramidAddUnlockR;
+      if (i.enabled === false) return '新入场已暂停，已有委托及保护/退出继续管理';
+      if (!i.entries) return `等待${this.autoModelName ? this.autoModelName(i.strategy) : '策略模型'}入场信号`;
+      if (!Array.isArray(i.risk_budgets) || !i.risk_budgets.length) return '执行上限未提供，仅显示已知状态';
+      if (i.entries >= i.risk_budgets.length) return '仅管理，等整组退出';
+      const unlockR = i.add_unlock_r;
+      if (!(unlockR > 0)) return '加仓门槛未提供';
       if (i.entries === 1 && !i.unlocked) return `等首仓达到${unlockR}R`;
       if (i.entries === 2 && !i.unlocked) return `等整组均价达到${unlockR}R`;
       if (i.entries === 2 && (i.second_mfe_r || 0) < 1) return '等第二仓达到1R';
@@ -921,6 +1186,39 @@ createApp({
       const ids = inst.lot_ids || [];
       return source.filter(l => ids.includes(l.lot_id));
     },
+    autoBreakevenKey(i) { return `${i.strategy || 'ema9_pyramid'}:${i.strategy_instance_id || 'default'}:${i.symbol}:${i.group_id || ''}`; },
+    autoBreakevenHint(i) {
+      if (this.demoMode) return '演示模式不执行真实保本';
+      if (this.autoBreakevenBusy[this.autoBreakevenKey(i)]) return '正在处理此交易组的保本请求';
+      if (i.state === 'DONE' || i.state === 'CLOSING' || i.exit_requested_reason) return '交易组已结束或正在退出';
+      if (i.recovery_block_reason) return '交易组恢复状态待核验，请先核对订单明细';
+      if (i.pending_lot_id || i.state === 'PENDING') return '请等待挂单成交或撤单确认后再保本';
+      if (!(i.qty > 0) || !(i.avg_cost > 0) || !i.group_id) return '等待实际持仓、成交均价和交易组信息';
+      if (i.breakeven_done) return '当前记录止损已至交易组成本或更有利，保护回报见订单明细';
+      return '';
+    },
+    async breakevenAutoInstance(i) {
+      const hint = this.autoBreakevenHint(i);
+      if (hint) { this.$message.info(hint); return; }
+      const key = this.autoBreakevenKey(i);
+      const body = { group_id: i.group_id, qty: i.qty, avg_cost: i.avg_cost };
+      this.autoBreakevenBusy[key] = true;
+      try {
+        await this.$confirm(`对象：${this.instanceTitle(i)}。本交易组 ${i.qty} 股，实际成交均价 ${i.avg_cost}。将该组已成交订单的保护止损收紧到交易组均价（按价格精度取整），保留更有利止损，不处理挂单。实际保护以券商回报为准。`, '整组保本确认', { type: 'warning', confirmButtonText: '确认保本', cancelButtonText: '取消' });
+        const response = await fetch(`/api/auto/instances/${encodeURIComponent(i.symbol)}/breakeven?strategy=${encodeURIComponent(i.strategy || 'ema9_pyramid')}&instance_id=${encodeURIComponent(i.strategy_instance_id || 'default')}`,
+          { method: 'POST', headers: this.tradeHeaders(true), body: JSON.stringify(body) });
+        this.checkWrite403(response);
+        const result = await response.json();
+        if (!response.ok) throw new Error(typeof result.detail === 'string' ? result.detail : '保本请求失败');
+        if (!result.ok) {
+          this.$message.warning(`部分保本修改未完成：${(result.failed || []).map(row => `${row.lot_id} ${row.reason}`).join('；')}。请核对订单明细，已成功的修改会保留。`);
+        } else {
+          this.$message.success(`保本价格 ${result.target_stop}：已提交 ${(result.updated || []).length} 笔，已在成本或更有利 ${(result.unchanged || []).length} 笔。实际保护回报见订单明细。`);
+        }
+      } catch (error) {
+        if (error !== 'cancel' && error !== 'close') this.$message.error(error.message || String(error));
+      } finally { delete this.autoBreakevenBusy[key]; }
+    },
     async stopAutoInstance(i, closePositions) {
       if (this.demoMode) {
         this.$message.info('演示模式不执行真实策略控制');
@@ -928,13 +1226,13 @@ createApp({
       }
       try {
         if (closePositions) {
-          await this.$confirm(`确认整组平掉 ${i.symbol.split(':').pop()}？`, '单票整组平仓', { type: 'warning' });
+          await this.$confirm(`对象：${this.instanceTitle(i)}。关联订单 ${(i.lot_ids || []).length} 笔，持仓 ${i.qty || 0} 股。将暂停新入场、撤销关联挂单并请求平仓；等待券商确认后才算完成。`, '退出此交易组', { type: 'warning' });
         }
         const r = await fetch(`/api/auto/instances/${encodeURIComponent(i.symbol)}/stop?close_positions=${closePositions}&strategy=${encodeURIComponent(i.strategy || 'ema9_pyramid')}&instance_id=${encodeURIComponent(i.strategy_instance_id || 'default')}`,
                               { method: 'POST', headers: this.tradeHeaders() });
         const d = await r.json();
         if (!r.ok) throw new Error(typeof d.detail === 'string' ? d.detail : '操作失败');
-        this.$message.success(closePositions ? '整组平仓已提交' : '已停止加仓');
+        this.$message.success(closePositions ? '此交易组退出请求已提交，等待撤单与成交确认' : '此实例新入场已暂停；已有委托及保护/退出继续管理');
       } catch (e) {
         if (e !== 'cancel') this.$message.error(e.message || String(e));
       }
@@ -949,13 +1247,12 @@ createApp({
                             '手动仓转全自动', { type: 'warning' });
         const r = await fetch('/api/auto/adopt', {
           method: 'POST', headers: this.tradeHeaders(true),
-          body: JSON.stringify({ symbol: row.symbol, lot_id: row.lot_id, strategy: this.autoModel, instance_id: this.autoInstanceId,
-                                initial_risk_usd: this.riskUsd }),
+          body: JSON.stringify({ symbol: row.symbol, lot_id: row.lot_id, strategy: this.autoModel, instance_id: this.autoInstanceId }),
         });
         const d = await r.json();
         if (!r.ok) throw new Error(typeof d.detail === 'string' ? d.detail : '接管失败');
         this.$message.success('已转全自动管理');
-        this.bottomTab = 'auto';
+        this.selectWorkspace('execution');
       } catch (e) {
         if (e !== 'cancel') this.$message.error(e.message || String(e));
       }
@@ -963,6 +1260,7 @@ createApp({
 
     // 策略：启动 / 停止 / 开仓候选决策
     async startAuto() {
+      if (this.autoBusy) return;
       if (this.demoMode) {
         this.$message.info('演示模式不会启动真实策略');
         return;
@@ -970,10 +1268,26 @@ createApp({
       this.autoBusy = true;
       try {
         const symbols = this.autoSymbols.split(',').map(s => s.trim()).filter(Boolean);
+        const request = { strategy: this.autoModel, instance_id: this.autoInstanceId, symbols };
+        const preview = await fetch('/api/auto/start/preview', {
+          method: 'POST', headers: this.tradeHeaders(true), body: JSON.stringify(request),
+        });
+        this.checkWrite403(preview);
+        const check = await preview.json();
+        if (!preview.ok) throw new Error(typeof check.detail === 'string' ? check.detail : '方向检查失败');
+        const directionText = value => value === 1 ? '多' : '空';
+        const targets = check.symbols.map(s => `${s} ${directionText(check.directions[s])}`).join('、');
+        try {
+          await this.$confirm(
+            `策略模型 ${check.model}，实例 ${request.instance_id}，首仓预算 $${check.risk}。QQQ 当前方向：${directionText(check.directions['NASDAQ:QQQ'])}。标的方向：${targets}。均与 QQQ 同向，确认启动？`,
+            '启动执行实例 · 二次确认', {
+              type: 'warning', confirmButtonText: '确认启动', cancelButtonText: '取消',
+              closeOnClickModal: false, autofocus: false,
+            });
+        } catch { return; }
         const r = await fetch('/api/auto/start', {
           method: 'POST', headers: this.tradeHeaders(true),
-          body: JSON.stringify({ strategy: this.autoModel, instance_id: this.autoInstanceId, symbols,
-                                params: { initial_risk_usd: this.riskUsd } }),
+          body: JSON.stringify({ ...request, symbols: check.symbols, confirmed_directions: check.directions }),
         });
         this.checkWrite403(r);
         const d = await r.json();
@@ -994,12 +1308,14 @@ createApp({
       }
       try {
         if (closePositions) {
-          await this.$confirm('确认停止策略并平掉全部存量持仓？', '停止并全平', { type: 'warning' });
+          const rows = (this.auto && this.auto.instances || []).filter(i => i.state !== 'DONE');
+          const details = rows.map(i => `${this.instanceTitle(i)}：持仓${i.qty || 0}股，关联订单${(i.lot_ids || []).length}笔`).join('；');
+          await this.$confirm(`作用于全部自动执行实例。将停止新入场、撤销关联挂单并请求退出关联持仓，不包含未接管的手动单。${details}。提交后仍需等待券商确认。`, '退出全部自动执行交易组', { type: 'warning' });
         }
         const r = await fetch(`/api/auto/stop?close_positions=${closePositions}`, { method: 'POST', headers: this.tradeHeaders() });
         this.checkWrite403(r);
         if (!r.ok) { const d = await r.json(); throw new Error(d.detail || '停止失败'); }
-        this.$message.success('已停止');
+        this.$message.success(closePositions ? '全部自动执行实例的退出请求已提交，请核对撤单与成交结果' : '全部实例已暂停新入场；已有委托及保护/退出继续管理');
       } catch (e) {
         if (e !== 'cancel') this.$message.error(e.message || String(e));
       }
@@ -1145,20 +1461,85 @@ createApp({
       this.decisionCollapsed[index] = !current;
     },
 
-    // 回测工作台（与实盘同一个 PyramidEngine，仅数据源/网关换成回放+模拟）
-    async wbLoad() {
-      this.wbLoading = true;
+    // 一次完成数据加载和独立模拟，不操作实盘或共享步进会话。
+    wbCopySettings() {
+      if (this.wbLoading) return;
+      this.wbModel = this.autoModel;
+      if (this.riskUsd > 0) this.wbRiskUsd = this.riskUsd;
+      if (this.equity > 0) this.wbEquity = this.equity;
+      this.wbAutoBreakeven = this.pyramidAutoBreakeven;
+      this.wbBreakevenR = this.pyramidBreakevenR;
+      this.wbAddUnlockR = this.pyramidAddUnlockR;
+    },
+    wbDirectionText(direction) {
+      return direction === 1 ? '多头' : direction === -1 ? '空头' : '中性 / 未知';
+    },
+    wbRiskPlan(params) {
+      return (params.risk_ratios || []).map(ratio => this.fmt2(ratio * params.initial_risk_usd)).join(' / $');
+    },
+    wbFocusTime(stamp) {
+      const index = ((this.wb && this.wb.replay_bars) || []).findIndex(row => row.time === stamp);
+      if (index >= 0) this.wbChartSelection = index;
+    },
+    wbReport() {
+      return { format_version: 1, result: this.wb, manual_review: {
+        expected: this.wbExpectationSnapshot || '', conclusion: this.wbReview || '未核对',
+      } };
+    },
+    downloadText(filename, content, type) {
+      const url = URL.createObjectURL(new Blob([content], { type }));
+      const link = document.createElement('a'); link.href = url; link.download = filename;
+      document.body.append(link); link.click(); link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    },
+    wbExportJson() {
+      if (this.wb) this.downloadText(`backtest-${this.wb.strategy}-${this.wb.day}.json`, JSON.stringify(this.wbReport(), null, 2), 'application/json;charset=utf-8');
+    },
+    wbExportPrevious() {
+      if (this.wbPrevious?.report) this.downloadText(`backtest-previous-${this.wbPrevious.day}.json`, JSON.stringify(this.wbPrevious.report, null, 2), 'application/json;charset=utf-8');
+    },
+    wbCsvCell(value) {
+      let text = value == null ? '' : String(value);
+      if (typeof value === 'string' && /^[=+\-@\t\r]/.test(text)) text = "'" + text;
+      return '"' + text.replace(/"/g, '""') + '"';
+    },
+    wbExportCsv() {
+      if (!this.wb) return;
+      const rows = [['策略模型', '执行配置', '标的', '交易日', '人工启动ET', '订单', '方向', '数量', '委托时间ET', '入场参考价', '初始止损', '成交时间ET', '成交价', '退出时间ET', '退出价', '退出原因', '盈亏美元', '实际R', '订单类型', '风险参考价']];
+      for (const o of this.wb.orders) rows.push([this.wb.model_name, this.wb.execution_profile, this.wb.symbol, this.wb.day, this.wb.run_context.start_time,
+        o.lot_id, o.side, o.qty, o.placed?.hm, o.placed?.limit, o.placed?.stop,
+        o.filled?.hm, o.filled?.px, o.closed?.hm, o.closed?.px, o.closed?.reason, o.pnl, o.rr,
+        o.entry_order_type || o.placed?.order_type || '', o.placed?.risk_reference]);
+      this.downloadText(`backtest-orders-${this.wb.day}.csv`, '\uFEFF' + rows.map(row => row.map(this.wbCsvCell).join(',')).join('\r\n'), 'text/csv;charset=utf-8');
+    },
+    async wbRun() {
+      if (this.wbLoading) return;
       this.wbError = '';
+      if (!(this.wbSymbol || '').trim()) { this.wbError = '请输入回测标的'; return; }
+      if (!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(this.wbStartTime || '')) {
+        this.wbError = '请选择执行实例启动时间（美东时间）'; return;
+      }
+      if (!(this.wbRiskUsd > 0) || !(this.wbEquity > 0)) {
+        this.wbError = '模拟初始资金和首仓风险预算必须大于 0'; return;
+      }
+      this.wbLoading = true;
+      if (this.wb) this.wbPrevious = { model_name: this.wb.model_name, symbol: this.wb.symbol,
+        day: this.wb.day, start_time: this.wb.run_context?.start_time, summary: { ...this.wb.summary }, report: this.wbReport() };
+      this.wb = null;
+      this.wbExpectationSnapshot = this.wbExpected;
+      this.wbReview = '';
+      this.wbChartSelection = 0;
       this.decisionCollapsed = {};
       try {
-        const r = await fetch('/api/bt/load', {
+        const params = { initial_risk_usd: this.wbRiskUsd, equity: this.wbEquity };
+        if (this.wbSelectedModel.execution_profile === 'ema9_legacy_pyramid') {
+          Object.assign(params, { pyramid_auto_breakeven: this.wbAutoBreakeven,
+            pyramid_breakeven_r: this.wbBreakevenR, pyramid_add_unlock_r: this.wbAddUnlockR });
+        }
+        const r = await fetch('/api/bt/run', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ symbol: this.wbSymbol || 'NVDA', day: this.wbDay || '',
-                                strategy: this.autoModel,
-                                params: { initial_risk_usd: this.riskUsd, equity: this.equity,
-                                          pyramid_auto_breakeven: this.autoModel === 'ema9_pyramid' && this.pyramidAutoBreakeven,
-                                          pyramid_breakeven_r: this.pyramidBreakevenR,
-                                          pyramid_add_unlock_r: this.pyramidAddUnlockR } }),
+          body: JSON.stringify({ symbol: this.wbSymbol.trim(), day: this.wbDay || '',
+            start_time: this.wbStartTime, strategy: this.wbModel, params }),
         });
         const d = await r.json();
         if (!r.ok) throw new Error(typeof d.detail === 'string' ? d.detail : '加载失败');
@@ -1168,22 +1549,6 @@ createApp({
       } finally {
         this.wbLoading = false;
       }
-    },
-    async wbStep(n) {
-      try {
-        const r = await fetch(`/api/bt/step?n=${n}`, { method: 'POST' });
-        const d = await r.json();
-        if (!r.ok) throw new Error(typeof d.detail === 'string' ? d.detail : '步进失败');
-        this.wb = d;
-      } catch (e) { this.$message.error(e.message || String(e)); }
-    },
-    async wbRunAll() {
-      try {
-        const r = await fetch('/api/bt/run_all', { method: 'POST' });
-        const d = await r.json();
-        if (!r.ok) throw new Error(typeof d.detail === 'string' ? d.detail : '运行失败');
-        this.wb = d;
-      } catch (e) { this.$message.error(e.message || String(e)); }
     },
     exitReasonText(r) {
       return { stop: '止损', trend_reverse: '趋势反向', eod: '收盘了结',
@@ -1215,15 +1580,10 @@ createApp({
       }
     },
 
-    // 盘前检查单：开面板时先展示最近一次落盘结果（非交易日可查看），
-    // 点「重新运行」实时重跑（/api/precheck，纯读无副作用）
+    // 打开盘前检查时读取当前状态，避免展示已恢复的历史红项。
     async openPrecheck() {
       this.precheckVisible = true;
-      if (this.precheck) return;
-      try {
-        const r = await fetch('/api/precheck/last');
-        if (r.ok) this.precheck = await r.json();
-      } catch (e) { /* 无历史记录 */ }
+      await this.runPrecheck();
     },
     async runPrecheck() {
       this.precheckLoading = true;
@@ -1288,6 +1648,7 @@ createApp({
           }
           // 盘前区间过滤开关跟快照走（全客户端同步）
           if (msg.status) {
+            this.screenOpeningRangeFilter = !!msg.status.screen_opening_range_filter;
             this.screenPmFilter = !!msg.status.screen_premarket_filter;
             this.fvgPmFilter = !!msg.status.fvg_premarket_filter;
             // 盘前新闻徽标联动：hot ticker → gist（tooltip）
@@ -1302,6 +1663,7 @@ createApp({
           this.lots = msg.lots || [];
           this.market = msg.market || {};
           this.logs = msg.logs || [];
+          this.momentum = msg.momentum || { long: [], short: [], ready_count: 0 };
           this.screen = msg.screen || { long: [], short: [] };
           this.scanAlerts = msg.scan_alerts || [];
           this.stopAlerts = msg.stop_alerts || [];
@@ -1315,6 +1677,8 @@ createApp({
           this.auto = msg.auto || { enabled: false, strategy: '', instances: [], proposals: [] };
           this.fvgMonitor = msg.fvg_monitor || { slots: [], retests: [] };
           this.breakoutSignals = msg.breakout_signals || [];   // 盘前突破信号（今日已确认）
+          this.openingBreakoutCoverage = msg.opening_breakout_coverage || null;
+          this.updateOpeningBreakouts(msg.opening_breakouts || []);
           this.clients = msg.clients || { pending: [], approved: [] };   // 客户端列表（master 审批条）
           this.copy = msg.copy || null;   // 跟单快照（缺段 = 后端未就绪，tab 容错提示）
           this.syncCopyDrafts();
@@ -1346,10 +1710,15 @@ createApp({
     },
 
     sortScreenRows(rows) {
-      const key = { divergence: 'divergence', duration: 'st_duration_bars', push: 'st_push_count', fvg: 'fvg_cum_count' }[this.screenSort];
+      const key = { divergence: 'divergence', duration: 'st_duration_bars', push: 'st_push_count', fvg: 'fvg_cum_count', slope: 'ema_slope_atr' }[this.screenSort];
       return [...rows].sort((a, b) => {
-        const av = a[key] ?? -Infinity;
-        const bv = b[key] ?? -Infinity;
+        const score = row => {
+          const value = row[key];
+          if (!Number.isFinite(value)) return -Infinity;
+          return this.screenSort === 'slope' && row.side === 'short' ? -value : value;
+        };
+        const av = score(a);
+        const bv = score(b);
         if (av !== bv) return bv - av;
         return (b.divergence ?? -1) - (a.divergence ?? -1);
       });
@@ -1477,7 +1846,7 @@ createApp({
         if (n.event === 'pyramid_order_placed') {
           title = `${action}已提交`;
           text = `${spelled} ${side}${action}已提交，等待成交`;
-          message = `${ticker} ${side} ${n.qty || 0} 股，限价 ${n.entry_px}，止损 ${n.stop_px}，等待成交`;
+          message = `${ticker} ${side} ${n.qty || 0} 股，${this.entryOrderTypeText(n)}，Pine 参考价 ${n.entry_px}，止损 ${n.stop_px}，等待成交`;
         } else if (n.event === 'pyramid_entry_filled') {
           title = `${action}已成交`;
           text = `${spelled} ${side}${action}已成交`;
@@ -1538,6 +1907,14 @@ createApp({
         if (this.lastFvgReverseAlert[key]) continue;
         this.lastFvgReverseAlert[key] = true;
         const spelled = (a.ticker || '').split('').join(' ');
+        if (a.kind === 'reverse_warning') {
+          this.$notify({
+            title: '反向 FVG 提醒',
+            message: `${a.ticker} 出现反向 FVG，当前浮亏 $${Math.abs(a.pnl)}。`,
+            type: 'warning',
+          });
+          continue;
+        }
         if (a.kind === 'profit_lock') {
           this.speak(`${spelled} 出现反向 F V G，已保本，建议平仓锁定利润`);
           this.$confirm(
@@ -1668,6 +2045,54 @@ createApp({
         `${s.ticker.split('').join(' ')} ${s.side === '跌破低点' ? '跌破盘前低点' : '站上盘前高点'}`);
       this.speak(`盘前突破，${parts.join('，')}`);
     },
+    updateOpeningBreakouts(rows) {
+      const previous = new Map(this.openingBreakouts.map(row => [row.id, row.status]));
+      const previousTime = this.openingBreakoutGroups[0]?.time ?? 0;
+      this.openingBreakouts = rows;
+      if ((this.openingBreakoutGroups[0]?.time ?? 0) > previousTime) {
+        this.openingFeedDrag = null;
+        this.$nextTick(this.scrollOpeningFeedToLatest);
+      }
+      if (!this.openingBreakoutsInitialized) {
+        this.openingBreakoutsInitialized = true;
+        return;
+      }
+      const fresh = rows.filter(row => {
+        const before = previous.get(row.id);
+        if (row.status === 'preview') return before === undefined;
+        if (row.status === 'confirmed') return before !== 'confirmed';
+        return ['submitted', 'submission_failed'].includes(row.status) && before !== row.status;
+      });
+      if (!fresh.length) return;
+      const summaries = fresh.map(row => `${row.ticker} ${row.side === 'long' ? '上破' : '下破'} ${this.openingBreakoutStatus(row)}`);
+      this.$notify({
+        title: '开盘小区间突破',
+        message: summaries.slice(0, 5).join(' · ') + (fresh.length > 5 ? ` · 共 ${fresh.length} 个，查看小区间突破页` : ''),
+        type: 'info', duration: 8000, position: 'bottom-right',
+      });
+    },
+    scrollOpeningFeedToLatest() {
+      const feed = this.$refs.openingFeed;
+      if (feed) feed.scrollLeft = 0;
+    },
+    startOpeningFeedDrag(event) {
+      const feed = event.currentTarget;
+      if (event.pointerType !== 'mouse' || event.button !== 0
+          || event.target.closest('button, a') || feed.scrollWidth <= feed.clientWidth
+          || event.clientY >= feed.getBoundingClientRect().top + feed.clientHeight) return;
+      feed.setPointerCapture(event.pointerId);
+      this.openingFeedDrag = {
+        pointerId: event.pointerId, startX: event.clientX, scrollLeft: feed.scrollLeft,
+      };
+    },
+    moveOpeningFeedDrag(event) {
+      const drag = this.openingFeedDrag;
+      if (drag?.pointerId !== event.pointerId) return;
+      event.currentTarget.scrollLeft = drag.scrollLeft + drag.startX - event.clientX;
+    },
+    endOpeningFeedDrag(event) {
+      if (this.openingFeedDrag?.pointerId === event.pointerId) this.openingFeedDrag = null;
+    },
     dismissFvgFeed(id) {
       this.fvgFeed = this.fvgFeed.filter(c => c.id !== id);
     },
@@ -1759,6 +2184,8 @@ createApp({
     // 止损 = 现价 ∓ atrMult×ATR（锚定预期成交价而非含溢价限价，与服务端一致；atrMult = 全局止损倍数），
     // 股数按以损定量；服务端会按实时价重新定价，浏览器价仅供参考
     async chaseFvg(ev, force = false, forceReason = '') {
+      if (this.placing && !force) return;
+      if (this.hasAutoPosition(ev.symbol)) return this.$message.warning('该标的已有自动策略仓位，禁止手动加仓');
       const bar = this.market[ev.symbol] && this.market[ev.symbol].bar;
       const close = bar && bar.close;
       if (!close || close <= 0) return this.$message.warning('无实时行情，无法追价');
@@ -1768,26 +2195,32 @@ createApp({
       // 止损 = 智能止损口径（smart_stop 指标优先）：现价 ∓ 距离（多−/空+）
       const symData = this.market[ev.symbol] || {};
       const dist = this.smartStopDist(symData, ev.side, close, ev.atr);
-      const stop = +(isLong ? close - dist : close + dist).toFixed(2);
+      const opening = this.openingManualStop(bar, ev.side);
+      const stop = opening ? opening.price : +(isLong ? close - dist : close + dist).toFixed(2);
+      if (!(stop > 0 && (isLong ? stop < close : stop > close))) {
+        return this.$message.warning('当前行情无法形成有效止损，暂不能追价');
+      }
       // 以损定量用现价（预期成交价）为参考价，溢价限价不进风险口径（与服务端一致）
       const pos = calcPosition(this.equity, this.riskUsd, close, stop, this.maxPositionPct, this.status.max_order_qty || 0);
       if (!pos.qty) return this.$message.warning('以损定量结果为 0 股，无法下单');
-      if (!force) {
-        try {
-          await this.$confirm(
-            `市价追${isLong ? '多' : '空'} ${ticker} ×${pos.qty} 股 @≈${limit}，止损 ${stop}（风险 $${pos.risk}），确认下单？`,
-            'FVG 追价确认', { type: 'warning' });
-        } catch { return; }   // 取消：不下单
-      }
+      this.placing = true;
       try {
+        if (!force) {
+          try {
+            await this.$confirm(
+              `市价追${isLong ? '多' : '空'} ${ticker} ×${pos.qty} 股 @≈${limit}，止损 ${stop}（风险 $${pos.risk}），确认下单？`,
+              'FVG 追价确认', { type: 'warning' });
+          } catch { return; }
+        }
         const body = {
           symbol: ev.symbol, side: ev.side, qty: pos.qty,
           limit_px: limit, stop_px: stop,
           limit_type: 'chase',
           reason: force && forceReason ? `FVG追价（执意开仓：${forceReason}）` : 'FVG追价',
-          risk_usd: this.riskUsd, force,
+          force,
           max_position_pct: this.maxPositionPct,
         };
+        if (!await this.confirmSlowMarketEntry(body)) return;
         const r = await fetch('/api/lots/limit-stop', {
           method: 'POST', headers: this.tradeHeaders(true),
           body: JSON.stringify(body),
@@ -1807,6 +2240,8 @@ createApp({
         this.$message.success(`已追价下单 ${lot.lot_id}（${lot.symbol} ${lot.side} x${lot.qty} @${lot.entry_px}，止损 ${lot.stop_px}）`);
       } catch (e) {
         this.$message.error(e.message || String(e));
+      } finally {
+        this.placing = false;
       }
     },
 
@@ -1862,8 +2297,10 @@ createApp({
         this.checkWrite403(r);
         const data = await r.json();
         if (!r.ok) throw new Error(typeof data.detail === 'string' ? data.detail : '保存失败');
-        this.$message.success(`盘前区间过滤已${v ? '开启' : '关闭'}（全局生效）`);
+        const label = key === "screen_opening_range_filter" ? "小区间过滤" : "盘前区间过滤";
+        this.$message.success(`${label}已${v ? '开启' : '关闭'}（全局生效）`);
       } catch (e) {
+        if (key === 'screen_opening_range_filter') this.screenOpeningRangeFilter = !v;
         if (key === 'screen_premarket_filter') this.screenPmFilter = !v;
         if (key === 'fvg_premarket_filter') this.fvgPmFilter = !v;
         this.$message.error(e.message || String(e));
@@ -1993,7 +2430,7 @@ createApp({
     // 同时 CDP 联动本机 TV 桌面端第一个 pane 切到该标的（失败静默降级）
     pickScreen(r) {
       this.slots[0].symbol = r.symbol;
-      this.$message.success(`已选中 ${r.ticker}（${r.side === 'long' ? '多' : '空'} 发散 ${r.divergence}）`);
+      this.$message.success(`已选中 ${r.ticker}`);
       this.tvShow(r.symbol);
     },
 
@@ -2091,6 +2528,17 @@ createApp({
       return Math.min(Math.max(logical, lo), hi);
     },
 
+    openingManualStop(bar, side, now = new Date()) {
+      const et = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+      }).format(now);
+      if (et < '09:30' || et >= '09:40') return null;
+      const age = now.getTime() / 1000 - bar.time;
+      const value = side === 'long' ? bar.low : side === 'short' ? bar.high : null;
+      return { price: age >= 0 && age < 300 && bar.low > 0 && bar.high >= bar.low
+        && Number.isFinite(value) ? +value.toFixed(2) : null };
+    },
+
     calcSlot(slot) {
       const data = this.market[slot.symbol];
       const empty = {
@@ -2135,8 +2583,11 @@ createApp({
       // 其余类型 = 智能止损（与服务端 _smart_stop_dist 同公式）：逻辑止损点
       // （最近三根 K 线极值，多=最低点/空=最高点，含当前 bar），钳制在
       // 1×ATR ~ atrMult×ATR（atrMult = 全局上限倍数，快照同步）
+      const opening = this.openingManualStop(bar, side);
       let stopPx;
-      if (slot.limitType === 'retest') {
+      if (opening) {
+        stopPx = opening.price;
+      } else if (slot.limitType === 'retest') {
         const v = side === 'long' ? barC2.low : (side === 'short' ? barC2.high : null);
         stopPx = v != null ? +v.toFixed(2) : null;
       } else {
@@ -2147,7 +2598,8 @@ createApp({
       }
 
       // 震荡（trendState=0）也放行：与服务端闸门一致，方向由 ST direction 决定
-      const ready = !!(side && limitPx && limitPx > 0 && stopPx && stopPx > 0);
+      const ready = !!(side && limitPx && limitPx > 0 && stopPx && stopPx > 0
+        && (!opening || (side === 'long' ? stopPx < limitPx : stopPx > limitPx)));
       const pos = ready ? calcPosition(this.equity, this.riskUsd, limitPx, stopPx, this.maxPositionPct, this.status.max_order_qty || 0) : { qty: 0, amount: 0, risk: 0 };
       // 资金占比 = 占用金额 / 净值（%）
       const equityRatio = this.equity > 0 && pos.amount > 0 ? +((pos.amount / this.equity) * 100).toFixed(1) : 0;
@@ -2223,8 +2675,122 @@ createApp({
       } catch { return null; }
     },
 
+    async confirmSlowMarketEntry(order, now = new Date()) {
+      const et = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+      }).format(now);
+      if (et < '09:40') return true;
+      const ticker = this.tickerOf(order.symbol);
+      const side = order.side === 'short' ? '做空' : '做多';
+      const terms = order.openingBreakout
+        ? `，市价入场，止损 ${order.stop_px.toFixed(2)}，股数按提交时现价和风险预算计算`
+        : ` × ${order.qty} 股`;
+      try {
+        await this.$confirm(
+          `美东 ${et}，已过开盘十分钟。当前属于慢速行情，手动交易亏钱概率极大。确认继续${side} ${ticker}${terms}？`,
+          '慢速行情 · 手动交易二次确认', {
+            type: 'warning', confirmButtonText: '确认继续下单', cancelButtonText: '取消下单',
+            closeOnClickModal: false, autofocus: false,
+          });
+        return true;
+      } catch { return false; }
+    },
+
+    hasAutoPosition(symbol) {
+      const ticker = this.tickerOf(symbol);
+      return this.lots.some(lot => this.tickerOf(lot.symbol) === ticker &&
+        ['ACTIVE', 'PENDING', 'CLOSING'].includes(lot.state) && lot.filled_qty > 0 &&
+        (lot.trader === 'auto' || lot.limit_type?.startsWith('auto_') ||
+          lot.signal_snapshot?.strategy_id || lot.signal_snapshot?.auto_strategy || lot.signal_snapshot?.pyramid_seed));
+    },
+
+    openingBreakoutBarTime(row) {
+      return row.bar_time ?? row.time - 300;
+    },
+
+    openingBreakoutStatus(row) {
+      return ({
+        preview: '盘中预选', preview_wait: '暂不达标', confirming: '等待收盘数据',
+        armed: '已预约 · 收盘达标才开仓', confirmed: '收盘确认',
+        invalid: '已失效', submitting: '正在提交', submitted: '已提交开仓',
+        submission_failed: '提交未成功',
+      })[row.status] || '收盘确认';
+    },
+
+    openingBreakoutActionLabel(row) {
+      if (row.status === 'armed') return '撤销预约';
+      if (row.status === 'preview') return '预约收盘开仓';
+      return row.side === 'long' ? '市价做多' : '市价做空';
+    },
+
+    openingBreakoutEntryDisabled(row) {
+      if (this.demoMode || this.placing) return true;
+      if (row.status === 'armed') return false;
+      if (row.status && !['preview', 'confirmed'].includes(row.status)) return true;
+      const confirmedAt = row.confirmed_at || row.time;
+      if (row.status !== 'preview' && this.now >= confirmedAt + 20) return true;
+      return !row.stop_px || this.hasAutoPosition(row.symbol)
+        || this.lots.some(lot => lot.signal_snapshot?.opening_breakout_id === row.id);
+    },
+
+    async prepareOpeningBreakout(row) {
+      if (this.openingBreakoutEntryDisabled(row)) return;
+      const cancel = row.status === 'armed';
+      this.placing = true;
+      try {
+        if (!cancel) {
+          try {
+            await this.$confirm(
+              `预约 ${row.ticker} ${row.side === 'long' ? '做多' : '做空'}。开盘已过十分钟，请确认当前行情适合交易。仅当美东 ${this.hmET(this.openingBreakoutBarTime(row))} 这根 5 分钟 K 线收盘仍符合原方向突破标准时，才提交市价单。初始止损取信号实体中点；入场所在的 5 分钟 K 线收盘后移至信号收盘价，不做1R保本，第三根收盘退出。10:30起停止下单，最多同时5笔突破订单。`,
+              '确认预约收盘开仓', {
+                type: 'warning', confirmButtonText: '确认预约', cancelButtonText: '取消',
+                closeOnClickModal: false, autofocus: false,
+              });
+          } catch { return; }
+        }
+        const response = await fetch('/api/lots/opening-breakout/prepare', {
+          method: 'POST', headers: this.tradeHeaders(true),
+          body: JSON.stringify({
+            signal_id: row.id, side: row.side, cancel, max_position_pct: this.maxPositionPct,
+          }),
+        });
+        this.checkWrite403(response);
+        const data = await response.json();
+        if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : '预约操作失败');
+        this.$message.success(cancel ? '已撤销预约' : '已预约，等待这根 K 线收盘');
+      } catch (error) {
+        this.$message.error(error.message || String(error));
+      } finally {
+        this.placing = false;
+      }
+    },
+
+    async placeOpeningBreakout(row) {
+      if (['preview', 'armed'].includes(row.status)) return this.prepareOpeningBreakout(row);
+      if (this.openingBreakoutEntryDisabled(row)) return;
+      if (this.hasAutoPosition(row.symbol)) return this.$message.warning('该标的已有自动策略仓位，禁止手动加仓');
+      this.placing = true;
+      try {
+        if (!await this.confirmSlowMarketEntry({ ...row, openingBreakout: true })) return;
+        const response = await fetch('/api/lots/opening-breakout', {
+          method: 'POST', headers: this.tradeHeaders(true),
+          body: JSON.stringify({ signal_id: row.id, max_position_pct: this.maxPositionPct }),
+        });
+        this.checkWrite403(response);
+        const data = await response.json();
+        if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : data.detail?.msg || '下单失败');
+        this.$message.success(`已提交市价开仓 ${row.ticker} × ${data.lot.qty} 股，止损 ${data.lot.stop_px}`);
+      } catch (error) {
+        this.$message.error(error.message || String(error));
+      } finally {
+        this.placing = false;
+      }
+    },
+
     async placeOrder(slot, force = false, forceReason = '') {
-      if (!slot.ready) return this.$message.warning('数据不完整，无法下单');
+      if (this.placing && !force) return;
+      if (this.hasAutoPosition(slot.symbol)) return this.$message.warning('该标的已有自动策略仓位，禁止手动加仓');
+      if (!slot.ready || !(slot.qty > 0)) return this.$message.warning('行情或风险定量未就绪，无法下单');
       this.placing = true;
       try {
         const ticker = slot.symbol.split(':').pop();
@@ -2234,9 +2800,10 @@ createApp({
           symbol: slot.symbol, side: slot.side, qty: slot.qty,
           limit_px: slot.limitPx, stop_px: slot.stopPx,
           limit_type: slot.limitType, reason,
-          risk_usd: this.riskUsd, force,
+          force,
           max_position_pct: this.maxPositionPct,
         };
+        if (!await this.confirmSlowMarketEntry(body)) return;
         const r = await fetch('/api/lots/limit-stop', {
           method: 'POST', headers: this.tradeHeaders(true),
           body: JSON.stringify(body),
@@ -2288,6 +2855,7 @@ createApp({
     },
 
     async cancelLot(row) {
+      if (this.guardDemoOrder(row)) return;
       try {
         await this.$confirm(`确认撤销批次 ${row.lot_id}（${row.symbol}）？`, '撤单确认', { type: 'warning' });
       } catch { return; }
@@ -2302,6 +2870,7 @@ createApp({
     },
 
     async closeLot(row) {
+      if (this.guardDemoOrder(row)) return;
       try {
         await this.$confirm(
           `确认平仓批次 ${row.lot_id}（${row.symbol} ${row.side} x${row.filled_qty || row.qty}）？`,
@@ -2318,6 +2887,7 @@ createApp({
     },
 
     async breakevenLot(row) {
+      if (this.guardDemoOrder(row)) return;
       try {
         await this.$confirm(
           `确认手动保本 ${row.lot_id}（${row.symbol} ${row.side} x${row.filled_qty || row.qty}）？止损将移到实际成本价 ${row.avg_fill || row.entry_px}`,
@@ -2334,6 +2904,7 @@ createApp({
     },
 
     async closeHalf(row) {
+      if (this.guardDemoOrder(row)) return;
       const half = Math.floor((row.filled_qty || row.qty) / 2);
       const remain = (row.filled_qty || row.qty) - half;
       try {

@@ -1,14 +1,229 @@
 """signals application functions and owned state. No console.app dependency."""
 
 from typing import Optional
+
+from fastapi import HTTPException
 import asyncio
 import time
+from datetime import datetime
 from console.shared import logger
+from console.schemas import OpeningBreakoutOrderRequest
+from domain.contracts import finite_number
+from engine.opening_range import beyond_opening_range, opening_range
+from engine.opening_breakout import CURRENT_RULES, evaluate_breakout
+from console.services.strategy_shadow import ET
+
+
+BREAKOUT_CONFIRM_GRACE_SECONDS = 20
 
 
 class SignalsService:
+    _breakout_policy = CURRENT_RULES
+
     def __init__(self, context):
         self.context = context
+        self._opening_breakout_state = {}
+        self._opening_breakouts = []
+        self._opening_breakout_day = None
+        self._opening_previews = {}
+        self._opening_orders = {}
+
+    def opening_breakouts(self, now: float) -> list:
+        if self._opening_breakout_day != datetime.fromtimestamp(now, ET).date():
+            return []
+        return sorted(self._opening_breakouts, key=lambda row: (-row["time"], row["symbol"]))
+
+    def opening_breakout_coverage(self, symbols, now: float) -> dict | None:
+        local = datetime.fromtimestamp(now, ET)
+        first = int(local.replace(hour=9, minute=40, second=0, microsecond=0).timestamp())
+        end = int(local.replace(hour=10, minute=30, second=0, microsecond=0).timestamp())
+        target = min(int(now) // 300 * 300, end)
+        if local.weekday() >= 5 or target <= first:
+            return None
+        pending = [
+            symbol for symbol in symbols
+            if self._opening_breakout_day != local.date()
+            or self._opening_breakout_state.get(symbol, (0, None))[0] < target - 300
+        ]
+        return {"total": len(symbols), "pending": pending, "through": target}
+
+    def _opening_breakout_bars(self, market: dict, now: float):
+        local = datetime.fromtimestamp(now, ET)
+        first = int(local.replace(hour=9, minute=40, second=0, microsecond=0).timestamp())
+        end = int(local.replace(hour=10 if self._breakout_policy.morning_only else 16,
+                                minute=30 if self._breakout_policy.morning_only else 0,
+                                second=0, microsecond=0).timestamp())
+        if local.weekday() >= 5:
+            return
+        for symbol, data in market.items():
+            history = data.get("opening_breakout_history")
+            if history is None:
+                yield symbol, data, now
+                continue
+            previous = self._opening_breakout_state.get(symbol, (first - 300, None))[0]
+            eligible = {
+                row[0]: row for row in history
+                if first <= row[0] < end and row[0] + 300 <= now and row[0] > previous
+            }
+            for time in range(previous + 300, min(int(now), end), 300):
+                row = eligible.get(time)
+                if row is None:
+                    break
+                _, open_px, high, low, close, sma, wilder, zone_high, zone_low = row[:9]
+                body_ema = row[10] if len(row) > 10 else None
+                engulfing = row[11] if len(row) > 11 else None
+                context = row[12] if len(row) > 12 and isinstance(row[12], dict) else {}
+                yield symbol, {
+                    "bar": {"time": time + 300},
+                    "bar_c": {"time": time, "open": open_px, "high": high, "low": low,
+                              "close": close, "atr_sma10": sma, "body_ema10": body_ema, "prior_engulfing4": engulfing, **context},
+                    "ts_c": {"time": time, "atr": wilder},
+                    "attack_c": {"time": time, "opening3High": zone_high, "opening3Low": zone_low},
+                }, time + 300
+                if self._opening_breakout_state.get(symbol, (0, None))[0] != time:
+                    break
+
+    def _scan_opening_breakouts(self, market: dict, now: float) -> None:
+        day = datetime.fromtimestamp(now, ET).date()
+        if self._opening_breakout_day != day:
+            self._opening_breakout_day = day
+            self._opening_breakout_state.clear()
+            self._opening_breakouts.clear()
+            self._opening_previews.clear()
+            self._opening_orders.clear()
+
+        for symbol, data, as_of in self._opening_breakout_bars(market, now):
+            zone = opening_range(data, as_of=as_of, include_session_close=True)
+            if zone is None or zone[0] <= zone[1]:
+                continue
+            bar = data["bar_c"]
+            bar_time = bar["time"]
+            previous_time, previous_side = self._opening_breakout_state.get(symbol, (0, None))
+            if bar_time <= previous_time:
+                continue
+            if self._breakout_policy.first_signal_only and any(
+                row["symbol"] == symbol for row in self._opening_breakouts
+            ):
+                self._opening_breakout_state[symbol] = (bar_time, previous_side)
+                continue
+            evaluation = self._evaluate_opening_breakout(symbol, bar, data.get("ts_c") or {}, zone)
+            if evaluation is None:
+                continue
+            side, signal = evaluation
+            self._opening_breakout_state[symbol] = (
+                bar_time, previous_side if side == previous_side else None,
+            )
+            if signal is None or side == previous_side:
+                continue
+            self._opening_breakout_state[symbol] = (bar_time, side)
+            self._opening_breakouts.append(signal)
+            self.context.events.record_event("opening_range_breakout", **signal)
+
+    def _evaluate_opening_breakout(self, symbol, bar, study, zone):
+        return evaluate_breakout(symbol, bar, study, zone, self._breakout_policy)
+
+    def _opening_preview(self, symbol, data, now):
+        zone = opening_range(data, as_of=now)
+        if zone is None or zone[0] <= zone[1]:
+            return None
+        bar = data["bar"]
+        if self._breakout_policy.first_signal_only and any(
+            row["symbol"] == symbol for row in self._opening_breakouts
+        ):
+            return None
+        # A preview cannot bypass an unprocessed earlier candle or the episode dedup.
+        previous_time, previous_side = self._opening_breakout_state.get(symbol, (0, None))
+        if previous_time != bar["time"] - 300:
+            return None
+        evaluation = self._evaluate_opening_breakout(symbol, bar, data.get("ts") or {}, zone)
+        if evaluation and evaluation[0] != previous_side:
+            return evaluation[1]
+        return None
+
+    def opening_breakout_display(self, now):
+        confirmed = self.opening_breakouts(now)
+        if self._opening_breakout_day != datetime.fromtimestamp(now, ET).date():
+            return confirmed
+        rows = {key: dict(row) for key, row in self._opening_previews.items()}
+        for row in confirmed:
+            rows[row["id"]] = {**row, "status": "confirmed"}
+        for key, order in self._opening_orders.items():
+            if key in rows:
+                rows[key].update(status=order["status"], status_detail=order.get("detail"))
+        return sorted(rows.values(), key=lambda row: (-row["time"], row["symbol"]))
+
+    def prepare_opening_breakout(self, req, trader):
+        now = time.time()
+        if req.cancel:
+            order = self._opening_orders.get(req.signal_id)
+            if not order or order["trader"] != trader or order["status"] != "armed" or now >= order["time"]:
+                raise HTTPException(409, "当前预约已无法撤销")
+            del self._opening_orders[req.signal_id]
+            return {"status": "cancelled"}
+        row = self._opening_previews.get(req.signal_id)
+        if not row or not now < row["time"] or row["status"] != "preview" or row["side"] != req.side:
+            raise HTTPException(409, "该预选信号已失效或进入收盘确认")
+        close_et = datetime.fromtimestamp(row["time"], ET)
+        if close_et.hour >= 16:
+            raise HTTPException(409, "该 K 线收盘时常规交易已结束，无法预约开仓")
+        market = self.context.collector.latest()
+        current = self._opening_preview(row["symbol"], market.get(row["symbol"], {}), now)
+        if not current or current["id"] != row["id"] or current["side"] != row["side"]:
+            raise HTTPException(409, "当前行情已不符合预选条件")
+        if req.signal_id in self._opening_orders:
+            raise HTTPException(409, "该信号已有预约")
+        self._opening_orders[req.signal_id] = {
+            "status": "armed", "side": row["side"], "time": row["time"],
+            "trader": trader, "max_position_pct": req.max_position_pct,
+        }
+        return {"status": "armed"}
+
+    async def _update_opening_previews(self, market, now):
+        if self._opening_breakout_day != datetime.fromtimestamp(now, ET).date():
+            return
+        confirmed = {row["id"]: row for row in self._opening_breakouts}
+        for key, preview in sorted(self._opening_previews.items(), key=lambda item: (item[1]["time"], -item[1].get("body_atr", 0), item[0])):
+            if now < preview["time"]:
+                preview["status"] = "preview_wait"
+                continue
+            signal = confirmed.get(key)
+            processed = self._opening_breakout_state.get(preview["symbol"], (0, None))[0]
+            order = self._opening_orders.get(key)
+            if signal is None and processed < preview["time"] - 300 and now < preview["time"] + BREAKOUT_CONFIRM_GRACE_SECONDS:
+                preview["status"] = "confirming"
+                continue
+            preview["status"] = "invalid" if signal is None else "confirmed"
+            if not order or order["status"] != "armed":
+                continue
+            bar = (self.context.collector.latest().get(preview["symbol"], {}).get("bar") or {})
+            if signal is None or signal["side"] != order["side"]:
+                order.update(status="invalid", detail="收盘未确认预约方向，未下单")
+            elif (time.time() >= signal["time"] + BREAKOUT_CONFIRM_GRACE_SECONDS
+                  or bar.get("time") != signal["time"]):
+                order.update(status="invalid", detail="收盘确认已超时，未下单")
+            else:
+                order["status"] = "submitting"
+                try:
+                    await self.context.trading.api_place_opening_breakout(
+                        OpeningBreakoutOrderRequest(signal_id=key, max_position_pct=order["max_position_pct"]),
+                        order["trader"], deadline=signal["time"] + BREAKOUT_CONFIRM_GRACE_SECONDS,
+                    )
+                except HTTPException as exc:
+                    order.update(status="submission_failed", detail=str(exc.detail))
+                except Exception:
+                    logger.exception("小区间突破预约提交异常 %s", key)
+                    order.update(status="submission_failed", detail="提交结果未确认，请查订单明细")
+                else:
+                    order["status"] = "submitted"
+
+        for symbol, data in market.items():
+            row = self._opening_preview(symbol, data, now)
+            if row is None:
+                continue
+            order = self._opening_orders.get(row["id"])
+            if order and order["side"] != row["side"]:
+                continue
+            self._opening_previews[row["id"]] = {**row, "status": "preview"}
 
     def _shadow_record_event(self, tr) -> None:
         """影子单建档事件（全类型统一出口）。"""
@@ -83,6 +298,13 @@ class SignalsService:
                 market = self.context.collector.latest()
                 if not market:
                     continue
+                try:
+                    await self.context.strategy_shadow.step(
+                        market, datetime.now(ET),
+                        stale=self.context.collector.data_health()["stale"],
+                    )
+                except Exception:
+                    logger.exception("策略影子执行异常")
                 events, settled = self.context.shadow_tracker.process(market)
                 for tr in events:
                     self.context.events.record_event(
@@ -496,6 +718,9 @@ class SignalsService:
             await asyncio.sleep(1.0)
             try:
                 market = self.context.collector.latest()
+                now = time.time()
+                self._scan_opening_breakouts(market, now)
+                await self._update_opening_previews(market, now)
                 if not market:
                     continue
                 fed_times: set = set()
@@ -587,11 +812,14 @@ class SignalsService:
         的标的一律保留（不误杀）。现价 = collector 实时 bar close。"""
         market = self.context.collector.latest()
         pm_filter = self.context.settings._screen_premarket_filter()
+        opening_filter = self.context.settings._screen_opening_range_filter()
+        now = time.time()
         long_rows, short_rows = ([], [])
         for symbol, data in market.items():
             ts = self.context.trading._ts_c(data)
             direction = ts.get("direction")
-            close = (data.get("bar") or {}).get("close")
+            bar = data.get("bar") or {}
+            close = bar.get("close")
             if direction not in (1, -1) or close is None:
                 continue
             pmh, pml = self.context.trading._attack_zone(data)
@@ -601,6 +829,14 @@ class SignalsService:
                 )
             ):
                 continue
+            zone = opening_range(data, as_of=now) if opening_filter else None
+            if opening_filter:
+                confirmed_close = (data.get("bar_c") or {}).get("close")
+                if not (
+                    beyond_opening_range(zone, direction, confirmed_close)
+                    and beyond_opening_range(zone, direction, close)
+                ):
+                    continue
             divergence = ts.get("divergence")
             if divergence is None:
                 ema_f, ema_s, atr = (
@@ -610,12 +846,22 @@ class SignalsService:
                 )
                 if ema_f is not None and ema_s is not None and atr and (atr > 0):
                     divergence = abs(ema_f - ema_s) / atr
+            # This live plot already uses closed bars internally. Using e9_c
+            # would shift the slope back by one more bar.
+            ema = data.get("e9") or {}
+            bar_time = finite_number(bar.get("time"))
+            slope = (
+                finite_number(ema.get("ema_slope_atr"))
+                if bar_time is not None and finite_number(ema.get("time")) == bar_time
+                else None
+            )
             fvg = data.get("fvg_c") or data.get("fvg") or {}
             row = {
                 "symbol": symbol,
                 "ticker": symbol.split(":")[-1],
                 "side": "long" if direction == 1 else "short",
                 "trend_state": ts.get("trend_state"),
+                "ema_slope_atr": slope,
                 "divergence": round(abs(divergence), 2)
                 if divergence is not None
                 else None,
@@ -627,12 +873,100 @@ class SignalsService:
                 "close": round(close, 2),
                 "pmh": round(pmh, 2) if pmh is not None else None,
                 "pml": round(pml, 2) if pml is not None else None,
+                "opening_high": zone[0] if zone else None,
+                "opening_low": zone[1] if zone else None,
                 "qualified": True,
             }
             (long_rows if direction == 1 else short_rows).append(row)
         long_rows.sort(key=lambda x: -(x["divergence"] or 0))
         short_rows.sort(key=lambda x: -(x["divergence"] or 0))
         return {"long": long_rows, "short": short_rows}
+
+    def compute_momentum(self) -> dict:
+        """Rank confirmed EMA7 progress toward or beyond the opening range edges."""
+        now = time.time()
+        result = {"long": [], "short": [], "ready_count": 0,
+                  "first_breaks": {"long": [], "short": []}, "first_break_ready": 0}
+        for symbol, data in (self.context.collector.latest() or {}).items():
+            zone = opening_range(data, as_of=now)
+            history = data.get("ema7_closed") or []
+            if not zone or zone[0] <= zone[1]:
+                continue
+            confirmed_time = data["bar_c"]["time"]
+            high, low = zone
+            first_by_side = {}
+            opening_bar = datetime.fromtimestamp(confirmed_time, ET).replace(
+                hour=9, minute=40, second=0, microsecond=0,
+            ).timestamp()
+            samples = int((confirmed_time - opening_bar) // 300) + 1
+            if samples > 0 and len(history) >= samples:
+                for index in reversed(range(samples)):
+                    row = history[index]
+                    stamp = confirmed_time - index * 300
+                    ema = finite_number(row.get("ema"))
+                    if finite_number(row.get("time")) != stamp or ema is None or ema <= 0:
+                        first_by_side.clear()
+                        break
+                    if ema > high:
+                        first_by_side.setdefault("long", stamp + 300)
+                    elif ema < low:
+                        first_by_side.setdefault("short", stamp + 300)
+                else:
+                    result["first_break_ready"] += 1
+                    for side, stamp in first_by_side.items():
+                        leaders = result["first_breaks"][side]
+                        if leaders and stamp < leaders[0]["time"]:
+                            leaders.clear()
+                        if not leaders or stamp == leaders[0]["time"]:
+                            leaders.append({"symbol": symbol, "ticker": symbol.split(":")[-1],
+                                            "side": side, "time": stamp})
+            if not history or finite_number(history[0].get("time")) != confirmed_time:
+                continue
+            latest_ema = finite_number(history[0].get("ema"))
+            if latest_ema is None or latest_ema <= 0:
+                continue
+            half_width = (high - low) / 2
+            position = (latest_ema - (high + low) / 2) / half_width
+            momentum = None
+            if len(history) >= 4:
+                # The 15-minute lookback may include premarket bars.
+                for index, row in enumerate(history[1:4], start=1):
+                    ema = finite_number(row.get("ema"))
+                    if (finite_number(row.get("time")) != confirmed_time - 300 * index
+                            or ema is None or ema <= 0):
+                        break
+                else:
+                    momentum = (latest_ema - ema) / half_width
+            result["ready_count"] += 1
+            side, direction = ("long", 1) if position >= 0 else ("short", -1)
+            # Every sample compares the same confirmed bar's close and Pine EMA.
+            success_count = None
+            if len(history) >= 20:
+                matches = 0
+                for index, row in enumerate(history[:20]):
+                    price = finite_number(row.get("close"))
+                    ema = finite_number(row.get("ema"))
+                    if (finite_number(row.get("time")) != confirmed_time - 300 * index
+                            or price is None or price <= 0 or ema is None or ema <= 0):
+                        break
+                    matches += direction * (price - ema) > 0
+                else:
+                    success_count = matches
+            close = finite_number(data["bar"].get("close"))
+            result[side].append({
+                "symbol": symbol, "ticker": symbol.split(":")[-1], "side": side,
+                "position": position, "momentum": momentum,
+                "breakout_distance": direction * position - 1,
+                "ema7_success_count": success_count,
+                "first_break_time": first_by_side.get(side),
+                "outside": beyond_opening_range(zone, direction, close) if close is not None else None,
+            })
+        for side, direction in (("long", 1), ("short", -1)):
+            result[side].sort(key=lambda row: (
+                -row["breakout_distance"], row["momentum"] is None,
+                -direction * (row["momentum"] or 0), row["symbol"],
+            ))
+        return result
 
     def _fvg_event_state(
         self, side: str, close: Optional[float], top: float, bottom: float

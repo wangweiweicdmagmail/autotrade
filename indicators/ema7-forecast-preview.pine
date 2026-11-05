@@ -1,0 +1,40 @@
+//@version=6
+indicator("EMA7 预测重心 · 对比", shorttitle="EMA7 Forecast", overlay=true)
+
+ema7 = ta.ema(close, 7)
+atr = ta.atr(14)
+
+// 最近三个已收盘间隔的速度取等权平均。
+// (EMA[1] - EMA[2]) + (EMA[2] - EMA[3]) + (EMA[3] - EMA[4]) = EMA[1] - EMA[4]
+averageVelocity = (ema7[1] - ema7[4]) / 3.0
+forecast = ema7[1] + averageVelocity
+
+// 用上一根已收盘 ATR，确保本根的偏移和预测线都固定。
+signedOffset = math.sign(averageVelocity) * 0.2 * atr[1]
+adjustedForecast = forecast + signedOffset
+
+// 开盘价确定本根的来向，固定的修正线用于检测根内触达。
+// 跳空到线另一侧的 K 线不标为从趋势一侧回踩。
+int direction = na(adjustedForecast) or adjustedForecast <= 0 ? 0 : averageVelocity > 0 ? 1 : averageVelocity < 0 ? -1 : 0
+longTouch = direction == 1 and open > adjustedForecast and low <= adjustedForecast
+shortTouch = direction == -1 and open < adjustedForecast and high >= adjustedForecast
+
+// 本根收盘后，比较预测重心和直接沿用上一根 EMA7 的误差。
+forecastError = barstate.isconfirmed ? ema7 - forecast : na
+baselineAbsError = barstate.isconfirmed ? math.abs(ema7 - ema7[1]) : na
+adjustedAbsError = barstate.isconfirmed ? math.abs(ema7 - adjustedForecast) : na
+
+plot(ema7, "实际 EMA7", color=color.orange, linewidth=2)
+plot(forecast, "预测重心", color=color.aqua, linewidth=2, style=plot.style_stepline)
+plot(adjustedForecast, "ATR 修正重心", color=color.fuchsia, linewidth=2, style=plot.style_stepline)
+plotshape(longTouch ? adjustedForecast : na, "多头回踩", style=shape.triangleup, location=location.absolute, color=color.lime, size=size.small)
+plotshape(shortTouch ? adjustedForecast : na, "空头反弹", style=shape.triangledown, location=location.absolute, color=color.red, size=size.small)
+plot(direction, "EMA7_Forecast_Direction", display=display.data_window, offset=0)
+plot(longTouch ? 1 : 0, "EMA7_Long_Touch", display=display.data_window, offset=0)
+plot(shortTouch ? 1 : 0, "EMA7_Short_Touch", display=display.data_window, offset=0)
+plot(averageVelocity, "EMA7_Forecast_Velocity", display=display.data_window, offset=0)
+plot(forecastError, "EMA7_Forecast_Error", display=display.data_window, offset=0)
+plot(math.abs(forecastError), "EMA7_Forecast_Abs_Error", display=display.data_window, offset=0)
+plot(baselineAbsError, "EMA7_Baseline_Abs_Error", display=display.data_window, offset=0)
+plot(signedOffset, "EMA7_Forecast_ATR_Offset", display=display.data_window, offset=0)
+plot(adjustedAbsError, "EMA7_Adjusted_Abs_Error", display=display.data_window, offset=0)

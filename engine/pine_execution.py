@@ -6,17 +6,20 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field, fields
 from typing import Dict, List, Optional
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from engine.states import ACTIVE, DONE, PENDING, WATCHING
 from engine.broker_protocols import TradeBroker, SimulatedPriceFeed
 from engine.pine_models import PineModel, PineModelRegistry
+from domain.contracts import ClosedBar, ExecutionGroupState, OrderPlan, PriceObservation, StrategyOutput, TradingGroupKey, TERMINAL_ORDER_VALUES, OPEN_ORDER_VALUES
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_BREAKEVEN_R = 3.0
 DEFAULT_ADD_UNLOCK_R = 2.0
-_TERMINAL = {"CLOSED", "CANCELLED", "FAILED", DONE}
-_OPEN = {PENDING, ACTIVE, "CLOSING"}
+_TERMINAL = TERMINAL_ORDER_VALUES
+_OPEN = OPEN_ORDER_VALUES
 
 
 @dataclass
@@ -64,8 +67,22 @@ class ExecutionInstance:
     close_attempt_at: float = 0.0
     source: str = "auto"
     created_at: float = field(default_factory=time.time)
+    started_at: float = 0.0
+    startup_params: dict = field(default_factory=dict)
+    last_input_at: float = 0.0
+    last_decision_at: float = 0.0
+    last_decision_reason: str = ""
+
+    @property
+    def key(self) -> TradingGroupKey:
+        return TradingGroupKey(self.strategy_id, self.strategy_instance_id, self.symbol, self.group_id)
+
+    def domain_state(self) -> ExecutionGroupState:
+        return ExecutionGroupState(self.key, self.state, self.entries, self.total_qty,
+                                   self.avg_cost, self.stop_px, self.enabled)
 
     def view(self) -> dict:
+        state = self.domain_state()
         return {
             "inst_id": (
                 f"pyramid-{self.symbol}"
@@ -83,7 +100,7 @@ class ExecutionInstance:
             "lot_ids": list(self.lot_ids),
             "entry_px": round(self.avg_cost, 4),
             "avg_cost": round(self.avg_cost, 4),
-            "qty": self.total_qty,
+            "qty": state.quantity,
             "stop_px": self.stop_px,
             "entries": self.entries,
             "initial_risk_usd": self.initial_risk_usd,
@@ -101,6 +118,11 @@ class ExecutionInstance:
             "done_reason": self.done_reason,
             "source": self.source,
             "created_at": self.created_at,
+            "started_at": self.started_at,
+            "startup_params": dict(self.startup_params),
+            "last_input_at": self.last_input_at,
+            "last_decision_at": self.last_decision_at,
+            "last_decision_reason": self.last_decision_reason,
             "group_id": self.group_id,
             "enabled": self.enabled,
             "pending_lot_id": self.pending_lot_id,
@@ -128,11 +150,12 @@ class PineExecutionEngine:
         *,
         model: Optional[PineModel] = None,
         instance_id: str = "default",
+        execution_profile=None,
     ) -> None:
         if breakeven_r <= 0 or add_unlock_r <= 0:
             raise ValueError("保本和加仓解锁 R 门槛必须大于 0")
         self.model = model or PineModelRegistry.load().get("ema9_pyramid")
-        self.profile = self.model.profile
+        self.profile = execution_profile or self.model.profile
         self.instance_id = instance_id
         self._broker = broker
         sink = emit or (lambda *_a, **_k: None)
@@ -144,6 +167,8 @@ class PineExecutionEngine:
         )
         self._max_instances = max_instances
         self._instances: Dict[str, ExecutionInstance] = {}
+        self._placements_inflight = set()
+        self._manual_protection_inflight = set()
         self.breakeven_enabled = (
             self.profile.auto_breakeven
             if breakeven_enabled is None
@@ -160,6 +185,19 @@ class PineExecutionEngine:
     def _second_lot(self, inst: ExecutionInstance):
         lot_id = next((k for k in inst.lot_ids if inst.entry_indices.get(k) == 2), None)
         return self._broker.get(lot_id) if lot_id else None
+
+    def _record_start(self, inst: ExecutionInstance) -> None:
+        inst.started_at = time.time()
+        inst.startup_params = {
+            "initial_risk_usd": inst.initial_risk_usd,
+            "start_direction": inst.start_direction,
+            "execution_profile": self.profile.name,
+            "risk_ratios": list(inst.risk_ratios),
+            "auto_breakeven": self.breakeven_enabled,
+            "breakeven_r": self.breakeven_r,
+            "add_unlock_r": self.add_unlock_r,
+            "direction_source": "startup_pine_snapshot",
+        }
 
     def start(
         self,
@@ -178,6 +216,7 @@ class PineExecutionEngine:
                 inst.enabled = True
                 if not inst.entries:
                     inst.initial_risk_usd = float(initial_risk_usd)
+                self._record_start(inst)
                 self._persist(inst)
                 started.append(symbol)
                 continue
@@ -199,6 +238,7 @@ class PineExecutionEngine:
                 start_direction=start_direction,
             )
             started.append(symbol)
+            self._record_start(self._instances[symbol])
             self._persist(self._instances[symbol])
             self._emit(
                 "pyramid_started",
@@ -382,6 +422,9 @@ class PineExecutionEngine:
                 },
             )
         existing.fill_versions = {lot["lot_id"]: [qty, entry]}
+        if enabled:
+            self._record_start(existing)
+            existing.startup_params["direction_source"] = "manual_seed_and_pine_snapshot"
         existing.mfe_since = time.time() if lot.get("entry_time") else 0.0
         self._persist(existing)
         self.enabled = self.enabled or enabled
@@ -396,8 +439,40 @@ class PineExecutionEngine:
         )
         return existing
 
+    def _can_resume(self, inst: ExecutionInstance, session_date) -> bool:
+        return (
+            session_date is not None
+            and inst.enabled
+            and inst.started_at > 0
+            and datetime.fromtimestamp(inst.started_at, ZoneInfo("America/New_York")).date()
+            == session_date
+            and inst.execution_profile == self.profile.name
+            and tuple(inst.risk_ratios) == self.profile.risk_ratios
+            and not inst.recovery_block_reason
+            and not inst.exit_requested_reason
+            and not inst.done_reason
+        )
+
+    def restore_watch(self, snapshot: dict, session_date) -> None:
+        allowed = {f.name for f in fields(ExecutionInstance)}
+        inst = ExecutionInstance(**{k: v for k, v in snapshot.items() if k in allowed})
+        if (
+            inst.symbol not in self._instances
+            and inst.state == WATCHING
+            and not inst.lot_ids
+            and not inst.pending_lot_id
+            and not inst.entries
+            and math.isfinite(inst.initial_risk_usd)
+            and inst.initial_risk_usd > 0
+            and self._can_resume(inst, session_date)
+        ):
+            inst.restored = True
+            self._instances[inst.symbol] = inst
+            self.enabled = True
+
     async def adopt_manual_lots(
-        self, lots: List[dict], signals: Optional[dict] = None
+        self, lots: List[dict], signals: Optional[dict] = None, *,
+        session_date=None, resumable_groups=(),
     ) -> List[str]:
         saved = (
             self._broker.pyramid_states()
@@ -480,7 +555,15 @@ class PineExecutionEngine:
                 inst.recovery_block_reason = (
                     "同标的存在不同交易组或方向，自动加仓已暂停"
                 )
-            inst.enabled = False
+            inst.enabled = (
+                group_id in resumable_groups
+                and self._can_resume(inst, session_date)
+                and sum(row["state"] == PENDING for row in rows) <= 1
+                and not any(
+                    row.get("entry_submission_pending") or row["state"] == "CLOSING"
+                    for row in rows
+                )
+            )
             inst.execution_profile = self.profile.name
             inst.risk_ratios = self.profile.risk_ratios
             inst.restored = True
@@ -499,6 +582,7 @@ class PineExecutionEngine:
                 inst.source = "manual_seed"
             self._instances[symbol] = inst
             await self._refresh(inst)
+            self.enabled = self.enabled or (inst.enabled and inst.state != DONE)
             self._persist(inst)
             adopted.append(symbol)
         for lot in lots:
@@ -683,7 +767,98 @@ class PineExecutionEngine:
             inst.stop_px = round(new_stop, 2)
         return ok
 
-    async def _place(self, inst: ExecutionInstance, e9: dict, now_hm: int) -> None:
+    async def manual_breakeven(self, symbol: str, group_id: str, expected_qty: int,
+                               expected_avg_cost: float) -> dict:
+        """Manually tighten the current filled group to its actual average cost.
+
+        Block new entries while processing; exit/cancel still wins through the
+        broker's existing per-order coordinator. Partial results are not rolled
+        back (that could loosen protection).
+        """
+        inst = self._instances.get(symbol)
+        if inst is None or inst.group_id != group_id:
+            raise ValueError("交易组已变化，请刷新执行监控后再试")
+        key = inst.key
+        if key in self._placements_inflight or key in self._manual_protection_inflight:
+            raise ValueError("该交易组正在下单或修改保护，请稍后重试")
+        self._manual_protection_inflight.add(key)
+        try:
+            if any(self._broker.get(lot_id) is None for lot_id in inst.lot_ids):
+                raise ValueError("关联订单缺失，请先核对执行账本与订单明细")
+            await self._refresh(inst)
+            if inst.state in (DONE, "CLOSING") or inst.exit_requested_reason:
+                raise ValueError("该交易组已结束或正在退出，不可保本")
+            if inst.recovery_block_reason:
+                raise ValueError("交易组恢复状态待核验，请先核对订单明细")
+            if inst.pending_lot_id:
+                raise ValueError("存在待成交订单，请等待成交或撤单确认后再保本")
+            lots = [self._broker.get(lot_id) for lot_id in inst.lot_ids]
+            if not lots or any(lot is None or lot.state != ACTIVE for lot in lots):
+                raise ValueError("关联订单尚未全部确认为持仓状态，请核对订单明细")
+            if any(not getattr(lot, "avg_fill", 0) > 0
+                   or not getattr(lot, "filled_qty", getattr(lot, "qty", 0)) > 0
+                   or getattr(lot, "partial_exit", None)
+                   or getattr(lot, "entry_submission_pending", False)
+                   or getattr(lot, "symbol", symbol) != symbol
+                   or getattr(lot, "side", inst.side) != inst.side
+                   or (getattr(lot, "entry_trade", None) is not None and not lot.entry_trade.isDone())
+                   for lot in lots):
+                raise ValueError("存在未确认成交、未完成委托或减仓，请先核对订单明细")
+            target = round(inst.avg_cost, 2)
+            if inst.total_qty <= 0 or target <= 0 or not math.isfinite(target):
+                raise ValueError("没有可保本的实际持仓或成交均价")
+            if inst.total_qty != expected_qty or target != round(expected_avg_cost, 2):
+                raise ValueError("持仓数量或成本已变化，请刷新后重新确认")
+            result = {"ok": True, "group_id": group_id, "target_stop": target,
+                      "qty": inst.total_qty, "updated": [], "unchanged": [], "failed": []}
+            for lot in lots:
+                if self._instances.get(symbol) is not inst or inst.exit_requested_reason or inst.state == "CLOSING":
+                    result["failed"].append({"lot_id": lot.lot_id, "reason": "交易组已替换或退出请求优先"})
+                    continue
+                if lot.state != ACTIVE:
+                    result["failed"].append({"lot_id": lot.lot_id, "reason": "订单状态已变化"})
+                    continue
+                await self._refresh(inst)
+                if inst.total_qty != expected_qty or round(inst.avg_cost, 2) != target:
+                    result["failed"].append({"lot_id": lot.lot_id, "reason": "持仓数量或成本已变化，停止后续改单"})
+                    continue
+                favorable = (inst.side == "long" and lot.stop_px >= target) or (
+                    inst.side == "short" and 0 < lot.stop_px <= target)
+                if favorable:
+                    result["unchanged"].append(lot.lot_id)
+                    continue
+                try:
+                    ok = await self._broker.move_stop(lot.lot_id, target)
+                except Exception as error:
+                    result["failed"].append({"lot_id": lot.lot_id, "reason": str(error) or "保护修改失败"})
+                else:
+                    if ok:
+                        result["updated"].append(lot.lot_id)
+                    else:
+                        result["failed"].append({"lot_id": lot.lot_id, "reason": "保护修改未成功，请核对订单回报"})
+            await self._refresh(inst)
+            if (self._instances.get(symbol) is not inst or inst.exit_requested_reason
+                    or inst.state == "CLOSING" or inst.total_qty != expected_qty
+                    or round(inst.avg_cost, 2) != target):
+                result["failed"].append({"lot_id": "交易组", "reason": "处理期间持仓、成本或退出状态发生变化，请重新核对"})
+            result["ok"] = not result["failed"]
+            self._persist(inst)
+            self._emit("manual_group_breakeven", symbol=symbol, **result)
+            return result
+        finally:
+            self._manual_protection_inflight.discard(key)
+
+    async def _place(self, inst: ExecutionInstance, e9: dict, now_hm: int, price: float, observed_at=None) -> None:
+        key = inst.key
+        if key in self._placements_inflight or key in self._manual_protection_inflight:
+            return
+        self._placements_inflight.add(key)
+        try:
+            await self._place_once(inst, e9, now_hm, price, observed_at)
+        finally:
+            self._placements_inflight.discard(key)
+
+    async def _place_once(self, inst: ExecutionInstance, e9: dict, now_hm: int, price: float, observed_at=None) -> None:
         if (
             not self.enabled
             or not inst.enabled
@@ -698,7 +873,6 @@ class PineExecutionEngine:
         bar_time = e9.get("time") or 0
         if bar_time and inst.last_signal_event_bar == bar_time:
             return
-        inst.last_signal_event_bar = bar_time
         direction = e9.get("direction")
         side = "long" if direction == 1 else "short" if direction == -1 else ""
         ema = e9.get("entry_price")
@@ -706,6 +880,8 @@ class PineExecutionEngine:
         mfe = inst.mfe_r
 
         def signal(action: str, reason: str, **details) -> None:
+            inst.last_decision_at = time.time()
+            inst.last_decision_reason = reason or action
             self._emit(
                 "pyramid_signal",
                 symbol=inst.symbol,
@@ -720,6 +896,11 @@ class PineExecutionEngine:
                 **details,
             )
 
+        if block := e9.get("entry_block_reason"):
+            if inst.last_decision_reason != block:
+                signal("ignored", block)
+            return
+        inst.last_signal_event_bar = bar_time
         if not self.profile.entry_start_hm <= now_hm < self.profile.entry_end_hm:
             signal("ignored", "非进场时段")
             return
@@ -749,17 +930,25 @@ class PineExecutionEngine:
             signal("ignored", "已达到三次建仓上限")
             return
         budget = inst.initial_risk_usd * self.profile.risk_ratios[inst.entries]
-        entry_px = round(ema, 2)
-        order_stop = round(signal_stop if not before_qty else inst.stop_px, 2)
-        risk_dist = round((entry_px - order_stop) * (1 if side == "long" else -1), 8)
-        if not math.isfinite(risk_dist) or risk_dist <= 0 or order_stop <= 0:
-            signal("ignored", "实际止损方向或距离无效")
+        try:
+            plan = OrderPlan.sized(inst.symbol, side, ema,
+                                   signal_stop if not before_qty else inst.stop_px,
+                                   budget, group=inst.key, signal_bar_time=bar_time,
+                                   created_at=time.time(), risk_reference_price=price, entry_order_type="MKT")
+        except ValueError as error:
+            signal("ignored", str(error))
             return
-        qty = math.floor(budget / risk_dist)
-        if qty <= 0:
-            signal("ignored", "风险预算不足一股")
-            return
+        entry_px, order_stop, qty = plan.entry_price, plan.stop_price, plan.qty
+        risk_dist = plan.risk_distance
         inst.last_signal_bar = bar_time
+        self._emit(
+            "pyramid_entry_decision",
+            symbol=inst.symbol, side=side, group_id=inst.group_id,
+            signal_bar_time=bar_time, entry_index=inst.entries + 1,
+            decision_at=plan.created_at, price_observed_at=observed_at,
+            signal_reference_price=ema, observed_price=price,
+            qty=qty, stop_px=order_stop, entry_order_type="MKT",
+        )
         try:
             lot = await self._broker.place_limit_stop(
                 symbol=inst.symbol,
@@ -770,6 +959,10 @@ class PineExecutionEngine:
                 limit_type=f"auto_{self.model.strategy_id}",
                 reason=f"{self.model.name} 第{inst.entries + 1}次 预算${budget:.2f}",
                 meta={
+                    "entry_order_type": "MKT",
+                    "risk_reference_price": plan.reference_price,
+                    "execution_observed_at": observed_at,
+                    "order_plan": plan.values(),
                     "entry_risk_dist": risk_dist,
                     "entry_index": inst.entries + 1,
                     "start_direction": inst.start_direction,
@@ -780,7 +973,7 @@ class PineExecutionEngine:
                     "initial_risk_usd": inst.initial_risk_usd,
                     "initial_r": inst.initial_r or risk_dist,
                     "risk_budget": budget,
-                    "planned_risk_usd": round(qty * risk_dist, 2),
+                    "planned_risk_usd": plan.planned_risk,
                 },
             )
         except Exception as e:
@@ -807,7 +1000,7 @@ class PineExecutionEngine:
         self._persist(inst)
         after_qty = before_qty + qty
         after_avg = (
-            (before_avg * before_qty + ema * qty) / after_qty if after_qty else ema
+            (before_avg * before_qty + plan.reference_price * qty) / after_qty if after_qty else plan.reference_price
         )
         signal(
             "add" if before_qty else "initial",
@@ -827,11 +1020,37 @@ class PineExecutionEngine:
             side=side,
             qty=qty,
             entry_px=ema,
+            entry_order_type="MKT",
+            risk_reference_price=plan.reference_price,
+            planned_risk_usd=plan.planned_risk,
             stop_px=order_stop,
             entries=inst.entries,
             risk_budget=budget,
             lot_id=lot.lot_id,
         )
+        # A terminal intent may arrive while the broker submission is awaiting.
+        # Attach the accepted order first, then finish the original exit intent.
+        # Plain pause deliberately keeps an already-submitted order unchanged.
+        superseded = self._instances.get(inst.symbol) is not inst
+        if superseded or inst.exit_requested_reason or inst.done_reason == "manual_stop_close":
+            inst.close_attempt_at = 0
+            reason = inst.exit_requested_reason or ("superseded_group" if superseded else "manual_stop")
+            await self._stop_close(inst, entry_px, reason)
+
+    async def on_observation(
+        self, observation: PriceObservation, output, now_hm: int, *, entry_block_reason=""
+    ) -> None:
+        output = output.for_bar(observation.bar_open_time, received_at=observation.received_at)
+        await self.on_output(observation.symbol, observation.price, output, now_hm,
+                             observed_at=observation.observed_at, entry_block_reason=entry_block_reason)
+
+    async def on_confirmed_bar(self, bar: ClosedBar, output) -> None:
+        output = output.for_bar(bar.open_time, confirmed=True, received_at=output.received_at)
+        if output.alignment == "mismatch":
+            raise ValueError("确认指标与收盘 K 线时间不一致")
+        if output.strategy_id != self.model.strategy_id:
+            raise ValueError("确认指标与执行实例归属不一致")
+        await self.on_bar(bar.symbol, bar.values(), output)
 
     async def on_price(
         self,
@@ -859,14 +1078,21 @@ class PineExecutionEngine:
         now_hm: int,
         *,
         observed_at: Optional[float] = None,
+        entry_block_reason: str = "",
     ) -> None:
         if output.strategy_id != self.model.strategy_id:
             raise ValueError("Pine 输出与执行实例的策略归属不一致")
+        values = output.execution_values()
+        if entry_block_reason:
+            values["entry_block_reason"] = entry_block_reason
+        instance = self._instances.get(symbol)
+        if instance is not None:
+            instance.last_input_at = observed_at or time.time()
         try:
             await self._on_price(
                 symbol,
                 price,
-                output.execution_values(),
+                values,
                 now_hm,
                 observed_at=observed_at,
             )
@@ -920,6 +1146,7 @@ class PineExecutionEngine:
                 )
             if (
                 self.breakeven_enabled
+                and inst.key not in self._manual_protection_inflight
                 and not inst.breakeven_done
                 and inst.mfe_r >= self.breakeven_r
             ):
@@ -934,7 +1161,7 @@ class PineExecutionEngine:
                         stop_px=inst.stop_px,
                         breakeven_r=self.breakeven_r,
                     )
-        await self._place(inst, e9, now_hm)
+        await self._place(inst, e9, now_hm, price, observed_at)
 
     async def on_price_extremes(
         self, symbol: str, low: float, high: float, e9: dict, now_hm: int
@@ -961,7 +1188,7 @@ class PineExecutionEngine:
                 self._broker.on_price(symbol, touch, ts=e9.get("time") or 0)
 
     async def on_bar(self, symbol: str, bar: dict, e9_c: dict) -> None:
-        e9_c = self.model.decode(e9_c).execution_values()
+        e9_c = (e9_c if isinstance(e9_c, StrategyOutput) else self.model.decode(e9_c)).execution_values()
         inst = self._instances.get(symbol)
         if inst is None:
             return

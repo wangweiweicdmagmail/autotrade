@@ -1,0 +1,426 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © wangweiweicdma
+
+//@version=6
+indicator("5M 进攻区域-方向过滤器，三区间", overlay=true, max_lines_count=500, max_boxes_count=500)
+
+// =====================================================
+// 0. 显示开关
+// =====================================================
+
+// 大区间：昨日高低点 + 盘前高低点
+showLargeRange = input.bool(
+     true,
+     title="显示大区间")
+
+// 小区间：纯盘前高低点
+showSmallRange = input.bool(
+     true,
+     title="显示盘前小区间")
+
+// 开盘小区间：正常交易时段开始后的前三根K线
+showOpening3Range = input.bool(
+     true,
+     title="显示开盘前三根K线小区间")
+
+// =====================================================
+// 0.1 历史显示设置
+// =====================================================
+
+// 保留最近多少个交易日
+daysToKeep = 5
+
+// =====================================================
+// 1. 昨日 High / Low
+// =====================================================
+
+yesterdayHigh = request.security(
+     syminfo.tickerid,
+     "D",
+     high[1],
+     lookahead=barmerge.lookahead_on)
+
+yesterdayLow = request.security(
+     syminfo.tickerid,
+     "D",
+     low[1],
+     lookahead=barmerge.lookahead_on)
+
+// =====================================================
+// 2. 美股交易时间
+// =====================================================
+
+// 盘前：04:00 - 09:29 ET
+isPremarket = not na(
+     time(timeframe.period, "0400-0929", "America/New_York"))
+
+// 正常交易：09:30 - 16:00 ET
+isRegularSession = not na(
+     time(timeframe.period, "0930-1600", "America/New_York"))
+
+// 当天第一根正常交易时段K线
+firstRegularBar =
+     isRegularSession and not isRegularSession[1]
+
+// =====================================================
+// 3. 新交易日
+// =====================================================
+
+newDay = ta.change(time("D")) != 0
+
+// =====================================================
+// 4. 计算当天盘前 High / Low
+// =====================================================
+
+var float premarketHigh = na
+var float premarketLow  = na
+
+if newDay
+    premarketHigh := na
+    premarketLow := na
+
+if isPremarket
+    premarketHigh := na(premarketHigh) ? high :
+         math.max(premarketHigh, high)
+
+    premarketLow := na(premarketLow) ? low :
+         math.min(premarketLow, low)
+
+// =====================================================
+// 5. 盘前小区间
+// =====================================================
+
+smallRangeHigh = premarketHigh
+smallRangeLow  = premarketLow
+
+// =====================================================
+// 6. 大区间
+//
+// 上边界：昨日 High 和盘前 High 较高者
+// 下边界：昨日 Low 和盘前 Low 较低者
+// 因此：大区间一定包含盘前小区间
+// =====================================================
+
+largeRangeHigh =
+     not na(yesterdayHigh) and not na(premarketHigh) ?
+     math.max(yesterdayHigh, premarketHigh) :
+     na
+
+largeRangeLow =
+     not na(yesterdayLow) and not na(premarketLow) ?
+     math.min(yesterdayLow, premarketLow) :
+     na
+
+// =====================================================
+// 7. 第一层进攻方向
+//
+// 实际交易逻辑仍只使用“大区间”
+// 突破大区间上沿 → 多头进攻
+// 跌破大区间下沿 → 空头进攻
+// 大区间内部 → 不交易
+//
+// 显示开关只负责视觉显示，不影响交易逻辑。
+// =====================================================
+
+longAttackZone =
+     isRegularSession and
+     not na(largeRangeHigh) and
+     close > largeRangeHigh
+
+shortAttackZone =
+     isRegularSession and
+     not na(largeRangeLow) and
+     close < largeRangeLow
+
+// =====================================================
+// 8. K线颜色
+// =====================================================
+
+attackCandleColor =
+     longAttackZone or shortAttackZone ?
+         (close >= open ? color.green : color.red) :
+         na
+
+barcolor(attackCandleColor)
+
+// =====================================================
+// 9. 开盘后前三根K线形成的小区间
+//
+// 按当前图表周期计数：
+// 5分钟图 = 09:30、09:35、09:40开始的三根K线，
+// 即完整的09:30 - 09:45开盘区间。
+//
+// 第三根K线完成前，高低点随实际K线逐步更新；
+// 第三根K线完成后，区间高低点固定，不再变化。
+// =====================================================
+
+var int regularBarCount = 0
+var float opening3High = na
+var float opening3Low  = na
+
+if newDay
+    regularBarCount := 0
+    opening3High := na
+    opening3Low := na
+
+if isRegularSession and regularBarCount < 3
+    regularBarCount += 1
+
+    opening3High := na(opening3High) ? high :
+         math.max(opening3High, high)
+
+    opening3Low := na(opening3Low) ? low :
+         math.min(opening3Low, low)
+
+// 仅在第三根正常交易时段K线完成时触发一次绘图
+opening3RangeJustCompleted =
+     isRegularSession and
+     barstate.isconfirmed and
+     regularBarCount == 3 and
+     regularBarCount[1] == 2
+
+// =====================================================
+// 10. 保存最近5个交易日的图形对象
+//
+// 每个交易日最多：
+// 大区间：1个Box + 2条Line
+// 盘前小区间：1个Box + 2条Line
+// 开盘前三根K线小区间：1个Box + 2条Line
+//
+// 最近5个交易日最多：
+// 30条Line + 15个Box
+// =====================================================
+
+// ---------- 大区间 ----------
+var line[] largeHighLines = array.new_line()
+var line[] largeLowLines  = array.new_line()
+var box[]  largeRangeBoxes = array.new_box()
+
+// ---------- 盘前小区间 ----------
+var line[] smallHighLines = array.new_line()
+var line[] smallLowLines  = array.new_line()
+var box[]  smallRangeBoxes = array.new_box()
+
+// ---------- 开盘前三根K线小区间 ----------
+var line[] opening3HighLines = array.new_line()
+var line[] opening3LowLines  = array.new_line()
+var box[]  opening3RangeBoxes = array.new_box()
+
+// 数据窗口中查看数值，不在主图额外生成连续曲线
+plot(premarketHigh, "盘前高点", display=display.data_window)
+plot(premarketLow, "盘前低点", display=display.data_window)
+plot(opening3High, "开盘前三根K线高点", display=display.data_window)
+plot(opening3Low, "开盘前三根K线低点", display=display.data_window)
+
+// =====================================================
+// 11. 创建第6个交易日前，删除最早的一天
+// =====================================================
+
+if firstRegularBar
+    if array.size(largeHighLines) >= daysToKeep
+        line.delete(array.shift(largeHighLines))
+
+    if array.size(largeLowLines) >= daysToKeep
+        line.delete(array.shift(largeLowLines))
+
+    if array.size(largeRangeBoxes) >= daysToKeep
+        box.delete(array.shift(largeRangeBoxes))
+
+    if array.size(smallHighLines) >= daysToKeep
+        line.delete(array.shift(smallHighLines))
+
+    if array.size(smallLowLines) >= daysToKeep
+        line.delete(array.shift(smallLowLines))
+
+    if array.size(smallRangeBoxes) >= daysToKeep
+        box.delete(array.shift(smallRangeBoxes))
+
+    if array.size(opening3HighLines) >= daysToKeep
+        line.delete(array.shift(opening3HighLines))
+
+    if array.size(opening3LowLines) >= daysToKeep
+        line.delete(array.shift(opening3LowLines))
+
+    if array.size(opening3RangeBoxes) >= daysToKeep
+        box.delete(array.shift(opening3RangeBoxes))
+
+// =====================================================
+// 12. 当天正常交易时段的起止时间
+// =====================================================
+
+currentYear = year(time, "America/New_York")
+currentMonth = month(time, "America/New_York")
+currentDay = dayofmonth(time, "America/New_York")
+
+sessionStart = timestamp(
+     "America/New_York",
+     currentYear,
+     currentMonth,
+     currentDay,
+     9,
+     30)
+
+sessionEnd = timestamp(
+     "America/New_York",
+     currentYear,
+     currentMonth,
+     currentDay,
+     16,
+     0)
+
+// =====================================================
+// 13. 绘制大区间与盘前小区间
+// =====================================================
+
+if firstRegularBar and
+   not na(smallRangeHigh) and
+   not na(smallRangeLow) and
+   not na(largeRangeHigh) and
+   not na(largeRangeLow)
+
+    // =================================================
+    // 13.1 大区间
+    // 深灰背景，4号实线边界
+    // =================================================
+
+    if showLargeRange
+        newLargeRangeBox = box.new(
+             left=sessionStart,
+             top=largeRangeHigh,
+             right=sessionEnd,
+             bottom=largeRangeLow,
+             xloc=xloc.bar_time,
+             border_color=color.new(color.gray, 100),
+             border_width=0,
+             bgcolor=color.new(color.gray, 80))
+
+        array.push(largeRangeBoxes, newLargeRangeBox)
+
+        newLargeHighLine = line.new(
+             x1=sessionStart,
+             y1=largeRangeHigh,
+             x2=sessionEnd,
+             y2=largeRangeHigh,
+             xloc=xloc.bar_time,
+             extend=extend.none,
+             color=color.green,
+             width=4,
+             style=line.style_solid)
+
+        array.push(largeHighLines, newLargeHighLine)
+
+        newLargeLowLine = line.new(
+             x1=sessionStart,
+             y1=largeRangeLow,
+             x2=sessionEnd,
+             y2=largeRangeLow,
+             xloc=xloc.bar_time,
+             extend=extend.none,
+             color=color.red,
+             width=4,
+             style=line.style_solid)
+
+        array.push(largeLowLines, newLargeLowLine)
+
+    // =================================================
+    // 13.2 盘前小区间
+    // 黄色背景，2号虚线边界
+    // =================================================
+
+    if showSmallRange
+        newSmallRangeBox = box.new(
+             left=sessionStart,
+             top=smallRangeHigh,
+             right=sessionEnd,
+             bottom=smallRangeLow,
+             xloc=xloc.bar_time,
+             border_color=color.new(color.yellow, 100),
+             border_width=0,
+             bgcolor=color.new(color.yellow, 80))
+
+        array.push(smallRangeBoxes, newSmallRangeBox)
+
+        newSmallHighLine = line.new(
+             x1=sessionStart,
+             y1=smallRangeHigh,
+             x2=sessionEnd,
+             y2=smallRangeHigh,
+             xloc=xloc.bar_time,
+             extend=extend.none,
+             color=color.green,
+             width=2,
+             style=line.style_dashed)
+
+        array.push(smallHighLines, newSmallHighLine)
+
+        newSmallLowLine = line.new(
+             x1=sessionStart,
+             y1=smallRangeLow,
+             x2=sessionEnd,
+             y2=smallRangeLow,
+             xloc=xloc.bar_time,
+             extend=extend.none,
+             color=color.red,
+             width=2,
+             style=line.style_dashed)
+
+        array.push(smallLowLines, newSmallLowLine)
+
+// =====================================================
+// 14. 绘制开盘前三根K线小区间
+//
+// 蓝色背景，2号点线边界。
+// 第三根K线完成后创建，并延伸到当天16:00。
+// 该区间仅用于显示，不改变原有进攻方向逻辑。
+// =====================================================
+
+if opening3RangeJustCompleted and
+   showOpening3Range and
+   not na(opening3High) and
+   not na(opening3Low)
+
+    newOpening3RangeBox = box.new(
+         left=sessionStart,
+         top=opening3High,
+         right=sessionEnd,
+         bottom=opening3Low,
+         xloc=xloc.bar_time,
+         border_color=color.new(color.blue, 100),
+         border_width=0,
+         bgcolor=color.new(color.blue, 85))
+
+    array.push(opening3RangeBoxes, newOpening3RangeBox)
+
+    newOpening3HighLine = line.new(
+         x1=sessionStart,
+         y1=opening3High,
+         x2=sessionEnd,
+         y2=opening3High,
+         xloc=xloc.bar_time,
+         extend=extend.none,
+         color=color.blue,
+         width=2,
+         style=line.style_dotted)
+
+    array.push(opening3HighLines, newOpening3HighLine)
+
+    newOpening3LowLine = line.new(
+         x1=sessionStart,
+         y1=opening3Low,
+         x2=sessionEnd,
+         y2=opening3Low,
+         xloc=xloc.bar_time,
+         extend=extend.none,
+         color=color.blue,
+         width=2,
+         style=line.style_dotted)
+
+    array.push(opening3LowLines, newOpening3LowLine)
+
+// 开盘小区间距离：中点为 0，上下沿分别为 +1 和 -1。
+opening3Mid = (opening3High + opening3Low) / 2.0
+opening3HalfWidth = (opening3High - opening3Low) / 2.0
+// 第三根收盘后区间才锁定；后续实时 K 线使用不断更新的 close。
+opening3DistanceReady = regularBarCount == 3 and (opening3RangeJustCompleted or regularBarCount[1] == 3)
+opening3Distance = opening3DistanceReady and not na(opening3HalfWidth) and opening3HalfWidth > 0 ? (close - opening3Mid) / opening3HalfWidth : na
+plot(opening3Distance, "Opening3_Distance", display=display.data_window, offset=0)

@@ -69,6 +69,50 @@ class AutoService:
             )
         return self._engines[key]
 
+    async def restore(self, session_date):
+        """Rehydrate the current session from the authoritative execution ledger."""
+        rows = self.order_manager.list_lots()
+        snapshots = self.order_manager.pyramid_states()
+        latest = {}
+        owners = set()
+        submitted = set()
+        for row in rows:
+            meta = row.get("signal_snapshot") or {}
+            strategy = meta.get("strategy_id")
+            if strategy:
+                owners.add((strategy, meta.get("strategy_instance_id") or "default"))
+            if meta.get("group_id"):
+                submitted.add(meta["group_id"])
+        for group_id, snapshot in snapshots.items():
+            if not isinstance(snapshot, dict) or snapshot.get("group_id") != group_id:
+                continue
+            owner = (snapshot.get("strategy_id", "ema9_pyramid"),
+                     snapshot.get("strategy_instance_id", "default"))
+            symbol = snapshot.get("symbol")
+            if not symbol:
+                continue
+            owners.add(owner)
+            key = (*owner, symbol)
+            if key not in latest or snapshot.get("created_at", 0) > latest[key].get("created_at", 0):
+                latest[key] = snapshot
+        for owner in owners:
+            try:
+                self.engine(*owner)
+            except AutoServiceError as error:
+                self.record_event("auto_restore_skipped", owner=owner, reason=str(error))
+        resumable = {snapshot["group_id"] for snapshot in latest.values()}
+        for engine in self.engines():
+            await engine.adopt_manual_lots(
+                rows, session_date=session_date, resumable_groups=resumable,
+            )
+        for (strategy, instance_id, _), snapshot in latest.items():
+            engine = self._engines.get((strategy, instance_id))
+            if engine is not None and snapshot["group_id"] not in submitted:
+                engine.restore_watch(snapshot, session_date)
+        running = [engine for engine in self.engines() if engine.enabled]
+        self.enabled = bool(running)
+        self.strategy_name = "、".join(dict.fromkeys(engine.model.name for engine in running))
+
     def symbol(self, symbol):
         symbol = symbol.strip().upper()
         return (
@@ -80,9 +124,12 @@ class AutoService:
     def instances(self):
         return [row for engine in self.engines() for row in engine.instances()]
 
-    def start(self, strategy, symbols, params, instance_id="default"):
-        engine = self.engine(strategy, instance_id)
-        model = engine.model
+    def start(self, strategy, symbols, params, instance_id="default", *,
+              preview=False, confirmed_directions=None):
+        try:
+            model = self.registry.get(strategy)
+        except ValueError as error:
+            raise AutoServiceError(400, str(error)) from error
         symbols = list(
             dict.fromkeys(
                 self.symbol(s) for s in (symbols or self.watchlist) if s.strip()
@@ -110,6 +157,22 @@ class AutoService:
                 "启动时方向不明确，无法锁定策略方向: "
                 + ",".join(s for s in symbols if not directions[s]),
             )
+        if preview or confirmed_directions is not None:
+            qqq = "NASDAQ:QQQ"
+            qqq_direction = model.from_market(market.get(qqq) or {}).direction
+            if qqq_direction not in (-1, 1):
+                raise AutoServiceError(409, f"{model.name} 的 QQQ 当前方向未就绪")
+            checked = {**directions, qqq: qqq_direction}
+            mismatched = [s for s, direction in directions.items() if direction != qqq_direction]
+            if mismatched:
+                labels = {1: "多", -1: "空"}
+                details = "、".join(f"{s} {labels[directions[s]]}" for s in mismatched)
+                raise AutoServiceError(409, f"{model.name} 方向不一致：QQQ {labels[qqq_direction]}，{details}")
+            if preview:
+                return {"model": model.name, "directions": checked, "symbols": symbols, "risk": risk}
+            if confirmed_directions != checked:
+                raise AutoServiceError(409, "启动方向尚未确认或已变化，请重新检查并确认")
+        engine = self.engine(strategy, instance_id)
         active = sum(row["state"] != "DONE" for row in self.instances())
         candidates = []
         for symbol in symbols:
@@ -196,6 +259,14 @@ class AutoService:
             strategy_instance_id=instance_id,
         )
         return {"ok": True, "symbol": symbol, "close_positions": close_positions}
+
+    async def breakeven_instance(self, symbol, group_id, qty, avg_cost,
+                                strategy="ema9_pyramid", instance_id="default"):
+        engine = self.engine(strategy, instance_id)
+        try:
+            return await engine.manual_breakeven(self.symbol(symbol), group_id, qty, avg_cost)
+        except ValueError as error:
+            raise AutoServiceError(409, str(error)) from error
 
     async def adopt(
         self, symbol, lot_id, risk=0, strategy="ema9_pyramid", instance_id="default"

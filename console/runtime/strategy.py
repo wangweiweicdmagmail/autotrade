@@ -2,17 +2,52 @@
 
 import logging
 import time
-from dataclasses import replace
+from domain.contracts import ClosedBar, PriceObservation, finite_number
+
+from engine.opening_range import opening_entry_block
 
 logger = logging.getLogger(__name__)
 
 
 class StrategyRuntime:
-    def __init__(self, service):
+    def __init__(self, service, *, require_opening_range=False):
         self.service = service
+        self.require_opening_range = require_opening_range
         self.last_bars = {}
         self.adopt_tick = 0
         self.rejected_signals = {}
+        self.unverified_confirmed = set()
+
+    async def _confirmed(self, engine, symbol, data, *, force=False):
+        model = engine.model
+        raw_bar = data.get("bar_c") or {}
+        raw_output = data.get(model.confirmed_key) or {}
+        if not raw_bar or not raw_output:
+            return
+        key = (model.strategy_id, engine.instance_id, symbol)
+        try:
+            bar = ClosedBar.from_mapping(symbol, raw_bar)
+        except ValueError:
+            return
+        current_open = finite_number((data.get("bar") or {}).get("time"))
+        if current_open and bar.open_time >= current_open:
+            return
+        stamp = raw_output.get("time")
+        if stamp is not None and finite_number(stamp) != bar.open_time:
+            return
+        if not force and bar.open_time <= self.last_bars.get(key, 0):
+            return
+        output = model.decode(raw_output).for_bar(bar.open_time, confirmed=True, received_at=time.time())
+        if output.alignment == "unknown" and key not in self.unverified_confirmed:
+            self.unverified_confirmed.add(key)
+            self.service.record_event(
+                "pine_confirmation_unverified", strategy_id=model.strategy_id,
+                strategy_instance_id=engine.instance_id, symbol=symbol,
+                reason="旧确认快照缺少指标时间，按兼容模式处理，未宣称时间已核验",
+            )
+        await engine.on_confirmed_bar(bar, output)
+        # A failed dispatch must remain retryable on the next snapshot.
+        self.last_bars[key] = bar.open_time
 
     async def step(self, market, now_hm, *, trading, stale=False):
         if not market or (trading and stale):
@@ -21,35 +56,18 @@ class StrategyRuntime:
         for engine in engines:
             model = engine.model
             for symbol, data in market.items():
-                bar_c = data.get("bar_c") or {}
-                bt = bar_c.get("time") or 0
                 key = (model.strategy_id, engine.instance_id, symbol)
-                confirmed = data.get(model.confirmed_key) or {}
-                confirmed_time = confirmed.get("time")
-                aligned = confirmed_time is None or confirmed_time == bt
-                if bt and aligned and self.last_bars.get(key) != bt:
-                    self.last_bars[key] = bt
-                    try:
-                        await engine.on_bar(symbol, bar_c, confirmed)
-                    except Exception:
-                        logger.exception(
-                            "Pine 收盘管理异常 %s %s", model.strategy_id, symbol
-                        )
+                try:
+                    await self._confirmed(engine, symbol, data)
+                except Exception:
+                    logger.exception("Pine 收盘管理异常 %s %s", model.strategy_id, symbol)
                 price = (data.get("bar") or {}).get("close")
                 if trading and price:
                     try:
-                        output = model.from_market(data)
-                        bar_time = (data.get("bar") or {}).get("time")
-                        if (
-                            output.entry_signal
-                            and output.time
-                            and bar_time
-                            and output.time != bar_time
-                        ):
-                            output = replace(
-                                output,
-                                errors=output.errors + ("信号与当前 K 线时间不一致",),
-                            )
+                        observation = PriceObservation.from_market(symbol, data, time.time())
+                        output = model.from_market(data).for_bar(
+                            observation.bar_open_time, received_at=observation.received_at,
+                        )
                         if output.entry_signal and output.errors:
                             fingerprint = (output.time, output.errors)
                             if self.rejected_signals.get(key) != fingerprint:
@@ -61,13 +79,18 @@ class StrategyRuntime:
                                     symbol=symbol,
                                     errors=list(output.errors),
                                 )
-                        await engine.on_output(
-                            symbol,
-                            price,
-                            output,
-                            now_hm,
-                            observed_at=data.get("price_observed_at") or time.time(),
-                        )
+                        block = ""
+                        if self.require_opening_range and output.entry_signal:
+                            block = opening_entry_block(
+                                data, output.direction, observation.price,
+                                as_of=observation.received_at,
+                            )
+                        if block:
+                            await engine.on_observation(
+                                observation, output, now_hm, entry_block_reason=block,
+                            )
+                        else:
+                            await engine.on_observation(observation, output, now_hm)
                     except Exception:
                         logger.exception(
                             "Pine 实时执行异常 %s %s", model.strategy_id, symbol
@@ -92,13 +115,6 @@ class StrategyRuntime:
                     adopted = await engine.adopt_manual_lots(lots, signals=market)
                     for symbol in adopted:
                         data = market.get(symbol) or {}
-                        confirmed = data.get(engine.model.confirmed_key) or {}
-                        bar_c = data.get("bar_c") or {}
-                        if bar_c and confirmed.get("time") in (None, bar_c.get("time")):
-                            await engine.on_bar(
-                                symbol,
-                                bar_c,
-                                confirmed,
-                            )
+                        await self._confirmed(engine, symbol, data, force=True)
                 except Exception:
                     logger.exception("Pine 持仓恢复异常 %s", engine.model.strategy_id)

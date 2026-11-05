@@ -91,15 +91,19 @@ class SettingsService:
         """选股盘前区间过滤开关（默认关：缺键/假值都不过滤）。"""
         return bool(self.context.settings._settings.get("screen_premarket_filter"))
 
+    def _screen_opening_range_filter(self) -> bool:
+        return bool(self.context.settings._settings.get("screen_opening_range_filter"))
+
     def _fvg_premarket_filter(self) -> bool:
-        """FVG 监控盘前区间过滤开关（默认关）。"""
-        return bool(self.context.settings._settings.get("fvg_premarket_filter"))
+        """FVG 监控盘前区间过滤开关（默认开，保留用户显式关闭）。"""
+        return bool(self.context.settings._settings.get("fvg_premarket_filter", True))
 
     def _settings_payload(self) -> dict:
         """全局设置当前值（GET /api/settings 与 POST 响应共用）。"""
         return {
             "stop_atr_mult": self.context.settings._stop_atr_mult(),
             "screen_premarket_filter": self.context.settings._screen_premarket_filter(),
+            "screen_opening_range_filter": self.context.settings._screen_opening_range_filter(),
             "fvg_premarket_filter": self.context.settings._fvg_premarket_filter(),
             "imessage_recipient": str(
                 self.context.settings._settings.get("imessage_recipient") or ""
@@ -135,6 +139,7 @@ class SettingsService:
             changed["stop_atr_mult"] = self.context.settings._settings["stop_atr_mult"]
         for key in (
             "screen_premarket_filter",
+            "screen_opening_range_filter",
             "fvg_premarket_filter",
             "pyramid_auto_breakeven",
         ):

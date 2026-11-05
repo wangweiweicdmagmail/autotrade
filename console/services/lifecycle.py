@@ -1,5 +1,10 @@
 """lifecycle application functions and owned state. No console.app dependency."""
 
+import asyncio
+import sys
+from pathlib import Path
+
+from fastapi import HTTPException
 from execution.writer_lock import acquire_writer_lock
 import config
 import time
@@ -9,6 +14,7 @@ from console.shared import logger
 class LifecycleService:
     def __init__(self, context):
         self.context = context
+        self._cache_repair_running = False
 
     def _startup_status(self) -> dict:
         snap = self.context.collector.latest() or {}
@@ -21,6 +27,8 @@ class LifecycleService:
                 and v["ts_c"].get("trend_state") is not None
             )
         )
+        pending = [symbol for symbol in config.WATCHLIST
+                   if (snap.get(symbol, {}).get("ts_c") or {}).get("trend_state") is None]
         expected = len(config.WATCHLIST)
         market_ready = (
             self.context.collector.running
@@ -58,7 +66,14 @@ class LifecycleService:
                 "key": "browser",
                 "label": "图表工作区",
                 "ready": browser_ready,
-                "detail": "控制台与 TradingView 双标签页已就绪"
+                "detail": (
+                    "左侧 autotrade · 右侧 TradingView 分屏已就绪"
+                    if self.context.lifecycle._startup_state.get("split_ready")
+                    else "浏览器已打开；自动分屏未完成："
+                    + self.context.lifecycle._startup_state["split_error"]
+                    if self.context.lifecycle._startup_state.get("split_error")
+                    else "控制台与 TradingView 标签页已就绪"
+                )
                 if browser_ready
                 else self.context.lifecycle._startup_state["browser_error"]
                 or "正在准备浏览器标签页",
@@ -73,7 +88,10 @@ class LifecycleService:
             errors.append(
                 "TradingView 指标通道异常，请运行 python3 service/tv_diag.py 检查"
             )
+        if pending and time.time() - self.context.lifecycle._startup_state["started_at"] > 240:
+            errors.append("行情订阅未完成，等待：" + "、".join(pending))
         return {
+            "market_pending": pending,
             "ready": bool(self.context.lifecycle._startup_state["ready"]),
             "stages": stages,
             "error": "；".join(errors),
@@ -81,6 +99,14 @@ class LifecycleService:
                 time.time() - self.context.lifecycle._startup_state["started_at"]
             ),
             "all_ready": all((s["ready"] for s in stages)),
+            "market_progress": {
+                "indicators": self.context.collector.startup_indicators,
+                "subscribed": self.context.collector.startup_subscribed,
+                "confirmed": confirmed,
+                "total": expected,
+            },
+            "cache_issues": list(self.context.collector.cache_issues.values()),
+            "cache_repair_running": self._cache_repair_running,
         }
 
     async def on_startup(self) -> None:
@@ -92,6 +118,8 @@ class LifecycleService:
         ):
             raise RuntimeError("另一个 autotrade 执行写进程正在运行，禁止重复管理订单")
         self.context.execution_writer_acquired = True
+        self.context.order_mgr._load(allow_recovery=True)  # reload after owning the writer lock, before broker access
+        self.context.order_mgr._save()  # validate/migrate local ledger before any broker side effects
         connected = await self.context.gateway.connect()
         if config.EXECUTION_ENABLED and (not connected):
             logger.error(
@@ -102,9 +130,21 @@ class LifecycleService:
             logger.info("IBKR 未连接，运行于纯 dry-run（虚拟成交）")
         self.context.order_mgr.on_lot_closed = self.context.events._on_lot_closed
         self.context.order_mgr.on_lot_revived = self.context.events._on_lot_revived
+        self.context.order_mgr.on_fill_event = lambda event: self.context.events.record_event("execution_fill", **event)
+        def entry_stage(**event):
+            self.context.events.record_event("execution_entry_stage", **event)
+
+        self.context.order_mgr.on_entry_stage = entry_stage
+        self.context.gateway.on_entry_stage = entry_stage
         self.context.order_mgr.price_provider = self.context.accounts._tv_last_price
         if connected:
             await self.context.order_mgr.reconcile()
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        await self.context.auto_service.restore(datetime.now(ZoneInfo("America/New_York")).date())
+        self.context.automatic._auto_enabled = self.context.auto_service.enabled
+        self.context.automatic._auto_strategy_name = self.context.auto_service.strategy_name
         await self.context.collector.start()
         await self.context.copy_supervisor.start(self.context.copy._load_copy_servers())
         self.context.snapshot._broadcast_task = self.context.tasks.start(
@@ -171,9 +211,6 @@ class LifecycleService:
             "desktop._tv_startup_check",
             lambda: self.context.desktop._tv_startup_check(),
         )
-        self.context.reports._report_loop_task = self.context.tasks.start(
-            "reports._report", lambda: self.context.reports._report_loop()
-        )
         self.context.precheck._precheck_task = self.context.tasks.start(
             "precheck._precheck", lambda: self.context.precheck._precheck_loop()
         )
@@ -209,6 +246,7 @@ class LifecycleService:
             if t:
                 t.cancel()
         for stop in (
+            self.context.night_test.disconnect,
             self.context.copy_supervisor.stop_all,
             self.context.collector.stop,
             self.context.gateway.disconnect,
@@ -220,3 +258,32 @@ class LifecycleService:
 
     async def api_startup(self) -> dict:
         return self.context.lifecycle._startup_status()
+
+    async def repair_pine_cache(self) -> dict:
+        if self._cache_repair_running:
+            raise HTTPException(409, "缓存修复正在进行")
+        ids = list(self.context.collector.cache_issues)
+        if not ids:
+            raise HTTPException(409, "当前没有待修复的指标正文缓存")
+        self._cache_repair_running = True
+        script = Path(__file__).resolve().parents[2] / "service" / "refresh_pine_texts.py"
+        args = [arg for indicator_id in ids for arg in ("--indicator", indicator_id)]
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, str(script), *args,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode:
+                detail = stderr.decode(errors="replace").strip().splitlines()
+                logger.warning("指标正文缓存修复失败: %s", detail[-1] if detail else proc.returncode)
+                if detail and "官方帧正文不完整或布局版本落后" in detail[-1]:
+                    raise HTTPException(502, "请在专用 TradingView 图表加载上方所列指标的最新版本，再点修复。")
+                raise HTTPException(502, "缓存修复验证失败，请查看控制台日志后重试。")
+            return {"ok": True}
+        finally:
+            if proc is not None and proc.returncode is None:
+                proc.terminate()
+                await proc.wait()
+            self._cache_repair_running = False

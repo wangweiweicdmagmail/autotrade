@@ -39,20 +39,27 @@ IBKR 账户。每个 IBKR 服务器一个独立进程：
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import math
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import config
 from execution.ibkr import IBKRGateway
+from execution.order_lot import OrderManager
+from execution.risk import RiskConfig, RiskGate
+from execution.writer_lock import acquire_writer_lock, release_writer_lock
 
 logger = logging.getLogger("copy_trader")
+ET = ZoneInfo("America/New_York")
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_SERVERS_PATH = PROJECT_ROOT / "logs" / "copy_servers.json"
@@ -102,7 +109,7 @@ class CopyFollower:
     def __init__(self, name: str, server_cfg: dict, dry_run: bool = False,
                  logs_dir: Optional[Path] = None,
                  servers_path: Optional[Path] = None,
-                 gateway=None) -> None:
+                 gateway=None, order_manager=None) -> None:
         self.name = name
         self.cfg = dict(server_cfg)
         self.logs_dir = Path(logs_dir) if logs_dir else PROJECT_ROOT / "logs"
@@ -124,6 +131,15 @@ class CopyFollower:
                 fa_group=self.cfg.get("fa_group", ""),
                 enabled=bool(self.cfg.get("enabled")) and not dry_run,
             )
+        self.order_manager = order_manager
+        self._managed = gateway is None or order_manager is not None
+        self._copy_lock = asyncio.Lock()
+        self._last_snapshot = 0.0
+        self._next_reconcile = 0.0
+        self._recovery_block = ""
+        self._last_submit = {}
+        self._managed_ready = False
+        self._simulation = bool(dry_run)
         self.gateway.disconnect_callback = self._on_ibkr_disconnect
 
         # master lot_id -> {"symbol","side","qty","stop_px","state",
@@ -131,6 +147,7 @@ class CopyFollower:
         self.map: Dict[str, dict] = {}
         self.skip: set = set()                 # 已见但不跟的 master lot
         self._seen: Dict[str, str] = {}        # master lot_id -> 最近状态
+        self._targets: Dict[str, int] = {}
         self._master_lots: Dict[str, dict] = {}  # master lot_id -> 最近快照行
         self._master_equity: Optional[float] = None
         self._first_snapshot = True
@@ -165,17 +182,41 @@ class CopyFollower:
         try:
             payload = json.loads(self.map_path.read_text(encoding="utf-8"))
             m = payload.get("map")
+            if not isinstance(m, dict):
+                raise ValueError("跟单映射格式无效")
+            if self._managed and payload.get("binding") not in (None, self._binding()):
+                raise ValueError("跟单账户或主端配置已变更")
+            risk = payload.get("risk") or {}
+            self.halted = bool(risk.get("halted"))
+            self.baseline_equity = float(risk.get("baseline_equity", 0))
+            self.baseline_date = str(risk.get("baseline_date", ""))
+            self.skip = set(payload.get("skip", []))
             if isinstance(m, dict):
                 self.map = m
                 logger.info("映射已加载: %d 条 (%s)", len(self.map), self.map_path)
         except FileNotFoundError:
-            pass
-        except (OSError, ValueError, TypeError) as e:
-            logger.error("映射文件损坏，按空映射启动 (%s): %s", self.map_path, e)
+            if self._managed and self.order_manager and self.order_manager.list_lots():
+                self._recovery_block = "跟单控制记录缺失，账本归属待核对"
+        except (OSError, ValueError, TypeError, AttributeError) as e:
+            self._recovery_block = "跟单映射损坏，需人工对账"
+            logger.error("映射文件损坏 (%s): %s", self.map_path, e)
 
     def _save_map(self) -> None:
-        _atomic_write_json(self.map_path, {"map": self.map})
+        if self._recovery_block:
+            return
+        _atomic_write_json(self.map_path, {
+            "map": self.map, "skip": sorted(self.skip),
+            "binding": self._binding(),
+            "risk": {"halted": self.halted, "baseline_equity": self.baseline_equity,
+                     "baseline_date": self.baseline_date},
+        })
         self._map_dirty = False
+
+    def _binding(self):
+        return {key: self.cfg.get(key, default) for key, default in (
+            ("host", "127.0.0.1"), ("port", 7497), ("client_id", 13),
+            ("account_id", ""), ("fa_group", ""), ("master_ws", "ws://127.0.0.1:8000/ws"),
+        )}
 
     def _event(self, event_type: str, **data) -> None:
         try:
@@ -247,10 +288,12 @@ class CopyFollower:
         mult = float(self.cfg.get("size_multiplier", 1.0))
         avg_fill = float(lot.get("avg_fill") or 0)
         stop_px = float(lot.get("stop_px") or 0)
-        master_qty = int(lot.get("qty") or 0)
+        master_qty = int(lot.get("filled_qty") or 0) if self._managed else int(lot.get("qty") or 0)
         if mode == "risk":
             if avg_fill <= 0 or stop_px <= 0:
                 return 0, "master avg_fill/stop_px 缺失，无法以损定量"
+            if self._managed and (avg_fill - stop_px) * (1 if lot.get("side") == "long" else -1) <= 0:
+                return 0, "保护止损已到成本或越过成本，不能据此定量"
             dist = max(0.01, abs(avg_fill - stop_px))
             qty = math.floor(float(self.cfg.get("risk_usd", 0)) * mult / dist)
         elif mode == "multiplier":
@@ -291,6 +334,11 @@ class CopyFollower:
         connected = await self.gateway.connect()
         if not connected:
             logger.warning("IBKR 未连接（gateway 自带重连机制会继续尝试）")
+        if self._managed:
+            await self._managed_reconcile()
+            await self._check_drawdown()
+            self._save_map()
+            return
         # 恢复 STP 句柄 + 轻量 unit
         trades = None
         if getattr(self.gateway, "_connected", False):
@@ -350,6 +398,8 @@ class CopyFollower:
                     len(self.map), self.baseline_equity)
 
     def _on_ibkr_disconnect(self) -> None:
+        self._managed_ready = False
+        self._next_reconcile = 0.0
         self.last_error = "IBKR 断线（gateway 自动重连中）"
         logger.warning("IBKR 断线回调")
 
@@ -360,6 +410,10 @@ class CopyFollower:
     async def process_snapshot(self, snap: dict) -> None:
         """处理一帧 master /ws 快照。"""
         if snap.get("type") not in (None, "snapshot"):
+            return
+        if self._managed:
+            async with self._copy_lock:
+                await self._process_managed_snapshot(snap)
             return
         lots = snap.get("lots") or []
         status = snap.get("status") or {}
@@ -427,6 +481,206 @@ class CopyFollower:
     # ------------------------------------------------------------------
     # 入场 / 改止损 / 平仓
     # ------------------------------------------------------------------
+
+    async def _managed_reconcile(self) -> None:
+        if self._recovery_block or not self.order_manager:
+            return
+        if any(row.get("state") != F_CLOSED for row in self.map.values()):
+            self._recovery_block = "旧跟单映射有未核验订单，完成券商对账和迁移前暂停跟单"
+            return
+        if not self.gateway.enabled:
+            self._managed_ready = self._simulation
+            return
+        if not self.gateway._connected:
+            self._managed_ready = False
+            return
+        now = time.time()
+        if now < self._next_reconcile:
+            return
+        self._next_reconcile = now + 15
+        self._managed_ready = False
+        await self.order_manager.reconcile()
+        recovery = self.order_manager.recovery_status()
+        self._managed_ready = (
+            recovery["phase"] == "checked" and not recovery["position_differences"]
+        )
+
+    def _managed_groups(self):
+        groups = {}
+        for row in self.order_manager.list_lots():
+            mid = (row.get("signal_snapshot") or {}).get("copy_master_lot_id")
+            if mid:
+                groups.setdefault(mid, []).append(row)
+        return groups
+
+    async def _process_managed_snapshot(self, snap):
+        status = snap.get("status") or {}
+        stamp = snap.get("ts")
+        if (not isinstance(stamp, (int, float)) or not math.isfinite(stamp)
+                or not -5 <= time.time() - stamp <= 15 or stamp <= self._last_snapshot):
+            return
+        if self.gateway.enabled and status.get("dry_run") is not False:
+            return
+        self._last_snapshot = stamp
+        self.last_sync_ts = time.time()
+        self._master_equity = status.get("equity")
+        if self._recovery_block or not self._managed_ready:
+            return
+        if self.gateway.enabled and not self.gateway._connected:
+            return
+        if self._map_dirty:
+            self._save_map()
+        groups = self._managed_groups()
+        for lot in snap.get("lots") or []:
+            if time.time() - stamp > 15:
+                break
+            mid = lot.get("lot_id")
+            if not isinstance(mid, str) or not mid:
+                continue
+            state = lot.get("state")
+            self._seen[mid] = state
+            rows = groups.get(mid, [])
+            if not rows and (mid in self.map or mid in self.skip):
+                continue
+            if not rows and self._first_snapshot and not self.cfg.get("copy_existing_on_start"):
+                if state in (M_ACTIVE, M_CLOSING):
+                    self.skip.add(mid)
+                    self._map_dirty = True
+                continue
+            if state not in (M_ACTIVE, M_PENDING, M_CLOSING, M_CLOSED, M_CANCELLED):
+                continue
+            await self._sync_managed_lot(mid, lot, rows)
+        self._first_snapshot = False
+        if self._map_dirty:
+            self._save_map()
+
+    async def _sync_managed_lot(self, mid, master, rows):
+        state = master["state"]
+        if state == M_PENDING and not rows:
+            return
+        if not rows and state != M_ACTIVE:
+            return
+        actual = max(0, int(master.get("filled_qty") or 0))
+        live = [row for row in rows if row["state"] in ("ACTIVE", "CLOSING", "PENDING")]
+        if any(row.get("entry_submission_pending") or row.get("partial_exit")
+               or row["state"] == "CLOSING" for row in live):
+            return
+        # CLOSED retains its historical filled quantity in the master snapshot.
+        closing = state in (M_CLOSING, M_CLOSED, M_CANCELLED)
+        if rows:
+            ratio = rows[0]["signal_snapshot"]["copy_size_ratio"]
+            target = math.floor(actual * ratio + 1e-9)
+        else:
+            if not actual or self.halted or not self._direction_ok(master.get("side")):
+                return
+            target, error = self._compute_qty(master)
+            if error:
+                self._record_failure(mid, "entry", error)
+                return
+            ratio = target / actual
+        if state in (M_CLOSED, M_CANCELLED):
+            target = 0
+        self._targets[mid] = target
+        held = sum(row["filled_qty"] for row in live)
+        pending = [row for row in live if row["state"] == "PENDING"]
+        if pending:
+            planned = held + sum(max(0, row["qty"] - row["filled_qty"]) for row in pending)
+            if closing or planned > target:
+                for row in pending:
+                    await self.order_manager.cancel_lot(row["lot_id"])
+            return
+        price = float(master.get("exit_px") or master.get("last_px") or master.get("avg_fill") or 0)
+        if held > target:
+            row = next((row for row in reversed(live) if row["filled_qty"] > 0), None)
+            if row is None:
+                return
+            qty = min(held - target, row["filled_qty"])
+            if qty == row["filled_qty"]:
+                ok, error = await self.order_manager.close_lot(row["lot_id"], price, "copy_exit")
+            else:
+                ok, error = await self.order_manager.close_half(
+                    row["lot_id"], price, "copy_reduce", quantity=qty,
+                )
+            if not ok:
+                self._record_failure(mid, "close", error)
+            else:
+                self._clear_failures(mid, "close")
+            return
+        stop = float(master.get("stop_px") or 0)
+        for row in live:
+            tighter = stop > row["stop_px"] if row["side"] == "long" else 0 < stop < row["stop_px"]
+            if tighter:
+                ok, error = await self.order_manager.update_trail(row["lot_id"], stop)
+                if not ok:
+                    self._record_failure(mid, "modify", error)
+                else:
+                    self._clear_failures(mid, "modify")
+        if closing or held >= target or self.halted or not self.equity or self.equity <= 0:
+            return
+        if any(row["state"] in ("FAILED", "CANCELLED", "CLOSED")
+               or row.get("close_filled_qty", 0) for row in rows):
+            return  # Do not refill after cancellation, stop execution or manual intervention.
+        if self.order_manager.recovery_status()["blocks_entry"]:
+            return
+        if time.time() < self._last_submit.get(mid, 0):
+            return
+        self._last_submit[mid] = time.time() + 5
+        symbol, side = master.get("symbol"), master.get("side")
+        avg = float(master.get("avg_fill") or 0)
+        if not symbol or side not in ("long", "short") or not all(
+            math.isfinite(p) and p > 0 for p in (avg, stop)
+        ):
+            return
+        limit = self._entry_limit(side, avg)
+        qty = min(target - held, config.RISK_MAX_ORDER_QTY)
+        if self.cfg.get("size_mode", "risk") == "risk":
+            dist = (limit - stop) * (1 if side == "long" else -1)
+            if dist <= 0:
+                return
+            budget = float(self.cfg.get("risk_usd", 0)) * float(self.cfg.get("size_multiplier", 1))
+            qty = min(qty, max(0, math.floor(budget / dist)))
+        if qty <= 0:
+            return
+        if not rows:
+            ratio = qty / actual
+        placed, error = await self.order_manager.place_limit_stop_lot(
+            symbol, side, qty, limit, stop, limit_type="copy", entry_order_type="LMT",
+            trader=f"copy:{self.name}",
+            signal_snapshot={"copy_master_lot_id": mid, "copy_size_ratio": ratio},
+        )
+        if placed is None:
+            self._record_failure(mid, "entry", error)
+        else:
+            self._clear_failures(mid, "entry")
+            self.synced += 1
+
+    def _managed_status(self):
+        orders = []
+        recovery = self.order_manager.recovery_status()
+        for mid, rows in self._managed_groups().items():
+            for row in rows:
+                orders.append({
+                    "master_lot_id": mid, "follower_lot_id": row["lot_id"],
+                    "symbol": row["symbol"], "side": row["side"],
+                    "master_state": self._seen.get(mid, ""), "follower_state": row["state"],
+                    "qty": row["filled_qty"] if row["state"] != "CLOSED" else 0,
+                    "target_qty": self._targets.get(mid),
+                    "pending_qty": max(0, row["qty"] - row["filled_qty"]) if row["state"] == "PENDING" else 0,
+                    "protection_qty": row.get("protection_order_qty"),
+                    "stop_px": row["stop_px"], "error": row.get("note", ""),
+                })
+        return {
+            "name": self.name, "ts": time.time(), "connected": self.gateway._connected,
+            "master_ws": self.master_ws, "equity": self.equity, "synced": self.synced,
+            "pending_map": sum(row["follower_state"] in ("ACTIVE", "PENDING", "CLOSING") for row in orders),
+            "failed": sum(not row.get("dismissed") for row in self.failures),
+            "last_sync_ts": self.last_sync_ts, "drawdown_pct": self.drawdown_pct,
+            "halted": self.halted, "orders": orders, "failures": self.failures,
+            "recovery": recovery, "last_error": self._recovery_block or (
+                "跟单账户尚未完成对账或持仓存在差异" if not self._managed_ready else
+                "跟单订单待核对，暂停新入场" if recovery["blocks_entry"] else self.last_error
+            ),
+        }
 
     async def _request_entry(self, lot: dict) -> None:
         """首次转 ACTIVE → 市价入场 + STP 同发；失败进指数退避重试。"""
@@ -697,11 +951,12 @@ class CopyFollower:
         await self._refresh_equity()
         if not self.equity or self.equity <= 0:
             return
-        today = time.strftime("%Y-%m-%d")
+        today = datetime.now(ET).date().isoformat()
         if self.baseline_equity <= 0 or self.baseline_date != today:
             if not self.halted:
                 self.baseline_equity = self.equity
                 self.baseline_date = today
+                self._map_dirty = True
         if self.baseline_equity <= 0:
             return
         dd = max(0.0, (self.baseline_equity - self.equity)
@@ -710,6 +965,7 @@ class CopyFollower:
         limit = float(self.cfg.get("max_drawdown_pct", 0) or 0)
         if not self.halted and limit > 0 and dd > limit:
             self.halted = True
+            self._map_dirty = True
             logger.warning("回撤熔断触发: 净值 %.2f 较基准 %.2f 回撤 %.2f%% > %.2f%%"
                            "——停止新开仓镜像（已有仓位继续管理/平仓同步）",
                            self.equity, self.baseline_equity, dd, limit)
@@ -744,13 +1000,17 @@ class CopyFollower:
             self._event("copy_cmd_dismiss", master_lot_id=mid)
         if data.get("unhalt"):
             self.halted = False
+            self._map_dirty = True
             self.drawdown_pct = 0.0
             if self.equity and self.equity > 0:
                 self.baseline_equity = self.equity
-                self.baseline_date = time.strftime("%Y-%m-%d")
+                self.baseline_date = datetime.now(ET).date().isoformat()
             logger.warning("人工解除熔断（新基准净值 %.2f）", self.baseline_equity)
             self._event("copy_unhalted", baseline_equity=self.baseline_equity)
         for mid in data.get("retry") or []:
+            if self._managed:
+                self._next_reconcile = 0.0
+                continue
             self._clear_failures(mid)
             rec = self.map.get(mid)
             lot = self._master_lots.get(mid)
@@ -774,6 +1034,8 @@ class CopyFollower:
     # ------------------------------------------------------------------
 
     def _build_status(self) -> dict:
+        if self._managed and self.order_manager:
+            return self._managed_status()
         orders = []
         for mid, rec in self.map.items():
             err = next((f["error"] for f in reversed(self.failures)
@@ -834,6 +1096,17 @@ class CopyFollower:
             try:
                 if n % int(CONFIG_RELOAD_SECONDS) == 0:
                     self.reload_config()
+                if self._managed:
+                    async with self._copy_lock:
+                        await self._managed_reconcile()
+                        await self._check_drawdown()
+                        if n % int(CMD_POLL_SECONDS) == 0:
+                            await self._process_cmd()
+                        if self._map_dirty:
+                            self._save_map()
+                        if n % int(STATUS_SECONDS) == 0:
+                            self.write_status()
+                    continue
                 await self._check_drawdown()
                 if n % int(CMD_POLL_SECONDS) == 0:
                     await self._process_cmd()
@@ -894,6 +1167,31 @@ class CopyFollower:
             logger.warning("服务器 %s enabled=false，进程退出（监管方不应再拉起）",
                            self.name)
             return 0
+        if self._managed:
+            mode = "paper" if self._simulation else "live"
+            directory = self.logs_dir / f"copy-{self.name}-{mode}"
+            directory.mkdir(parents=True, exist_ok=True)
+            if self._simulation:
+                self.map_path = directory / "control.json"
+                self.status_path = directory / "status.json"
+                self.cmd_path = directory / "cmd.json"
+                self.events_path = directory / "events.jsonl"
+            binding = self._binding()
+            gateway_key = hashlib.sha256(
+                f"{binding['host']}:{binding['port']}".encode()
+            ).hexdigest()[:16]
+            lock = directory / "writer.lock" if self._simulation else self.logs_dir / f"copy-gateway-{gateway_key}.lock"
+            if not acquire_writer_lock(str(lock.resolve()), owner=self):
+                logger.error("跟单写进程已存在: %s", self.name)
+                return 1
+            if self.order_manager is None:
+                risk = RiskGate(RiskConfig(
+                    max_order_qty=config.RISK_MAX_ORDER_QTY,
+                    max_open_positions=config.RISK_MAX_OPEN_POSITIONS,
+                    max_total_risk_usd=config.RISK_MAX_TOTAL_RISK_USD,
+                ), halt_dir=directory)
+                self.order_manager = OrderManager(self.gateway, risk, directory / "lots.json")
+                self.order_manager._load(allow_recovery=True)
         await self.startup()
         periodic = asyncio.create_task(self._periodic_loop())
         ws_task = asyncio.create_task(self._ws_loop())
@@ -903,6 +1201,7 @@ class CopyFollower:
         finally:
             for t in (periodic, ws_task):
                 t.cancel()
+            await asyncio.gather(periodic, ws_task, return_exceptions=True)
             self.write_status()
             if self._map_dirty:
                 self._save_map()
@@ -910,6 +1209,8 @@ class CopyFollower:
                 await self.gateway.disconnect()
             except Exception:
                 pass
+            if self._managed:
+                release_writer_lock(owner=self)
         return 0
 
 

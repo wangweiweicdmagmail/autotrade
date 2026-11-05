@@ -23,10 +23,15 @@ class SnapshotService:
             "status": {
                 "execution_enabled": bool(self.context.gateway.enabled),
                 "connected": bool(self.context.gateway._connected),
+                "broker_route": {
+                    "account": getattr(self.context.gateway, "account_id", None),
+                    "fa_group": getattr(self.context.gateway, "fa_group", None),
+                },
                 "dry_run": not bool(self.context.gateway.enabled),
                 "equity": status["equity"],
                 "daily_pnl": status["daily_pnl"],
                 "halted": self.context.risk_gate.is_halted(),
+                "recovery": self.context.order_mgr.recovery_status(),
                 "open_symbols": open_symbols,
                 "total_risk_usd": self.context.order_mgr.risk_exposure()["total"],
                 "max_total_risk_usd": config.RISK_MAX_TOTAL_RISK_USD,
@@ -34,6 +39,7 @@ class SnapshotService:
                     status["equity"]
                 ),
                 "max_order_qty": config.RISK_MAX_ORDER_QTY,
+                "risk_per_trade_usd": config.RISK_PER_TRADE_USD,
                 "allow_short": config.ALLOW_SHORT,
                 "fvg_chase_max_ratio": config.FVG_CHASE_MAX_ATR_RATIO,
                 "stop_atr_mult": self.context.settings._stop_atr_mult(),
@@ -41,6 +47,7 @@ class SnapshotService:
                 "pyramid_breakeven_r": self.context.settings._pyramid_breakeven_r(),
                 "pyramid_add_unlock_r": self.context.settings._pyramid_add_unlock_r(),
                 "screen_premarket_filter": self.context.settings._screen_premarket_filter(),
+                "screen_opening_range_filter": self.context.settings._screen_opening_range_filter(),
                 "fvg_premarket_filter": self.context.settings._fvg_premarket_filter(),
                 "news": self.context.news._news_status(),
                 "imessage_recipient": str(
@@ -63,11 +70,15 @@ class SnapshotService:
                 "tv_study": self.context.collector.study_health(),
                 "tv_view": self.context.desktop._tv_view_info,
             },
-            "market": self.context.collector.latest(),
+            "market": {
+                symbol: {key: value for key, value in data.items() if key != "opening_breakout_history"}
+                for symbol, data in self.context.collector.latest().items()
+            },
             "positions": self.context.order_mgr.aggregate(),
             "lots": self.context.order_mgr.list_lots(),
             "logs": list(self.context.events._log_buffer),
             "screen": self.context.signals.compute_screen(),
+            "momentum": self.context.signals.compute_momentum(),
             "scan_alerts": sorted(
                 self.context.monitoring._scan_alerts.values(),
                 key=lambda x: x.get("scanned_at", 0),
@@ -110,6 +121,10 @@ class SnapshotService:
             },
             "fvg_monitor": self.context.signals._fvg_monitor_snapshot(),
             "breakout_signals": list(self.context.signals._breakout_signals),
+            "opening_breakouts": self.context.signals.opening_breakout_display(time.time()),
+            "opening_breakout_coverage": self.context.signals.opening_breakout_coverage(
+                config.WATCHLIST, time.time()
+            ),
             "alerts": self.context.notifier.active_alerts(),
             "auto": {
                 "enabled": self.context.automatic._auto_enabled,

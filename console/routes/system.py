@@ -1,12 +1,18 @@
 """HTTP adapters; application logic lives in services."""
 
-from fastapi import Depends
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import FileResponse
-from fastapi import Request
+
 from console.dependencies import get_services
-from fastapi import APIRouter
 
 router = APIRouter()
+
+
+@router.get("/system-docs/{document}", include_in_schema=False)
+async def system_documentation(document: str, download: bool = False) -> FileResponse:
+    from console.services.documentation import documentation_file
+
+    return documentation_file(document, download=download)
 
 
 @router.post("/api/system/shutdown")

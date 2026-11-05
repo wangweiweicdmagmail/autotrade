@@ -8,9 +8,8 @@ IBKR 网关适配层 (IBKRGateway)
 
 - TWS 实盘端口 7496；client_id 与 nautilus 项目错开（默认 11）；
 - FA 账户组：order.faGroup = 组名，faMethod 留空（带值被拒 10226/321）；
-- 入场单用 marketable LIMIT（限价=参考价±0.5%，tif=DAY），
-  不用 bare MARKET（延迟行情被拒 error 10349），也不用 GTC
-  （未成交单不隔夜，引擎宕机 IBKR 收盘自动作废，双保险）；
+- Pine 自动入场使用 MKT DAY 父单 + STP GTC 保护子单；手动限价与历史
+  marketable LIMIT 入口继续保留。延迟行情标的仍受交易黑名单约束；
 - 保护止损 STOP_MARKET GTC + 止盈 LIMIT GTC，OCA 组联动（ocaType=1）；
 - IBKR 的 order error 不一定事件化 → submit 后 2.5s 主动核对订单状态；
 - dry-run 门控：enabled=False 时所有下单动作只记日志，返回伪造句柄，
@@ -92,6 +91,8 @@ class IBKRGateway:
         res = await gw.place_entry(unit)      # dict，含 ok/status/order_id/trade
     """
 
+    supports_order_refs = True
+
     def __init__(self, host: str, port: int, client_id: int,
                  account_id: str, fa_group: str, fa_method: str = "",
                  enabled: bool = False) -> None:
@@ -102,6 +103,7 @@ class IBKRGateway:
         self.fa_group = fa_group
         self.fa_method = fa_method
         self.enabled = enabled
+        self.on_entry_stage = None
         self.ib = None          # ib_async.IB，connect 后可用
         self._connected = False
         self.ibkr_time = 0.0                # IBKR 服务器时间戳（心跳探测时更新）
@@ -428,7 +430,7 @@ class IBKRGateway:
                 "trail_trade": trail_trade}
 
     async def place_market_with_stop(self, symbol: str, side: str, qty: int,
-                                     stop_px: float) -> dict:
+                                     stop_px: float, order_ref: str = "") -> dict:
         """市价单（父，MKT DAY）+ 固定 STOP 止损（子，STP GTC，parentId 关联）。
 
         严格市价成交（v2026-10-24 用户定稿：只做实时行情标的、严格市价成交）。
@@ -448,9 +450,24 @@ class IBKRGateway:
                     "stop_order_id": fake_stop, "status": "DryRun"}
 
         from ib_async import MarketOrder, Order
+        def audit(stage, **details):
+            if self.on_entry_stage is None:
+                return
+            try:
+                self.on_entry_stage(
+                    stage=stage, symbol=symbol, side=side, qty=qty,
+                    lot_id=order_ref.removeprefix("autotrade:") if order_ref else None,
+                    **details,
+                )
+            except Exception:
+                logger.exception("券商发单审计回调失败 %s", order_ref)
+
+        qualify_started_at = time.time()
         contract = await self._qualify(symbol)
+        qualified_at = time.time()
         parent = MarketOrder(action, qty, tif="DAY",
                              orderId=self._next_tool_order_id(), transmit=False)
+        parent.orderRef = order_ref + ":entry" if order_ref else ""
         self._apply_fa(parent)
         stop = Order()
         stop.orderType = "STP"
@@ -461,10 +478,17 @@ class IBKRGateway:
         stop.orderId = self._next_tool_order_id()
         stop.parentId = parent.orderId
         stop.transmit = True
+        stop.orderRef = order_ref + ":stop" if order_ref else ""
         self._apply_fa(stop)
         t0 = time.time()
         entry_trade = self.ib.placeOrder(contract, parent)
+        stop_send_at = time.time()
         stop_trade = self.ib.placeOrder(contract, stop)
+        audit(
+            "sent_to_tws", order_id=parent.orderId, stop_order_id=stop.orderId,
+            qualify_started_at=qualify_started_at, qualified_at=qualified_at,
+            entry_send_at=t0, stop_send_at=stop_send_at,
+        )
         await asyncio.sleep(2.5)
         status = entry_trade.orderStatus.status
         stop_status = stop_trade.orderStatus.status
@@ -487,7 +511,7 @@ class IBKRGateway:
                 "trade": entry_trade, "stop_trade": stop_trade}
 
     async def place_limit_with_stop(self, symbol: str, side: str, qty: int,
-                                    limit_px: float, stop_px: float) -> dict:
+                                    limit_px: float, stop_px: float, order_ref: str = "") -> dict:
         """
         限价单（父，LMT DAY）+ 固定 STOP 止损（子，STP GTC，parentId 关联）。
         parentId 关联语义：父单未成交时子单挂起；父单被撤/平仓时子单随之
@@ -497,7 +521,9 @@ class IBKRGateway:
         action = "BUY" if side == "long" else "SELL"
         opp = "SELL" if side == "long" else "BUY"
 
-        if not (self.enabled and self._connected):
+        if self.enabled and not self._connected:
+            return {"ok": False, "error": "IBKR 未连接，限价入场未提交"}
+        if not self.enabled:
             fake_entry = next(self._fake_ids)
             fake_stop = next(self._fake_ids)
             logger.info("[DRY-RUN] 限价+STOP 子单 %s: %s x%d @LMT %.2f | STOP %s %.2f | FA=%s",
@@ -511,6 +537,7 @@ class IBKRGateway:
         # 显式分配 orderId，子单 parentId 才能正确关联父单
         parent = LimitOrder(action, qty, round(limit_px, 2), tif="DAY",
                             orderId=self._next_tool_order_id(), transmit=False)
+        parent.orderRef = order_ref + ":entry" if order_ref else ""
         self._apply_fa(parent)
         stop = Order()
         stop.orderType = "STP"
@@ -521,6 +548,7 @@ class IBKRGateway:
         stop.orderId = self._next_tool_order_id()
         stop.parentId = parent.orderId
         stop.transmit = True
+        stop.orderRef = order_ref + ":stop" if order_ref else ""
         self._apply_fa(stop)
         t0 = time.time()
         entry_trade = self.ib.placeOrder(contract, parent)
@@ -549,7 +577,7 @@ class IBKRGateway:
 
     async def place_midpoint_oca(self, symbol: str, side: str, qty: int,
                                  limit_px: float, breakout_px: float,
-                                 stop_px: float, oca_group: str) -> dict:
+                                 stop_px: float, oca_group: str, order_ref: str = "") -> dict:
         """中点 OCA 双腿入场：LMT 中点父单 + STP 突破入场腿，一成全撤。
 
         结构：LMT 父单（transmit=False，OCA 组）+ STP 止损子单（parentId
@@ -580,6 +608,7 @@ class IBKRGateway:
                             orderId=self._next_tool_order_id(), transmit=False)
         parent.ocaGroup = oca_group
         parent.ocaType = 1                      # 成交即撤销组内其余订单
+        parent.orderRef = order_ref + ":entry" if order_ref else ""
         self._apply_fa(parent)
         stop = Order()
         stop.orderType = "STP"
@@ -590,6 +619,7 @@ class IBKRGateway:
         stop.orderId = self._next_tool_order_id()
         stop.parentId = parent.orderId          # 止损只挂中点腿，不入 OCA 组
         stop.transmit = True
+        stop.orderRef = order_ref + ":stop" if order_ref else ""
         self._apply_fa(stop)
         brk = Order()
         brk.orderType = "STP"                   # stop-market 突破入场
@@ -601,6 +631,7 @@ class IBKRGateway:
         brk.ocaGroup = oca_group
         brk.ocaType = 1
         brk.transmit = True
+        brk.orderRef = order_ref + ":breakout" if order_ref else ""
         self._apply_fa(brk)
         t0 = time.time()
         entry_trade = self.ib.placeOrder(contract, parent)
@@ -647,7 +678,9 @@ class IBKRGateway:
         sign = -1 if side == "long" else 1                # 平多卖略低 / 平空买略高
         lmt = round(ref_px * (1 + premium * sign), 2)
 
-        if not (self.enabled and self._connected):
+        if self.enabled and not self._connected:
+            return {"ok": False, "error": "IBKR 未连接，平仓未提交"}
+        if not self.enabled:
             fake = next(self._fake_ids)
             logger.info("[DRY-RUN] 平仓 %s: %s x%d @LMT %.2f",
                         symbol, action, qty, lmt)
@@ -1245,6 +1278,24 @@ class IBKRGateway:
         if total_shares <= 0:
             return None
         return round(total_amt / total_shares, 4), int(total_shares)
+
+    async def submission_order_ids(self, symbol: str, references: list) -> Optional[dict]:
+        """Recover exact persisted order references from today's executions, never by price."""
+        if not self._connected:
+            return None
+        try:
+            fills = await asyncio.wait_for(self.ib.reqExecutionsAsync(ExecutionFilter()), timeout=10)
+        except Exception:
+            logger.exception("受理意图成交引用查询失败")
+            return None
+        ticker = symbol.split(":")[-1].upper()
+        result = {reference: set() for reference in references}
+        for fill in fills:
+            execution = fill.execution
+            reference = getattr(execution, "orderRef", "")
+            if fill.contract.symbol.upper() == ticker and reference in result:
+                result[reference].add(int(execution.orderId))
+        return result
 
     async def entry_fills_by_order(self, symbol: str,
                                    order_ids) -> Optional[Dict[int, tuple]]:

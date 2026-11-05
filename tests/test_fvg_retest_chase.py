@@ -168,6 +168,7 @@ def test_chase_normal_pricing(app):
         assert call["limit_type"] == "chase"
         assert call["limit_px"] == 100.5     # 100 × 1.005
         assert call["stop_px"] == 98.0       # 智能止损：max(逻辑0.3, 1×ATR)
+        assert call["risk_usd"] == 700.0 and call["manual_entry"] is True
         assert call["reprice_bar_time"] == 0 and call["breakout_px"] == 0
     run(go())
 
@@ -205,3 +206,70 @@ def test_chase_atr_missing_rejected(app):
             await chase_req(app, force=True)
         assert ei.value.status_code == 400 and "ATR" in str(ei.value.detail)
     run(go())
+
+
+@pytest.mark.parametrize(("side", "minute", "stop"), [
+    ("long", 30, 99.7), ("short", 35, 100.3), ("long", 40, 98.0),
+])
+def test_manual_market_opening_stop(app, monkeypatch, side, minute, stop):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    stamp = datetime(2026, 11, 3, 9, minute, 10, tzinfo=ZoneInfo("America/New_York"))
+
+    class Clock:
+        @staticmethod
+        def now(tz):
+            return stamp.astimezone(tz)
+
+    monkeypatch.setattr("console.services.trading.datetime", Clock)
+    monkeypatch.setattr("config.ALLOW_SHORT", True)
+    chase_market(100, None if minute < 40 else 2.0, side)
+    market[SYM_L]["bar"]["time"] = stamp.timestamp() - 10
+    req = schemas.LimitStopOrderRequest(
+        symbol=SYM_L, side=side, qty=10, limit_px=1, stop_px=1, limit_type="market",
+    )
+    assert run(app.trading.api_place_limit_stop(req))["ok"]
+    call = app.order_mgr.place_calls[-1]
+    assert call["stop_px"] == stop
+    assert call["risk_ref_px"] == 100
+    assert (call["signal_snapshot"].get("stop_source") == "opening_bar_extreme") == (minute < 40)
+
+
+@pytest.mark.parametrize(("side", "stop", "close"), [
+    ("long", 97.25, 100.0), ("short", 103.75, 100.0),
+])
+def test_opening_breakout_uses_fixed_signal_stop_and_strict_market(app, monkeypatch, side, stop, close):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    stamp = datetime(2026, 11, 3, 10, 5, 10, tzinfo=ZoneInfo("America/New_York"))
+
+    class Clock:
+        @staticmethod
+        def now(tz):
+            return stamp.astimezone(tz)
+
+    monkeypatch.setattr("console.services.trading.datetime", Clock)
+    monkeypatch.setattr("config.ALLOW_SHORT", True)
+    monkeypatch.setattr("config.MARKET_ORDER_STRICT", False)
+    chase_market(close, 2.0, side)
+    market[SYM_L]["bar"]["time"] = stamp.timestamp() - 10
+    from engine.opening_breakout import RULES_VERSION
+    signal = {
+        "rules_version": RULES_VERSION,
+        "id": "breakout-1", "symbol": SYM_L, "side": side, "close": 99.5,
+        "open": stop, "stop_px": stop, "time": stamp.timestamp() - 10,
+    }
+    monkeypatch.setattr(app.signals, "opening_breakouts", lambda now: [signal])
+    req = schemas.OpeningBreakoutOrderRequest(signal_id=signal["id"])
+    assert run(app.trading.api_place_opening_breakout(req, "master"))["ok"]
+    call = app.order_mgr.place_calls[-1]
+    assert call["entry_order_type"] == "MKT"
+    assert call["risk_ref_px"] == close
+    assert call["stop_px"] == round((stop+signal["close"])/2, 2)
+    assert call["manual_entry"] is True
+    assert call["signal_snapshot"]["opening_breakout_id"] == signal["id"]
+    assert call["signal_snapshot"]["stop_source"] == "opening_breakout_body_midpoint"
+    assert call["signal_snapshot"]["breakout_signal_open"] == stop
+    assert call["signal_snapshot"]["breakout_signal_close"] == signal["close"]

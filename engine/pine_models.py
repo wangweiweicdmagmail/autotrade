@@ -1,45 +1,15 @@
 """Pine 是策略模型：这里只映射输出，不计算任何行情入场条件。"""
 
 import json
-import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Optional
 
+# Compatibility names remain available at the original import path.
+from domain.contracts import StrategyOutput as PineOutput, finite_number as number
+
 MODEL_PATH = Path(__file__).resolve().parent.parent / "service" / "pine_strategies.json"
-
-
-def number(value) -> Optional[float]:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    return float(value) if math.isfinite(value) and abs(value) < 1e99 else None
-
-
-@dataclass(frozen=True)
-class PineOutput:
-    strategy_id: str
-    time: float
-    entry_signal: bool
-    direction: int
-    entry_price: Optional[float]
-    long_stop: Optional[float]
-    short_stop: Optional[float]
-    errors: tuple = ()
-
-    @property
-    def stop_px(self):
-        return self.long_stop if self.direction == 1 else self.short_stop
-
-    def execution_values(self) -> dict:
-        return {
-            "time": self.time,
-            "entry_signal": int(self.entry_signal and not self.errors),
-            "direction": self.direction,
-            "entry_price": self.entry_price,
-            "long_stop": self.long_stop,
-            "short_stop": self.short_stop,
-        }
 
 
 @dataclass(frozen=True)

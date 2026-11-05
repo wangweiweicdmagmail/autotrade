@@ -36,10 +36,13 @@ TV_DAEMON_JS = SERVICE_DIR / "tv_cloud_daemon.js"
 class RealtimeCollector:
     """常驻 TV 订阅采集器。"""
 
+    # 53 symbols with 161 historical rows and Pine breakout context exceed 4MB.
+    STREAM_LIMIT_BYTES = 16 * 1024 * 1024
     CONTENT_STALE_SECONDS = 45.0
     TRANSPORT_STALE_SECONDS = 15.0
     BAR_STALE_SECONDS = 600.0
     STARTUP_GRACE_SECONDS = 90.0
+    STARTUP_MAX_SECONDS = 180.0
     RESTART_COOLDOWN_SECONDS = 60.0
 
     def __init__(self, symbols: List[str]):
@@ -53,6 +56,11 @@ class RealtimeCollector:
         self._last_update = 0.0          # 最后一次收到有效 tick（传输心跳）
         self._last_content_update = 0.0  # 最后一次 symbols 实际变化
         self._last_launch = 0.0
+        self._last_startup_progress = 0.0
+        self.startup_indicators: dict = {}
+        self.startup_subscribed = 0
+        self.cache_issues: dict[str, dict] = {}
+        self._started_at = None
         self._last_restart = 0.0
         self.latest_bar_time: float = 0.0   # 最新 K 线时间戳（数据时钟）
         self.bar_update_delay: Optional[float] = None  # K线收盘→收到 的延时（秒）
@@ -68,6 +76,7 @@ class RealtimeCollector:
         if not TV_DAEMON_JS.exists():
             raise RuntimeError(f"daemon 不存在: {TV_DAEMON_JS}")
         self._running = True
+        self._started_at = time.monotonic()
         try:
             await self._launch()
         except Exception:
@@ -75,17 +84,28 @@ class RealtimeCollector:
             raise
         self._watchdog_task = asyncio.create_task(self._watchdog_loop())
 
+    @property
+    def starting_up(self) -> bool:
+        return (
+            self._running
+            and self._started_at is not None
+            and time.monotonic() - self._started_at < self.STARTUP_GRACE_SECONDS
+        )
+
     async def _launch(self) -> None:
         """启动 daemon 及其专属 stdout/stderr 消费任务。"""
         self._last_launch = time.time()
+        self._last_startup_progress = 0.0
+        self.startup_indicators = {}
+        self.startup_subscribed = 0
         self._proc = await asyncio.create_subprocess_exec(
             "node", str(TV_DAEMON_JS), "--symbols", ",".join(self.symbols),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(SERVICE_DIR),
-            # tick JSON 单行 = 全部标的快照，54 标的实测 71KB > asyncio 默认
-            # 64KB 流上限（readline 抛 ValueError 静默断流）；放宽到 4MB
-            limit=4 * 1024 * 1024,
+            # Whole-watchlist ticks now include historical Pine context (>4MB).
+            # Keep a bounded buffer with headroom for the complete snapshot.
+            limit=self.STREAM_LIMIT_BYTES,
         )
         logger.info("TV 订阅采集器启动: %d 个标的", len(self.symbols))
         self._drain_task = asyncio.create_task(self._stderr_drain(self._proc))
@@ -160,6 +180,18 @@ class RealtimeCollector:
                 continue
             if msg.get("type") == "tick":
                 self._accept_tick(msg)
+            elif msg.get("type") == "startup_progress":
+                self._last_startup_progress = time.time()
+                self.startup_subscribed = msg["subscribed"]
+            elif msg.get("type") == "indicator_startup":
+                self._last_startup_progress = time.time()
+                self.startup_indicators = {
+                    key: msg[key] for key in ("loaded", "total", "name") if key in msg
+                }
+                if issue := msg.get("cache_issue"):
+                    self.cache_issues[issue["id"]] = issue
+                if loaded_id := msg.get("loaded_id"):
+                    self.cache_issues.pop(loaded_id, None)
 
     async def _cancel_io(self) -> None:
         tasks = [t for t in (self._reader_task, self._drain_task) if t is not None]
@@ -198,8 +230,24 @@ class RealtimeCollector:
                     logger.warning("daemon 重启失败（5s 后重试）: %s", e)
                 continue
 
+            # A dead reader cannot recover by waiting for market hours or ticks.
+            # Restart only this collector's process, including during premarket.
+            if self._reader_task is not None and self._reader_task.done():
+                try:
+                    await self._restart("行情读取任务已停止")
+                    logger.warning("行情读取任务已停止，daemon 重启成功")
+                except Exception as e:
+                    logger.warning("行情读取任务已停止，daemon 重启失败: %s", e)
+                continue
+
             now = time.time()
-            if now - self._last_launch < self.STARTUP_GRACE_SECONDS:
+            launch_age = now - self._last_launch
+            if launch_age < self.STARTUP_GRACE_SECONDS:
+                continue
+            # Allow an advancing subscription batch to finish. Progress never
+            # counts as a fresh tick and cannot extend startup indefinitely.
+            if (launch_age < self.STARTUP_MAX_SECONDS
+                    and now - self._last_startup_progress < self.TRANSPORT_STALE_SECONDS):
                 continue
             if now - self._last_restart < self.RESTART_COOLDOWN_SECONDS:
                 continue

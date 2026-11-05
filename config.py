@@ -216,7 +216,7 @@ EXECUTION_ENABLED = _os.environ.get("EXECUTION_ENABLED", "0") == "1"
 # qty = floor(净值 × 0.1% / |entry - 止损价|)。
 # 净值取不到（dry-run 未连 IBKR）时退化用 RISK_PER_TRADE_USD 固定额。
 RISK_PER_TRADE_PCT = 0.001        # 0.1% 账户净值
-RISK_PER_TRADE_USD = 200.0        # 净值未知时的降级固定风险额
+RISK_PER_TRADE_USD = 700.0        # 控制台手动单笔风险、执行实例首仓预算
 RISK_MAX_ORDER_QTY = 100000       # 单笔最大股数硬顶（仅极端兜底，不再干扰以损定量）
 RISK_MAX_OPEN_POSITIONS = 0       # 最大同时持仓数；0 = 不限制（2026-10-22 用户要求取消三笔上限）
 # 总风险敞口预算：全部开放 lot 的剩余风险（PENDING 全额计划风险 /
@@ -274,7 +274,7 @@ STOP_GUARD_ENABLED = True
 # 持仓反向 FVG 守卫：持仓股 5M 收盘确认反向缺口（多仓遇空头 FVG、空仓遇多头
 # FVG）→ 浮亏立即市价平仓，浮盈立即保本 + 语音/界面提醒平仓锁利
 FVG_REVERSE_GUARD_ENABLED = True
-FVG_REVERSE_AUTO_CLOSE = True    # 浮亏自动市价平仓；False 降级为只提醒
+FVG_REVERSE_AUTO_CLOSE = False   # 反向 FVG 浮亏时仅提醒
 
 # 外部订单清理：号段外且不在旧工具白名单的挂单撤销、持仓平仓（默认按用户要求开启）
 # 外部订单/持仓处理：1=自动撤挂单+市价平残余持仓（默认，2026-10-23 用户恢复：

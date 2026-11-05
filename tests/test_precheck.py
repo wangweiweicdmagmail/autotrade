@@ -153,7 +153,7 @@ def test_copy_servers(app, monkeypatch):
     assert by["copy"]["status"] == "ok"
 
 
-def test_leftover_alerts(app, tmp_path):
+def test_leftover_alerts(app, tmp_path, monkeypatch):
     """昨日遗留：有未恢复 critical → 红；全部已恢复 → 绿；无日志 → 中性。"""
     yday = (datetime.now(ET).date()).strftime("%Y%m%d")
     # 用「昨天」日期写事件日志（tmp 目录）
@@ -169,7 +169,12 @@ def test_leftover_alerts(app, tmp_path):
     ]) + "\n", encoding="utf-8")
     rep = run(app.precheck.run_precheck())
     by = {i["key"]: i for i in rep["items"]}
-    assert by["leftover"]["status"] == "bad" and "TWS 断线" in by["leftover"]["detail"]
+    assert by["leftover"]["status"] == "ok" and "TWS" not in by["leftover"]["detail"]
+    monkeypatch.setattr(app.gateway, "_connected", False)
+    rep = run(app.precheck.run_precheck())
+    by = {i["key"]: i for i in rep["items"]}
+    assert by["ibkr"]["status"] == "bad"
+    assert by["leftover"]["status"] == "ok" and "TWS" not in by["leftover"]["detail"]
     # 补上恢复记录 → 绿
     with open(ev, "a", encoding="utf-8") as f:
         f.write(json.dumps({"type": "alert_recovered", "key": "tws_down"}) + "\n")
@@ -204,6 +209,23 @@ def test_schedule_red_alert(app, monkeypatch):
     assert run(app.precheck._precheck_check_once(fri, done)) is True
     a = app.notifier._active.get("precheck:2026-10-23")
     assert a and a["level"] == "critical" and "数据流" in a["msg"]
+
+
+def test_schedule_waits_for_startup_then_reports_persistent_data_failure(app, monkeypatch):
+    monkeypatch.setattr(app.collector, "_market", {})
+    monkeypatch.setattr(app.collector, "starting_up", True, raising=False)
+    done = set()
+    now = datetime(2026, 10, 23, 10, 0, tzinfo=ET)
+    report = run(app.precheck.run_precheck())
+    assert report["waiting_for_market"]
+    assert not any(i["status"] == "bad" for i in report["items"])
+    assert not run(app.precheck._precheck_check_once(now, done))
+    assert not done
+    assert not app.notifier.is_active("precheck:2026-10-23")
+    monkeypatch.setattr(app.collector, "starting_up", False)
+    assert run(app.precheck._precheck_check_once(now, done))
+    alert = app.notifier._active["precheck:2026-10-23"]
+    assert "数据流" in alert["msg"] and "盘前区间注入" not in alert["msg"]
 
 
 def test_api(app, monkeypatch):

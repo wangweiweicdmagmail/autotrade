@@ -12,6 +12,7 @@
         "atr": "ATR",
         "touch": "Touch_EMA9",
         "ema_9": "EMA_9",
+        "ema_slope_atr": "EMA_Slope_ATR",
         "long_stop": "Long_Stop",
         "short_stop": "Short_Stop"
       },
@@ -23,6 +24,52 @@
         "short_stop": "short_stop"
       },
       "execution_profile": "ema9_legacy_pyramid"
+    },
+    {
+      "id": "ema20_pullback",
+      "name": "EMA20-ST-ATR",
+      "indicator_id": "USER;6f23ebe5ff9c4b0d8be22eb0a69a3638",
+      "realtime_key": "e20",
+      "confirmed_key": "e20_c",
+      "plots": {
+        "entry_signal": "Entry_Signal",
+        "direction": "Direction",
+        "entry_price": "Entry_Price",
+        "long_stop": "Long_Stop",
+        "short_stop": "Short_Stop",
+        "atr": "ATR"
+      },
+      "fields": {
+        "entry_signal": "entry_signal",
+        "direction": "direction",
+        "entry_price": "entry_price",
+        "long_stop": "long_stop",
+        "short_stop": "short_stop"
+      },
+      "execution_profile": "single_entry"
+    },
+    {
+      "id": "ema7_autotrade_v2",
+      "name": "ema7_autotrade_v2",
+      "indicator_id": "USER;c6caeb4e10144cd98f2ea19b9300eba9",
+      "realtime_key": "e7v2",
+      "confirmed_key": "e7v2_c",
+      "plots": {
+        "entry_signal": "Entry_Signal",
+        "direction": "Direction",
+        "entry_price": "Entry_Price",
+        "long_stop": "Long_Stop",
+        "short_stop": "Short_Stop",
+        "atr": "ATR"
+      },
+      "fields": {
+        "entry_signal": "entry_signal",
+        "direction": "direction",
+        "entry_price": "entry_price",
+        "long_stop": "long_stop",
+        "short_stop": "short_stop"
+      },
+      "execution_profile": "single_entry"
     }
   ]
 }

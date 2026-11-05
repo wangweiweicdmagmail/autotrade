@@ -51,6 +51,29 @@ def test_pending_full_plan_risk(tmp_path):
     run(go())
 
 
+def test_manual_add_blocked_for_auto_position_even_with_symbol_alias(tmp_path):
+    async def go():
+        mgr = make_mgr(tmp_path)
+        auto, err = await mgr.place_limit_stop_lot(
+            "NASDAQ:AAA", "long", 10, 100, 99,
+            signal_snapshot={"strategy_id": "fixture_pullback"},
+        )
+        assert auto is not None, err
+        blocked, err = await mgr.place_limit_stop_lot(
+            "AAA", "long", 10, 100, 99, manual_entry=True,
+        )
+        assert blocked is None and "禁止手动加仓" in err
+        other, err = await mgr.place_limit_stop_lot(
+            "NASDAQ:BBB", "long", 10, 100, 99, manual_entry=True,
+        )
+        assert other is not None, err
+        auto_add, err = await mgr.place_limit_stop_lot(
+            "NASDAQ:AAA", "long", 10, 101, 99, trader="auto",
+        )
+        assert auto_add is not None, err
+    run(go())
+
+
 def test_active_partial_exposure(tmp_path):
     """② ACTIVE 未保本部分敞口（止损上移一半）；avg_fill 缺失回退 entry_px。"""
     async def go():

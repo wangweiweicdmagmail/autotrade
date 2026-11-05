@@ -1,5 +1,7 @@
 """Explicit composition root. Tests pass temporary paths; import does not read production state."""
 
+from console.services.night_test import NightTestService
+from console.services.strategy_shadow import StrategyShadow
 from console.services.auto import AutoService
 from engine.backtest_session import BacktestSession
 from engine.breakout_tracker import BreakoutTracker
@@ -62,6 +64,7 @@ class ConsoleServices:
     def __init__(self, paths=None):
         self.paths = paths or RuntimePaths()
         self.tasks = TaskRegistry()
+        self.night_test = NightTestService(self.paths.data_dir, self.tasks)
         self.app = None
         self.execution_writer_acquired = False
         self.config = config
@@ -160,7 +163,10 @@ class ConsoleServices:
         self.monitoring._fvg_reverse_notices: dict = {}
         self.monitoring._fvg_reverse_acted: dict = {}
         self.monitoring._fvg_reverse_task: Optional[asyncio.Task] = None
-        self.shadow_tracker: ShadowTracker = ShadowTracker()
+        self.shadow_tracker: ShadowTracker = ShadowTracker(db_path=self.paths.data_dir / "research.db")
+        self.strategy_shadow = StrategyShadow(
+            self.paths.data_dir / "strategy_shadow", config.WATCHLIST, self.settings,
+        )
         self.signals._shadow_task: Optional[asyncio.Task] = None
         self.signals._shadow_proposal_recorded: set = set()
         self.automatic._AUTO_NOTICE_EVENTS = {
@@ -190,7 +196,7 @@ class ConsoleServices:
             emit=lambda *a, **k: self.automatic._emit_auto(*a, **k),
             record_event=lambda *a, **k: self.events.record_event(*a, **k),
         )
-        self.strategy_runtime = StrategyRuntime(self.auto_service)
+        self.strategy_runtime = StrategyRuntime(self.auto_service, require_opening_range=True)
         self.automatic._auto_enabled: bool = False
         self.automatic._auto_task: Optional[asyncio.Task] = None
         self.automatic._auto_last_bar: dict = {}
@@ -221,6 +227,8 @@ class ConsoleServices:
             "core_ready": False,
             "browser_ready": False,
             "browser_error": "",
+            "split_ready": False,
+            "split_error": "",
             "ready": False,
         }
         self.system._system_stopping = False
@@ -242,6 +250,9 @@ class ConsoleServices:
         self.desktop._CONSOLE_URL = os.getenv("CONSOLE_URL", "http://127.0.0.1:8000/")
         self.desktop._CONSOLE_AUTO_OPEN_BROWSER = (
             os.getenv("CONSOLE_AUTO_OPEN_BROWSER", "1") != "0"
+        )
+        self.desktop._CONSOLE_AUTO_SPLIT_BROWSER = (
+            os.getenv("CONSOLE_AUTO_SPLIT_BROWSER", "1") != "0"
         )
         self.desktop._TV_PANES_COLLECT_JS = "\n  const readSym = cw => {\n    try { const s = cw.symbol();\n      return String((s && typeof s.value === 'function') ? s.value() : s);\n    } catch (e) {}\n    try { return String(cw.model().mainSeries().symbol()); } catch (e) {}\n    return '';\n  };\n  const rectOf = cw => {\n    try {\n      if (cw._mainDiv && cw._mainDiv.getBoundingClientRect) {\n        const b = cw._mainDiv.getBoundingClientRect();\n        return { x: b.x, y: b.y, w: b.width, h: b.height };\n      }\n    } catch (e) {}\n    return null;\n  };\n  let cws = [];\n  const api = window.TradingViewApi && window.TradingViewApi._chartWidgetCollection;\n  if (api && typeof api.getAll === 'function') cws = api.getAll() || [];\n  if (!cws.length) {\n    const col = window._exposed_chartWidgetCollection;\n    if (col && col._chartWidgetsDefs) {\n      cws = col._chartWidgetsDefs.map(d => d.chartWidget);\n    }\n  }\n  const panes = cws.map(cw => ({ cw, rect: rectOf(cw) }))\n    .filter(p => p.rect && p.rect.w > 50 && p.rect.h > 50)\n    .sort((a, b) => (a.rect.y - b.rect.y) || (a.rect.x - b.rect.x));\n"
         self.desktop._TV_PANES_JS = (

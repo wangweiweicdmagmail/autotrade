@@ -14,7 +14,8 @@ vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../console/static/app.j
   },
 });
 const ui = { ...options.methods, pyramidAddUnlockR: 2 };
-const active = { state: 'ACTIVE', entries: 2, enabled: true, unlocked: true, second_mfe_r: 0.5 };
+const active = { state: 'ACTIVE', entries: 2, enabled: true, unlocked: true, second_mfe_r: 0.5,
+  risk_budgets: [300, 200, 100], add_unlock_r: 2 };
 assert.match(ui.autoNext(active), /第二仓达到1R/);
 assert.match(ui.autoNext({ ...active, state: 'PENDING', pending_lot_id: 'add' }), /实际成交/);
 assert.match(ui.autoNext({ ...active, state: 'CLOSING' }), /退出中/);

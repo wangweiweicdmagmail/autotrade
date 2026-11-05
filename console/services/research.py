@@ -3,17 +3,90 @@
 from engine.backtest_session import BacktestSession
 from fastapi import HTTPException
 from pathlib import Path
+from collections import OrderedDict
 import asyncio
 import config
 from engine import shadow_report
 import time
 from console.shared import CONSOLE_FILE, logger
-from console.schemas import BtLoadRequest
+from console.schemas import BtLoadRequest, BtRunRequest
 
 
 class ResearchService:
     def __init__(self, context):
         self.context = context
+        self._backtest_history = OrderedDict()
+        self._backtest_history_lock = asyncio.Lock()
+
+    async def api_bt_run(self, req: BtRunRequest) -> dict:
+        """Reuse historical inputs while running a fresh private simulation."""
+        from datetime import datetime, time as clock_time
+        import math
+        from engine.pine_models import PineModelRegistry
+        from backtest_trend import ET, fetch_history
+
+        symbol = req.symbol.strip().upper()
+        if not symbol:
+            raise HTTPException(400, "请输入回测标的")
+        if ":" not in symbol:
+            symbol = next((s for s in config.WATCHLIST if s.split(":")[-1] == symbol), symbol)
+        day = req.day
+        now = datetime.now(ET)
+        try:
+            if day and datetime.strptime(day, "%Y-%m-%d").date().isoformat() != day:
+                raise ValueError("交易日格式应为 YYYY-MM-DD")
+            registry = PineModelRegistry.load()
+            registry.get(req.strategy)
+            for key in ("initial_risk_usd", "equity", "pyramid_breakeven_r", "pyramid_add_unlock_r"):
+                if key in req.params:
+                    value = req.params[key]
+                    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                        raise ValueError(f"{key} 必须为有限正数")
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from error
+        # Invalidate the default lookup at the next ET date or regular close.
+        current_day = now.date().isoformat()
+        window = (current_day, now.time() >= clock_time(16)) if day in ("", current_day) else None
+        key = (symbol, day, req.strategy, req.bars, window)
+        async with self._backtest_history_lock:
+            cached = self._backtest_history.get(key)
+            reused = cached is not None
+            if cached is None:
+                try:
+                    rows = await fetch_history(symbol, req.bars, day)
+                except Exception as error:
+                    raise HTTPException(400, f"历史数据拉取失败: {error}") from error
+                if not day:
+                    bar_times = (datetime.fromtimestamp(row["time"], ET) for row in rows)
+                    days = {
+                        bar.date() for bar in bar_times
+                        if clock_time(9, 30) <= bar.time() < clock_time(16)
+                        and (bar.date() < now.date() or
+                             (bar.date() == now.date() and now.time() >= clock_time(16)))
+                    }
+                    if not days:
+                        raise HTTPException(400, f"{symbol} 没有已收盘交易日的常规时段数据")
+                    day = max(days).isoformat()
+                self._backtest_history[key] = (day, rows)
+                if len(self._backtest_history) > 8:
+                    self._backtest_history.popitem(last=False)
+            else:
+                day, rows = cached
+                self._backtest_history.move_to_end(key)
+        try:
+            session = BacktestSession(
+                rows, symbol, day, req.strategy, req.params,
+                registry=registry, start_time=req.start_time,
+            )
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from error
+        if not session.total_bars:
+            raise HTTPException(400, f"{symbol} 在 {day} {req.start_time} ET 后无常规时段数据")
+        # CPU-only simulation on a separate thread keeps the live event loop responsive.
+        # The session and simulated broker are local to this request.
+        result = await asyncio.to_thread(lambda: asyncio.run(session.run_all()))
+        result["history_reused"] = reused
+        return result
 
     async def api_shadow(self) -> dict:
         """当日影子回测：统计 + 全部回踩事件（实时逐 bar 推演）。"""
@@ -104,16 +177,7 @@ class ResearchService:
 
     async def api_performance(self) -> dict:
         """复盘统计：从历史归档（logs/trades-*.json）读取平仓记录。"""
-        import glob
-        import json as _json
-
-        logs_dir = self.context.paths.data_dir
-        records = []
-        for f in sorted(glob.glob(str(logs_dir / "trades-*.json"))):
-            try:
-                records.extend(_json.loads(open(f, encoding="utf-8").read()))
-            except Exception:
-                continue
+        records = self.context.order_mgr._store.archive_records()
         closed = [r for r in records if r.get("state") == "CLOSED"]
 
         def _stats(rows) -> dict:
