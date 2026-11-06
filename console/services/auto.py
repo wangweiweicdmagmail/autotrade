@@ -157,20 +157,15 @@ class AutoService:
                 "启动时方向不明确，无法锁定策略方向: "
                 + ",".join(s for s in symbols if not directions[s]),
             )
-        if preview or confirmed_directions is not None:
+        if preview:
             qqq = "NASDAQ:QQQ"
             qqq_direction = model.from_market(market.get(qqq) or {}).direction
-            if qqq_direction not in (-1, 1):
-                raise AutoServiceError(409, f"{model.name} 的 QQQ 当前方向未就绪")
             checked = {**directions, qqq: qqq_direction}
-            mismatched = [s for s, direction in directions.items() if direction != qqq_direction]
-            if mismatched:
-                labels = {1: "多", -1: "空"}
-                details = "、".join(f"{s} {labels[directions[s]]}" for s in mismatched)
-                raise AutoServiceError(409, f"{model.name} 方向不一致：QQQ {labels[qqq_direction]}，{details}")
-            if preview:
-                return {"model": model.name, "directions": checked, "symbols": symbols, "risk": risk}
-            if confirmed_directions != checked:
+            return {"model": model.name, "directions": checked, "symbols": symbols, "risk": risk}
+        if confirmed_directions is not None:
+            # QQQ is informational unless it is itself a selected execution target.
+            confirmed_targets = {symbol: confirmed_directions.get(symbol) for symbol in symbols}
+            if confirmed_targets != directions:
                 raise AutoServiceError(409, "启动方向尚未确认或已变化，请重新检查并确认")
         engine = self.engine(strategy, instance_id)
         active = sum(row["state"] != "DONE" for row in self.instances())

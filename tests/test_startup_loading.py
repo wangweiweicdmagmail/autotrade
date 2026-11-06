@@ -64,12 +64,12 @@ def test_startup_reports_cache_mismatch_before_first_market_tick(console_app, mo
     assert status["cache_issues"] == [issue]
     assert status["market_progress"] == {
         "indicators": {"loaded": 3, "total": 7},
-        "subscribed": 0, "confirmed": 0, "total": 1,
+        "subscribed": 0, "bars_ready": 0, "confirmed": 0, "total": 1,
     }
     assert client.post("/api/startup/repair-pine-cache").status_code == 403
 
 
-def test_live_startup_requires_ibkr(console_app, monkeypatch):
+def test_live_startup_opens_workspace_with_tws_offline(console_app, monkeypatch):
     monkeypatch.setattr(console_app.lifecycle, "_startup_state", _ready_state())
     monkeypatch.setattr(console_app.config, "WATCHLIST", ["NASDAQ:QQQ"])
     monkeypatch.setattr(console_app.collector, "_running", True)
@@ -78,7 +78,21 @@ def test_live_startup_requires_ibkr(console_app, monkeypatch):
     monkeypatch.setattr(console_app.collector, "study_health", lambda: {"systemic": False})
     monkeypatch.setattr(console_app.gateway, "enabled", True)
     monkeypatch.setattr(console_app.gateway, "_connected", False)
-    assert console_app.lifecycle._startup_status()["all_ready"] is False
+    status = console_app.lifecycle._startup_status()
+    assert status["all_ready"] is False
+    assert status["workspace_ready"] is True
+    ibkr = next(stage for stage in status["stages"] if stage["key"] == "ibkr")
+    assert ibkr["ready"] is False and ibkr["blocking"] is False
+
+    monkeypatch.setattr(console_app.desktop, "_CONSOLE_AUTO_OPEN_BROWSER", False)
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(console_app.asyncio, "sleep", no_sleep)
+    run(console_app.desktop._startup_prepare())
+    client = TestClient(console_app.app)
+    assert 'id="app" v-cloak' in client.get("/").text
 
     monkeypatch.setattr(console_app.gateway, "_connected", True)
     assert console_app.lifecycle._startup_status()["all_ready"] is True
@@ -257,7 +271,7 @@ def test_browser_waits_for_http_but_not_full_trading_readiness(console_app, monk
     monkeypatch.setattr(console_app.desktop, "_console_http_ready", probe)
     monkeypatch.setattr(console_app.desktop, "_workspace_ensure_browser", open_browser)
     monkeypatch.setattr(console_app.asyncio, "sleep", no_sleep)
-    monkeypatch.setattr(console_app.lifecycle, "_startup_status", lambda: {"all_ready": True})
+    monkeypatch.setattr(console_app.lifecycle, "_startup_status", lambda: {"workspace_ready": True})
     run(console_app.desktop._startup_prepare())
     assert calls == [("http", False), ("http", False), ("http", True), ("browser", True)]
     assert state["ready"] and state["browser_ready"]
@@ -297,3 +311,38 @@ def test_startup_names_partial_subscription_after_timeout(console_app,monkeypatc
     assert status['market_pending']==['NYSE:UBER']
     assert 'NYSE:UBER' in status['error']
     assert not status['all_ready']
+
+
+def test_offline_live_gateway_rejects_order_operations():
+    from execution.ibkr import IBKRGateway
+
+    async def exercise():
+        gateway = IBKRGateway("127.0.0.1", 7496, 11, "", "", enabled=True)
+        unit = SimpleNamespace(side="long", entry_px=100)
+        for result in (
+            await gateway.place_bracket(unit),
+            await gateway.place_market_with_stop("NASDAQ:QQQ", "long", 1, 99),
+            await gateway.place_midpoint_oca("NASDAQ:QQQ", "long", 1, 100, 101, 99, "test"),
+        ):
+            assert result["ok"] is False
+            assert "未连接" in result["error"]
+        assert gateway.cancel_order(None) is False
+
+    run(exercise())
+
+
+def test_24h_session_rejection_is_visible_without_blocking_workspace(console_app, monkeypatch):
+    monkeypatch.setattr(console_app.lifecycle, "_startup_state", _ready_state())
+    monkeypatch.setattr(console_app.config, "WATCHLIST", ["NASDAQ:QQQ", "NASDAQ:AAPL"])
+    collector = console_app.collector
+    monkeypatch.setattr(collector, "_running", True)
+    monkeypatch.setattr(collector, "_proc", SimpleNamespace(returncode=None))
+    monkeypatch.setattr(collector, "latest", _ready_market)
+    monkeypatch.setattr(collector, "market_session", "24h")
+    monkeypatch.setattr(collector, "market_sessions", {"NASDAQ:AAPL": {"resolved": "extended"}})
+
+    status = console_app.lifecycle._startup_status()
+    assert status["workspace_ready"] and not status["all_ready"]
+    assert status["market_pending"] == []
+    assert "NASDAQ:AAPL（extended）" in status["error"]
+    assert status["market_session"]["unavailable"]["NASDAQ:AAPL"]["resolved"] == "extended"

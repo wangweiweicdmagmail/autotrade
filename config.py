@@ -103,7 +103,8 @@ WATCHLIST: List[str] = [
     "NASDAQ:ADBE",
     "NYSE:UBER",
     "NASDAQ:COIN",
-    "NYSE:BE"
+    "NYSE:BE",
+    "NASDAQ:COST",
 ]
 
 # 八宫格布局参数（对齐 Premium 套餐每标签页 8 图上限）
@@ -268,13 +269,13 @@ TOOL_ORDER_ID_MAX = 88999999
 TOOL_ORDER_ID_STATE_PATH = "logs/tool_order_id.json"
 
 # 持仓扫描与止损守卫
-AUTO_CLOSE_ON_ST_FLIP = True
+AUTO_CLOSE_ON_ST_FLIP = False  # 兼容标识；True 也不得启用 ST 转向自动退出
 STOP_GUARD_ENABLED = True
 
 # 持仓反向 FVG 守卫：持仓股 5M 收盘确认反向缺口（多仓遇空头 FVG、空仓遇多头
-# FVG）→ 浮亏立即市价平仓，浮盈立即保本 + 语音/界面提醒平仓锁利
+# FVG）→ 只作语音/界面提醒；保本和平仓须用户明确确认
 FVG_REVERSE_GUARD_ENABLED = True
-FVG_REVERSE_AUTO_CLOSE = False   # 反向 FVG 浮亏时仅提醒
+FVG_REVERSE_AUTO_CLOSE = False   # 保留兼容标识；当前反向FVG守卫始终只提醒
 
 # 外部订单清理：号段外且不在旧工具白名单的挂单撤销、持仓平仓（默认按用户要求开启）
 # 外部订单/持仓处理：1=自动撤挂单+市价平残余持仓（默认，2026-10-23 用户恢复：
@@ -295,7 +296,15 @@ SLOW_BREAK_SECONDS = 900
 AUTO_BREAKEVEN_R = 2.0
 
 
+# 主行情的 5 分钟 TradingView 会话。
+TV_MARKET_SESSION = _os.environ.get("TV_MARKET_SESSION", "24h")
+# 这些报价使用数据商的默认时段，不请求美股的 24h 子时段。
+TV_DEFAULT_SESSION_SYMBOLS = ("BLACKBULL:WTI", "CAPITALCOM:NAS100", "CAPITALCOM:SPX500")
+
+
 def validate_config() -> None:
+    if TV_MARKET_SESSION not in ("24h", "extended"):
+        raise RuntimeError("TV_MARKET_SESSION 必须为 24h 或 extended")
     required = (
         "TOOL_ORDER_ID_BASE", "TOOL_ORDER_ID_MAX", "TOOL_ORDER_ID_STATE_PATH",
         "AUTO_CLOSE_ON_ST_FLIP", "STOP_GUARD_ENABLED",

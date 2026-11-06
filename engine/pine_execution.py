@@ -64,6 +64,7 @@ class ExecutionInstance:
     last_signal_bar: float = 0.0
     last_signal_event_bar: float = 0.0
     done_reason: str = ""
+    last_reverse_alert_bar: float = -1.0
     close_attempt_at: float = 0.0
     source: str = "auto"
     created_at: float = field(default_factory=time.time)
@@ -192,6 +193,7 @@ class PineExecutionEngine:
             "initial_risk_usd": inst.initial_risk_usd,
             "start_direction": inst.start_direction,
             "execution_profile": self.profile.name,
+            "reverse_action": "alert",
             "risk_ratios": list(inst.risk_ratios),
             "auto_breakeven": self.breakeven_enabled,
             "breakeven_r": self.breakeven_r,
@@ -262,9 +264,27 @@ class PineExecutionEngine:
             inst.done_reason = "manual_stop"
         self._persist(inst)
 
+    def _reverse_alert(self, inst, price, direction, bar_time=0):
+        if inst.last_reverse_alert_bar == bar_time:
+            return
+        inst.last_reverse_alert_bar = bar_time
+        self._emit("pyramid_trend_reverse_alert", symbol=inst.symbol, side=inst.side,
+                   qty=inst.total_qty, price=price, direction=direction,
+                   bar_time=bar_time, group_id=inst.group_id)
+        logger.warning("ST/策略方向反向，仅提醒 %s %s qty=%s price=%s",
+                       inst.symbol, inst.side, inst.total_qty, price)
+
     async def _stop_close(
         self, inst: ExecutionInstance, ref_px: float, reason: str
     ) -> None:
+        if reason in ("trend_reverse", "st_flip"):
+            # Discard an old, unsubmitted reverse exit intent after recovery.
+            # Broker-accepted close orders remain reconciled by OrderManager.
+            inst.exit_requested_reason = ""
+            await self._refresh(inst)
+            self._reverse_alert(inst, ref_px, -1 if inst.side == "long" else 1)
+            self._persist(inst)
+            return
         now = time.time()
         if inst.state == "CLOSING" and now - inst.close_attempt_at < 5.0:
             return
@@ -1206,8 +1226,9 @@ class PineExecutionEngine:
                 inst.side == "short" and direction == 1
             )
             if flipped:
-                await self._stop_close(inst, bar.get("close") or 0, "trend_reverse")
+                self._reverse_alert(inst, bar.get("close") or 0, direction, bar.get("time") or 0)
             elif self.profile.follow_pine_stop and inst.total_qty:
+                inst.last_reverse_alert_bar = -1.0
                 stop = e9_c.get("long_stop" if inst.side == "long" else "short_stop")
                 close = bar.get("close") or 0
                 if (

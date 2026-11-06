@@ -26,7 +26,7 @@ Python 工程还包含数据接入、控制台、券商连接等支撑模块，�
 | 策略输出契约 | Strategy Output Contract | 约定输出字段、取值、时间语义与有效性 | `docs/PINE_INDICATOR_CONTRACT.md`、`PineOutput` |
 | 执行领域契约 | Execution Domain Contracts | 统一行情、确认 K 线、策略输出、订单计划、成交与交易组的数据语义 | `domain/contracts.py`；旧 `PineOutput` 兼容别名 |
 | 订单操作协调器 | Order Operation Coordinator | 在逐订单锁上协调退出、撤单、减仓与改单；建仓串行核对账户风险 | `execution/operations.py`、`OrderManager` |
-| 行情与信号接入层 | Market Data & Signal Ingestion Layer | 获取 TradingView 行情及 Pine 输出，形成实时与确认快照 | `service/tv_cloud*.js`、`engine/cloud_collector.py` 等采集模块 |
+| 行情与信号接入层 | Market Data & Signal Ingestion Layer | 获取 TradingView K 线，将 PineTS 的本地指标结果组装为实时与确认快照 | `service/tv_cloud_daemon.js`、`service/pinets_live.js`、`engine/realtime_collector.py` |
 | 执行编排服务 | Execution Orchestration Service | 启停执行实例、选择模型、检查实例容量并调度输出 | `console/services/auto.py`、`console/runtime/strategy.py` |
 | 交易执行引擎 | Trade Execution Engine | 运行执行模型，推进交易状态、去重、建仓、保护和退出 | `engine/pine_execution.py` |
 | 执行配置 | Execution Profile | 选择单次建仓或兼容金字塔等具体执行规则 | `execution_profile`、`engine/execution_rules.py` 及执行引擎 |

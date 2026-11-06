@@ -381,6 +381,9 @@ class OrderManager:
             except Exception as e:
                 logger.error("行情健康检查失败，拒绝开仓 %s %s: %s", symbol, side, e)
                 return None, "行情健康检查失败，禁止新开仓；人工平仓/撤单不受影响"
+            confirmed_24h = health.get("confirmed_24h_symbols")
+            if confirmed_24h is not None and symbol not in confirmed_24h:
+                return None, f"{symbol} 尚无已确认的 24 小时行情，禁止新开仓"
             if not health.get("trade_allowed", False):
                 reason = health.get("reason") or "unknown"
                 logger.warning("🚫 行情陈旧，拒绝开仓 %s %s: %s", symbol, side, reason)
@@ -570,6 +573,8 @@ class OrderManager:
                         ref_px: Optional[float] = None,
                         exit_reason: str = "manual") -> Tuple[bool, str]:
         """提交平仓并进入 CLOSING；只有 watcher 确认实际成交后才 CLOSED。"""
+        if exit_reason in ("st_flip", "trend_reverse", "fvg_reverse"):
+            return False, "ST/反向FVG仅提醒，必须由用户明确手动平仓"
         lot = self._lots.get(lot_id)
         if lot is None:
             return False, f"lot 不存在: {lot_id}"
@@ -602,6 +607,11 @@ class OrderManager:
                 self._save()
                 self._emit_closed(lot)
                 return True, ""
+
+            if lot.protection_restore_needed:
+                position_ok, position_error = await self._has_broker_position(lot)
+                if not position_ok:
+                    return False, "退出前余仓未核对: " + position_error
 
             # 尚未入账的保护单成交须先处理，否则可能过量平仓；已入账部分
             # 已从 filled_qty 扣减，剩余数量可以安全重试平仓。
@@ -668,23 +678,27 @@ class OrderManager:
                 self._trade_perm_id(lot.close_trade))
 
             if not result.get("ok"):
-                if lot.close_trade is not None:
-                    self._record_exit_fill(lot, "close")
-                if lot.filled_qty > 0:
-                    lot.state = ACTIVE
-                    protected = await self._restore_protection(lot)
-                    lot.note = f"平仓失败: {result.get('error')}"
-                    if not protected:
-                        lot.note += "；实际余仓保护单恢复失败，需立即核查"
-                    lot.updated_at = time.time()
+                # A gateway error is not proof that this close did not fill.
+                # Missing/live handles stay CLOSING: never arm another SELL/BUY
+                # against shares that may already have exited at the broker.
+                logger.warning("退出返回异常 lot=%s symbol=%s orderId=%s status=%s handle=%s error=%s",
+                               lot.lot_id, lot.symbol, lot.close_order_id,
+                               result.get("status"), lot.close_trade is not None, result.get("error"))
+                if lot.close_trade is None or not lot.close_trade.isDone():
+                    lot.note = f"退出结果待核对: {result.get('error')}；保持 CLOSING，禁止补挂止损或重复退出"
                     self._save()
-                    if protected:
-                        self._start_exit_watch(lot)
+                    if lot.close_trade is not None:
+                        self._start_close_watch(lot)
                     return False, lot.note
-                # 即使网关报错，只要已有成交就由 watcher 按实际数量闭环，绝不猜价。
-                lot.note = "平仓返回失败但已有成交，等待实际成交回报核对"
+                outcome = await self._handle_close_terminal(lot)
                 self._save()
-                self._start_close_watch(lot)
+                if outcome == "closed":
+                    self._emit_closed(lot)
+                    return True, ""
+                if outcome == "restored":
+                    self._start_exit_watch(lot)
+                elif lot.state == CLOSING:
+                    self._start_close_watch(lot)
                 return False, lot.note
 
             lot.note = (f"平仓单已提交（{lot.close_reason}），"
@@ -886,6 +900,10 @@ class OrderManager:
             filled, avg = event.cumulative_qty, event.average_price
         except (AttributeError, TypeError, ValueError):
             return ownership_changed
+        return self._record_exit_event(lot, source, event, ownership_changed)
+
+    def _record_exit_event(self, lot, source, event, ownership_changed=False):
+        filled, avg = event.cumulative_qty, event.average_price
         if source == "close":
             previous = lot.close_order_filled_qty
             previous_avg = lot.close_order_avg_fill
@@ -956,9 +974,8 @@ class OrderManager:
             return 0.0
         fill = await self._gw.closing_fill_avg(
             lot.symbol, lot.side, lot.entry_time,
-            legacy_order_ids=self.legacy_order_ids(lot))
-        # 网关会纳入本工具 88 号段成交；数量不一致说明可能混入其他 lot，
-        # 此时宁可等待人工核查，也不能用该均价记盈亏。
+            exact_order_ids=self.legacy_order_ids(lot))
+        # Exact lot ownership must match even if a sibling has identical qty.
         if fill and int(fill[1]) == lot.close_filled_qty and fill[0] > 0:
             lot.close_avg_fill = float(fill[0])
             self._recompute_realized(lot)
@@ -970,21 +987,20 @@ class OrderManager:
         if (lot.close_order_id is None and lot.close_permId is None) \
                 or lot.close_requested_qty <= 0:
             return "waiting"
-        original_qty = lot.close_filled_qty + lot.filled_qty
-        if original_qty <= 0:
+        # Quantity equality is not ownership: two sibling lots can both be 311.
+        if lot.close_order_id is None:
             return "waiting"
         fill = await self._gw.closing_fill_avg(
             lot.symbol, lot.side, lot.entry_time,
-            legacy_order_ids=self.legacy_order_ids(lot))
-        if not fill or fill[0] <= 0 or int(fill[1]) != original_qty:
-            logger.warning("lot %s 平仓句柄缺失且成交回报无法唯一归因（%s），"
-                           "保持 CLOSING，禁止重发", lot.lot_id, fill)
+            exact_order_ids={lot.close_order_id})
+        if not fill or fill[0] <= 0 or not 0 < int(fill[1]) <= lot.close_requested_qty:
             return "waiting"
-        lot.close_filled_qty = original_qty
-        lot.filled_qty = 0
-        lot.close_avg_fill = float(fill[0])
-        lot.close_order_filled_qty = lot.close_requested_qty
-        self._recompute_realized(lot)
+        event = FillEvent(lot.lot_id, "close", int(fill[1]), float(fill[0]),
+                          time.time(), order_id=lot.close_order_id)
+        self._record_exit_event(lot, "close", event)
+        if lot.filled_qty > 0:
+            return "waiting"
+
         if self._finalize_close(lot, lot.close_avg_fill,
                                 lot.close_reason or "manual"):
             lot.note = "重启后按本 lot 实际成交回报补登平仓"
@@ -1002,6 +1018,16 @@ class OrderManager:
         if pos is None:
             return False, f"券商持仓查询失败，禁止为 {ticker} 新建保护单"
         have = pos.get(ticker, 0.0)
+        # The remaining shares may belong to a sibling lot. One 311-share
+        # position cannot back two separate 311-share protective SELL orders.
+        required = sum(row.filled_qty for row in self._lots.values()
+                       if row.symbol.split(":")[-1] == ticker and row.side == lot.side
+                       and row.state in (ACTIVE, PENDING, CLOSING) and row.filled_qty > 0)
+        required = max(lot.filled_qty, required)
+        available = have if lot.side == "long" else -have
+        if available < required:
+            return False, (f"券商侧 {ticker} 同向持仓 {available} < 本工具同向批次总余仓 {required}，"
+                           "疑似幻影 lot 或退出未核对，禁止新建保护单")
         if lot.side == "long" and have < lot.filled_qty:
             return False, (f"券商侧 {ticker} 持仓 {have} < lot {lot.filled_qty}，"
                            f"疑似幻影 lot，禁止新建保护单，请人工核查/核销")
@@ -1010,8 +1036,22 @@ class OrderManager:
                            f"疑似幻影 lot，禁止新建保护单，请人工核查/核销")
         return True, ""
 
+    async def restore_protection(self, lot_id: str) -> bool:
+        """Public recovery command shares the same lock/priority as close."""
+        lot = self._lots.get(lot_id)
+        if lot is None:
+            return False
+        async with self._operations.run(lot_id, OperationKind.STOP, lock=self._lot_lock(lot)) as decision:
+            if not decision.allowed or lot.state != ACTIVE:
+                return False
+            result = await self._restore_protection(lot)
+            self._save()
+            return result
+
     async def _restore_protection(self, lot: OrderLot) -> bool:
         """优先认回原括号子单并调整数量；确认缺失后才恢复独立 STOP。"""
+        if lot.state != ACTIVE:
+            return False
         if lot.filled_qty <= 0:
             lot.protection_restore_needed = False
             return True
@@ -1050,20 +1090,26 @@ class OrderManager:
             return False
         result = await self._gw.place_stop_only(
             lot.symbol, lot.side, lot.filled_qty, lot.stop_px)
+        returned_id = result.get("stop_order_id") or result.get("order_id")
+        if returned_id is not None or result.get("trade") is not None:
+            lot.trail_order_id = returned_id
+            lot.trail_trade = result.get("trade")
+            lot.trail_order_filled_qty = 0
+            lot.trail_order_avg_fill = 0.0
+            self._remember_order(lot, returned_id, self._trade_order_id(lot.trail_trade),
+                                 self._trade_perm_id(lot.trail_trade))
         if not result.get("ok"):
-            logger.error("lot %s %s 实际余仓 %d 恢复保护单失败: %s",
+            # A protective order can also have filled despite an error result.
+            # Keep its identity and consume real fills before any recovery retry.
+            if lot.trail_trade is not None:
+                self._record_exit_fill(lot, "trail")
+                self._start_exit_watch(lot)
+            self._save()
+            logger.error("lot %s %s 实际余仓 %d 恢复保护单失败 orderId=%s: %s",
                          lot.lot_id, lot.symbol, lot.filled_qty,
-                         result.get("error"))
+                         lot.trail_order_id, result.get("error"))
             return False
-        lot.trail_order_id = result.get("stop_order_id") or result.get("order_id")
-        lot.trail_trade = result.get("trade")
-        lot.trail_order_filled_qty = 0
-        lot.trail_order_avg_fill = 0.0
         lot.protection_restore_needed = False
-        self._remember_order(
-            lot, lot.trail_order_id,
-            self._trade_order_id(lot.trail_trade),
-            self._trade_perm_id(lot.trail_trade))
         logger.info("lot %s 已按实际余仓 %d 恢复 STOP orderId=%s",
                     lot.lot_id, lot.filled_qty, lot.trail_order_id)
         return True

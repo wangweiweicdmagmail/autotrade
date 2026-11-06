@@ -135,10 +135,10 @@ assert.equal(ui.workspaceExpanded, false);
   ui.autoInstanceId = 'independent';
   ui.autoSymbols = 'NVDA';
   ui.autoRiskUsd = 200;
-  const directions = { 'NASDAQ:NVDA': -1, 'NASDAQ:QQQ': -1 };
+  const directions = { 'NASDAQ:NVDA': -1, 'NASDAQ:QQQ': 0 };
   responseBody = { model: '模型乙', symbols: ['NASDAQ:NVDA'], directions, risk: 200 };
   ui.$confirm = async message => {
-    assert.match(message, /模型乙.*QQQ 当前方向：空.*NASDAQ:NVDA 空/);
+    assert.match(message, /模型乙.*QQQ 当前方向：未就绪（仅供参考）.*NASDAQ:NVDA 空/);
     throw 'cancel';
   };
   await ui.startAuto();
@@ -160,3 +160,89 @@ const breakoutGroups = options.computed.openingBreakoutGroups.call({
 });
 assert.equal(breakoutGroups.length, 1);
 assert.equal(breakoutGroups[0].time, 300);
+
+// A confirmed ST flip only notifies. It must not invoke confirmation or an exit.
+const flipNotices=[], flipSpoken=[];
+const flipUI={...options.methods,lastScanAlert:{},scanAlerts:[
+  {ticker:'SMH',symbol:'NASDAQ:SMH',side:'short',qty:155,st_line:451.13,close:464.38,scanned_at:1},
+],speak:text=>flipSpoken.push(text),$notify:notice=>flipNotices.push(notice),
+$confirm:()=>{throw new Error('ST alert must not confirm an exit');},
+closePosition:()=>{throw new Error('ST alert must not submit an exit');}};
+flipUI.checkScanAlert();flipUI.checkScanAlert();
+assert.equal(flipNotices.length,1);
+assert.match(flipNotices[0].message,/持仓空头.*收盘确认ST 多头/);
+assert.equal(flipSpoken.length,1);
+
+const fvgConsentNotices=[];
+const fvgConsentUI={...options.methods,lastFvgReverseAlert:{},
+  fvgReverseAlerts:[{lot_id:'asml',ticker:'ASML',side:'long',qty:68,pnl:59.43,alerted_at:1,kind:'reverse_warning'}],
+  speak(){},$notify:n=>fvgConsentNotices.push(n),
+  $confirm(){throw new Error('FVG must wait for a separate explicit user action');},
+  closePosition(){throw new Error('Must not close all sibling lots');},
+  breakevenLot(){throw new Error('Must not breakeven automatically');}};
+fvgConsentUI.checkFvgReverseAlert();fvgConsentUI.checkFvgReverseAlert();
+assert.equal(fvgConsentNotices.length,1);
+assert.match(fvgConsentNotices[0].message,/对应订单批次/);
+
+// Order history shows the recorded position side, independent of current ST.
+assert.equal(ui.lotSideLabel({side:'long'}),'做多');
+assert.equal(ui.lotSideLabel({side:'short'}),'做空');
+assert.match(ui.lotEntryAction({side:'short'}),/SELL.*开仓/);
+assert.match(ui.lotEntryAction({side:'long'}),/BUY.*开仓/);
+assert.equal(ui.lotOpenTime({entry_broker_time:1793902183,entry_time:1793902200}),'2026-11-05 13:09:43');
+assert.equal(ui.lotExitReason({state:'CLOSED',exit_reason:'stop'}),'保护止损触发');
+assert.match(ui.lotExitReason({state:'CLOSED',exit_reason:'st_flip'}),/ST转向.*历史/);
+assert.equal(ui.lotExitReason({state:'CLOSED'}),'原因未记录');
+assert.equal(ui.lotExitReason({state:'CLOSING'}),'待成交确认：原因未记录');
+assert.match(ui.lotExitReason({state:'CLOSING',close_reason:'manual'}),/^待成交确认/);
+const orderPage=fs.readFileSync(path.join(__dirname,'../console/static/index.html'),'utf8');
+for (const label of ['开仓方向','开仓时间 · 美东','平仓时间 · 美东','平仓原因']) assert.ok(orderPage.includes(label));
+
+// A mixed live/confirmed ST alert must show both, without claiming the live ST flipped short.
+flipUI.lastScanAlert={};flipUI.scanAlerts=[{ticker:'QCOM',side:'long',qty:608,
+  confirmed_direction:-1,realtime_direction:1,confirmed_bar_time:1793901900,scanned_at:2}];
+flipUI.checkScanAlert();
+assert.match(flipNotices.at(-1).message,/实时ST 多头.*收盘确认ST 空头/);
+
+{
+  const range = require('../console/static/range-distribution');
+  const time = Date.parse('2026-11-05T09:45:00-05:00') / 1000;
+  function quote(close, open, speed) {
+    return {
+      previous_regular_range: {day: '2026-11-05', date: '2026-11-04', high: 120, low: 80},
+      bar: {time, close, open}, e9: {time, ema_slope_atr: speed},
+      attack: {time, pmh: 106, pml: 95, opening3High: 105, opening3Low: 93},
+    };
+  }
+  const wrong = quote(108, 109, 2);
+  wrong.e9.time -= 300;
+  const map = range.build({AMD: quote(106, 100, -1), NVDA: quote(108, 109, 2),
+    COIN: quote(90, 95, -3.4), WRONG: wrong}, ['AMD', 'NVDA', 'COIN', 'WRONG']);
+  assert.deepEqual(map.rows.map(r => [r.ticker, r.major, r.minor, r.tone]),
+    [['AMD', 1, 1, 'flat'], ['NVDA', 1, 0, 'down'], ['COIN', 1, 2, 'down']]);
+  assert.deepEqual(map.rows[1].target, {label: '昨高', price: 120});
+  assert.equal(map.limit, 4);
+  assert.deepEqual(map.pending, ['WRONG']);
+  const crowded = {
+    SLOW: quote(108, 107, 1),
+    MID: quote(108, 107, 1.1),
+    FAST: quote(108, 107, 1.2),
+    FAR: quote(108, 107, -2),
+    INSIDE1: quote(100, 99, 0.4),
+    INSIDE2: quote(100, 99, 0.41),
+  };
+  const layout = range.build(crowded, Object.keys(crowded), 480);
+  const [outside, inside] = layout.groups[1].lanes;
+  assert.equal(outside.layers, 3);
+  assert.deepEqual(outside.rows.map(row => [row.ticker, row.layer]),
+    [['SLOW', 0], ['MID', 1], ['FAST', 2], ['FAR', 0]]);
+  assert.equal(inside.layers, 1);
+  assert.equal(range.build(crowded, Object.keys(crowded), 3200).groups[1].lanes[0].layers, 1);
+  const early = quote(109, 108, 1);
+  early.bar.time -= 3600;
+  early.e9.time = early.attack.time = early.bar.time;
+  early.attack.opening3High = early.attack.opening3Low = null;
+  const provisional = range.build({EARLY: early}, ['EARLY']).rows[0];
+  assert.equal(provisional.forming, true);
+  assert.equal(provisional.target, null);
+}

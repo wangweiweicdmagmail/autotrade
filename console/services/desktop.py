@@ -47,8 +47,8 @@ class DesktopService:
                 await self.context.notifier.notify(
                     "tv_startup",
                     "critical",
-                    "TV 数据源异常",
-                    f"启动检查发现 study 通道系统性故障（60s 内 study 报错 {health['study_errors_60s']} 条，ts_c 就绪 {health['ts_ready']}/{health['ts_total']}），请检查 daemon 日志",
+                    "指标数据异常",
+                    f"启动检查发现指标计算故障（60 秒内错误 {health['study_errors_60s']} 条，ts_c 就绪 {health['ts_ready']}/{health['ts_total']}），请检查行情采集日志",
                 )
                 return
             total, ready = _ready_counts()
@@ -398,7 +398,7 @@ class DesktopService:
         return await asyncio.to_thread(probe)
 
     async def _startup_prepare(self) -> None:
-        """打开工作区并等待全链路首次就绪；就绪锁定后不再因断线退回加载页。"""
+        """打开工作区并等待必需服务首次就绪。"""
         await asyncio.sleep(0.5)
         if self.context.desktop._CONSOLE_AUTO_OPEN_BROWSER:
             while not await self.context.desktop._console_http_ready():
@@ -421,9 +421,9 @@ class DesktopService:
         else:
             self.context.lifecycle._startup_state["browser_ready"] = True
         while not self.context.lifecycle._startup_state["ready"]:
-            if self.context.lifecycle._startup_status()["all_ready"]:
+            if self.context.lifecycle._startup_status()["workspace_ready"]:
                 self.context.lifecycle._startup_state["ready"] = True
-                logger.info("控制台全链路就绪，加载页自动进入主页面")
+                logger.info("控制台工作区就绪，加载页自动进入主页面")
                 return
             await asyncio.sleep(1)
 

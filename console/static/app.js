@@ -31,6 +31,18 @@ function calcPosition(equity, riskUsd, limitPx, stopPx, maxPositionPct, maxOrder
 }
 
 createApp({
+  directives: {
+    rangeWidth: {
+      mounted(element, binding) {
+        const observer = new ResizeObserver(([entry]) => binding.value(entry.contentRect.width));
+        observer.observe(element);
+        element.rangeWidthObserver = observer;
+      },
+      unmounted(element) {
+        element.rangeWidthObserver.disconnect();
+      },
+    },
+  },
   data() {
     return {
       status: { dry_run: true, connected: false, halted: false, equity: null, daily_pnl: null, market_age: null, market_transport_age: null, market_bar_age: null, market_stale: false, market_stale_reason: '', market_running: true, allow_short: true, total_risk_usd: 0, max_total_risk_usd: 0, total_position_pct: null, tv_view: null },
@@ -74,7 +86,7 @@ createApp({
       workspaceNames: { execution: '执行监控', validation: '回测验证', research: '研究复盘', operations: '系统运维' },
       workspaceTabNames: { instances: '执行监控', orders: '订单批次', fvg: 'FVG 监控', backtest: '回测验证', night: '夜盘模拟',
         screen: '选股', momentum: '推进力', reports: '盘前报告', news: '盘前新闻', shadow: '影子', returns: '收益对比', perf: '绩效',
-        openingBreakouts: '小区间突破', log: '运行日志', events: '事件', copy: '跟单管理' },
+        openingBreakouts: '区间分布图', log: '运行日志', events: '事件', copy: '跟单管理' },
       bottomPanelHeight: (() => {
         try { const v = parseInt(localStorage.getItem('bottom_panel_height'), 10); return v >= 180 && v <= 800 ? v : 420; } catch (e) { return 420; }
       })(),
@@ -168,6 +180,8 @@ createApp({
       lastFvgDataTime: null,       // 上一次数据时钟（bar 收盘滴答用，首次仅建基线）
       breakoutSignals: [],         // 盘前突破信号（后端快照，今日已确认）
       openingBreakouts: [],
+      rangeSelectedSymbol: '',
+      rangePlotWidth: 0,
       openingBreakoutCoverage: null,
       openingBreakoutsInitialized: false,
       openingFeedDrag: null,
@@ -245,6 +259,13 @@ createApp({
   },
 
   computed: {
+    rangeDistribution() {
+      const symbols = new Set([...this.watchlist, ...Object.keys(this.status.market_session?.symbols || {})]);
+      return RangeDistribution.build(this.market, symbols, this.rangePlotWidth);
+    },
+    rangeSelectedRow() {
+      return this.rangeDistribution.rows.find(row => row.symbol === this.rangeSelectedSymbol);
+    },
     openingBreakoutGroups() {
       const groups = new Map();
       for (const row of this.openingBreakouts) {
@@ -1101,7 +1122,7 @@ createApp({
         order_placed: '下单', order_closed: '平仓', order_close_requested: '平仓请求',
         order_close_failed: '平仓失败', order_cancelled: '撤单',
         order_cancel_failed: '撤单失败', position_scan_alert: '平仓提醒',
-        auto_close_st_flip: 'ST转空自动平仓', missing_stop_alert: '止损单缺失',
+        auto_close_st_flip: 'ST转向自动平仓（历史）', missing_stop_alert: '止损单缺失',
         external_position_alert: '外部订单/持仓提醒',
         pullback_event: '回踩事件', shadow_settled: '影子结算',
         breakout_signal: '盘前突破',
@@ -1275,11 +1296,11 @@ createApp({
         this.checkWrite403(preview);
         const check = await preview.json();
         if (!preview.ok) throw new Error(typeof check.detail === 'string' ? check.detail : '方向检查失败');
-        const directionText = value => value === 1 ? '多' : '空';
+        const directionText = value => ({ 1: '多', [-1]: '空' }[value] || '未就绪');
         const targets = check.symbols.map(s => `${s} ${directionText(check.directions[s])}`).join('、');
         try {
           await this.$confirm(
-            `策略模型 ${check.model}，实例 ${request.instance_id}，首仓预算 $${check.risk}。QQQ 当前方向：${directionText(check.directions['NASDAQ:QQQ'])}。标的方向：${targets}。均与 QQQ 同向，确认启动？`,
+            `策略模型 ${check.model}，实例 ${request.instance_id}，首仓预算 $${check.risk}。QQQ 当前方向：${directionText(check.directions['NASDAQ:QQQ'])}（仅供参考）。标的方向：${targets}。确认启动？`,
             '启动执行实例 · 二次确认', {
               type: 'warning', confirmButtonText: '确认启动', cancelButtonText: '取消',
               closeOnClickModal: false, autofocus: false,
@@ -1744,24 +1765,20 @@ createApp({
       } catch (e) { /* 忽略语音失败 */ }
     },
 
-    // 持仓扫描提醒 → 弹框确认平仓（取消后下次继续提醒）；
-    // 实盘默认已自动平仓，只有自动平仓失败或开关关闭时才会出现这里的提醒
+    // ST 确认转向只播报和通知，平仓仍由用户点击已有仓位操作。
     checkScanAlert() {
       for (const a of this.scanAlerts) {
-        const ts = a.scanned_at;
-        if (this.lastScanAlert[a.ticker] === ts) continue;   // 本次扫描已提醒过
-        this.lastScanAlert[a.ticker] = ts;
-        const lead = a.auto_close_failed ? '自动平仓失败！' : '';
-        this.$confirm(
-          `${lead}${a.ticker} 多头 ${a.qty} 股，ST 已转空头（${a.st_short}），现价 ${a.close}，确认平仓？`,
-          '持仓扫描：ST 转空头', {
-            type: 'warning',
-            confirmButtonText: '平仓',
-            cancelButtonText: '暂不',
-            closeOnClickModal: false,
-          }
-        ).then(() => this.closePosition(a.symbol))
-          .catch(() => { /* 取消：下次扫描继续提醒 */ });
+        if (this.lastScanAlert[a.ticker] === a.scanned_at) continue;
+        this.lastScanAlert[a.ticker] = a.scanned_at;
+        const side = a.side === 'short' ? '空头' : '多头';
+        const confirmed = a.confirmed_direction === 1 ? '多头' : a.confirmed_direction === -1 ? '空头' : (a.side === 'short' ? '多头' : '空头');
+        const realtime = a.realtime_direction === 1 ? '多头' : a.realtime_direction === -1 ? '空头' : '未就绪';
+        const time = a.confirmed_bar_time ? this.hmET(a.confirmed_bar_time) + '开盘K线' : '时间未记录';
+        this.speak(`${a.ticker.split('').join(' ')} 持仓${side}，收盘确认ST${confirmed}，实时ST${realtime}，请检查`);
+        this.$notify({
+          title: 'ST方向提醒（收盘确认）', type: 'warning', duration: 0, position: 'bottom-right',
+          message: `${a.ticker} 持仓${side} ${a.qty} 股；实时ST ${realtime}；收盘确认ST ${confirmed}（美东${time}），确认ST线 ${a.st_line ?? '—'}。仅提醒，由你决定是否处理。`,
+        });
       }
     },
 
@@ -1813,7 +1830,7 @@ createApp({
         this.speak(n.pending ? `${spelled} 已提交自动平仓，等待成交` : `${spelled} 已自动平仓`);
         this.$notify({
           title: n.pending ? '已提交自动平仓' : '已自动平仓',
-          message: `${n.ticker} 多头 ${n.qty} 股，ST 已转空头（${n.st_short}），平仓价 ${n.close}${n.pending ? '，等待实际成交' : ''}`,
+          message: `${n.ticker} ${n.side === 'short' ? '空头' : '多头'} ${n.qty} 股，历史ST转向退出，ST线 ${n.st_line ?? '—'}，平仓价 ${n.close}${n.pending ? '，等待实际成交' : ''}`,
           type: n.pending ? 'warning' : 'success', duration: 30000, position: 'bottom-right',
         });
       }
@@ -1865,6 +1882,12 @@ createApp({
           message = `${ticker} ${side} ${n.qty || 0} 股，原因 ${n.reason || '策略退出'}${ok ? '，等待成交' : ''}`;
           type = ok ? 'warning' : 'error';
           duration = ok ? 10000 : 0;
+        } else if (['pyramid_trend_reverse_alert', 'auto_trend_reverse_alert'].includes(n.event)) {
+          title = 'ST / 策略方向转向提醒';
+          text = `${spelled} ${side}持仓方向已反向，请检查`;
+          message = `${ticker} ${side} ${n.qty || 0} 股，确认方向已反向，现价 ${n.price ?? '—'}，请自行决定是否平仓`;
+          type = 'warning';
+          duration = 0;
         } else if (n.event === 'pyramid_flat') {
           title = '整组平仓已完成';
           text = `${spelled} 自动策略已完成平仓`;
@@ -1899,47 +1922,18 @@ createApp({
       if (dirty) saveNotified('notified_fvg_reverse', this.lastFvgReverseNotice);
     },
 
-    // 反向 FVG 守卫提醒：浮盈已保本 → 语音 + 弹框确认平仓锁利；
-    // 平仓失败 → 语音警告 + 弹框人工平仓（取消后下次快照继续提醒）
+    // FVG 转向仅通知；任何保本/平仓均由用户在对应批次手动确认。
     checkFvgReverseAlert() {
       for (const a of this.fvgReverseAlerts) {
         const key = `${a.lot_id}:${a.alerted_at}`;
         if (this.lastFvgReverseAlert[key]) continue;
         this.lastFvgReverseAlert[key] = true;
-        const spelled = (a.ticker || '').split('').join(' ');
-        if (a.kind === 'reverse_warning') {
-          this.$notify({
-            title: '反向 FVG 提醒',
-            message: `${a.ticker} 出现反向 FVG，当前浮亏 $${Math.abs(a.pnl)}。`,
-            type: 'warning',
-          });
-          continue;
-        }
-        if (a.kind === 'profit_lock') {
-          this.speak(`${spelled} 出现反向 F V G，已保本，建议平仓锁定利润`);
-          this.$confirm(
-            `${a.ticker} ${a.side === 'long' ? '多头' : '空头'} ${a.qty} 股浮盈 ${a.pnl} 美元，出现反向 FVG（已保本），确认平仓锁定利润？`,
-            '反向 FVG：锁定利润', {
-              type: 'warning',
-              confirmButtonText: '平仓锁利',
-              cancelButtonText: '暂不',
-              closeOnClickModal: false,
-            }
-          ).then(() => this.closePosition(a.symbol))
-            .catch(() => { /* 暂不：提醒记录保留，人工决定 */ });
-        } else {
-          this.speak(`警告 ${spelled} 反向 F V G，自动平仓失败，请人工平仓`);
-          this.$confirm(
-            `${a.ticker} ${a.side === 'long' ? '多头' : '空头'} ${a.qty} 股浮亏 ${a.pnl} 美元，反向 FVG 确认但自动平仓失败，立即人工平仓？`,
-            '反向 FVG：平仓失败', {
-              type: 'error',
-              confirmButtonText: '平仓',
-              cancelButtonText: '暂不',
-              closeOnClickModal: false,
-            }
-          ).then(() => this.closePosition(a.symbol))
-            .catch(() => { /* 暂不：后端下一根确认 bar 自动重试 */ });
-        }
+        const side = a.side === 'long' ? '多头' : '空头';
+        this.speak(`${(a.ticker || '').split('').join(' ')} 出现反向 F V G，请确认是否处理持仓`);
+        this.$notify({
+          title: '反向 FVG：等待人工决定', type: 'warning', duration: 0, position: 'bottom-right',
+          message: `${a.ticker} ${side} ${a.qty} 股，当前浮动盈亏 $${a.pnl}。系统仅提醒；如需处理，请在对应订单批次明确确认保本或平仓。`,
+        });
       }
     },
 
@@ -2432,6 +2426,14 @@ createApp({
       this.slots[0].symbol = r.symbol;
       this.$message.success(`已选中 ${r.ticker}`);
       this.tvShow(r.symbol);
+    },
+
+    selectRangeStock(row) {
+      this.rangeSelectedSymbol = row.symbol;
+      this.pickScreen(row);
+    },
+    rangePosition(speed) {
+      return RangeDistribution.position(speed, this.rangeDistribution.limit);
     },
 
     // CDP 联动看盘：POST /api/tv/view。master → 只切 TV pane 0（无截图）；
@@ -2981,9 +2983,33 @@ createApp({
       const age = this.now - bt;
       return age > 60 ? '价@' + this.hmET(bt) : '';
     },
+    lotSideLabel(row) {
+      return row.side === 'long' ? '做多' : row.side === 'short' ? '做空' : '方向未记录';
+    },
+    lotEntryAction(row) {
+      return row.side === 'long' ? 'BUY 买入开仓' : row.side === 'short' ? 'SELL 卖出开仓' : '—';
+    },
+    orderTime(ts) {
+      if (!Number.isFinite(ts) || ts <= 0) return '—';
+      return new Date(ts * 1000).toLocaleString('sv-SE', {
+        timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+      });
+    },
+    lotOpenTime(row) { return this.orderTime(row.entry_broker_time || row.entry_time); },
+    lotExitReason(row) {
+      if (row.state === 'CLOSED') return row.exit_reason ? this.exitReasonLabel(row.exit_reason) : '原因未记录';
+      if (row.state === 'CLOSING') return '待成交确认：' + this.exitReasonLabel(row.close_reason);
+      return '—';
+    },
     exitReasonLabel(r) {
-      return { trail_stop: '跟踪止损', stop: '止损', manual: '手动平仓', eod: '尾盘强平',
-               external_close: '外部平仓', phantom_cleanup: '人工核销' }[r] || r;
+      return { trail_stop: '跟踪保护止损成交', stop: '保护止损触发', manual: '用户手动平仓',
+        manual_stop: '用户退出策略组', manual_stop_close: '用户退出策略组',
+        st_flip: 'ST转向自动平仓（历史规则）', trend_reverse: '策略方向反向退出（历史规则）',
+        fvg_reverse: '反向FVG自动退出（历史规则）', eod: '尾盘强平', eod_cancel: '尾盘撤单',
+        naked_guard: '保护单恢复失败强平', breakout_three_bar_timeout: '突破入场第三根收盘退出',
+        breakout_signal_close_stop: '突破信号收盘价保护退出', superseded_group: '旧交易组退出',
+        external_close: '外部平仓', phantom_cleanup: '人工核销' }[r] || r || '原因未记录';
     },
     stateTag(s) { return { ACTIVE: 'success', PENDING: 'warning', CLOSING: 'warning', CANCELLED: 'info', FAILED: 'danger', CLOSED: 'info' }[s] || 'info'; },
     // 交易员列配色：本客户端绿色高亮，master/auto 普通色，他人弱化

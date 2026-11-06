@@ -2,7 +2,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { loadPineModels, outputFromPeriod } = require('../service/pine_models');
+const { loadPineModels, outputFromPeriod, periodFromOutput } = require('../service/pine_models');
 const models = loadPineModels();
 assert.equal(models[0].name, 'EMA9-ST-ATR');
 assert.deepEqual(outputFromPeriod(models[0], {
@@ -23,6 +23,13 @@ const other = { id: 'fixture_model', realtime_key: 'fixture', confirmed_key: 'fi
   plots: { signal: 'Signal', dir: 'Bias', price: 'Price', sl: 'StopLong', ss: 'StopShort' } };
 assert.equal(outputFromPeriod(other, { $time: 10, Signal: 0, Bias: -1, Price: 100, StopLong: 99, StopShort: 101 }).signal, 0);
 assert.equal(outputFromPeriod(other, { StopLong: Infinity }).sl, null);
+for (const model of models) {
+  const computed = { time: 1700, ...Object.fromEntries(Object.keys(model.plots)
+    .map((field, index) => [field, field === 'short_stop' ? null : index + 1])) };
+  assert.deepEqual(outputFromPeriod(model, periodFromOutput(model, computed)), computed,
+    model.id + ' local results survive the Tick adapter');
+  assert.equal(periodFromOutput(model, null), null);
+}
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'autotrade-pine-'));
 try {
   const file = path.join(dir, 'models.json');

@@ -5,7 +5,7 @@ from typing import List
 from typing import Optional
 from console.schemas import LimitStopOrderRequest, OpeningBreakoutOrderRequest, OpeningBreakoutPrepareRequest, UpdateTrailRequest
 from console.dependencies import get_services, require_trader
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 
 router = APIRouter()
 
@@ -23,6 +23,17 @@ async def api_lots(
 @router.get("/api/positions")
 async def api_positions(*, services=Depends(get_services)) -> List[dict]:
     return await services.trading.api_positions()
+
+
+@router.get("/api/trades/history")
+async def api_trade_history(
+    symbol: Optional[str] = None,
+    before: Optional[float] = Query(default=None, gt=0),
+    limit: int = Query(default=100, ge=1, le=500),
+    *,
+    services=Depends(get_services),
+) -> List[dict]:
+    return await services.trading.api_trade_history(symbol=symbol, before=before, limit=limit)
 
 
 @router.post("/api/lots/limit-stop")

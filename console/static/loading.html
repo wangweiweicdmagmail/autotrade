@@ -32,6 +32,8 @@
     .stage-icon { width: 20px; height: 20px; flex: none; display: grid; place-items: center;
       border: 2px solid #4b5262; border-radius: 50%; color: transparent; font-size: 12px; }
     .stage:not(.ready) .stage-icon { border-top-color: #6ea8ff; animation: spin 1.1s linear infinite; }
+    .stage.optional:not(.ready) .stage-icon { border-color: #d9a441; color: #d9a441; animation: none; }
+    .stage.optional:not(.ready) .stage-icon::before { content: "!"; }
     .stage.ready .stage-icon { border-color: #22c55e; color: #22c55e; }
     .stage.ready .stage-icon::before { content: "✓"; }
     .stage-copy { min-width: 0; flex: 1; }
@@ -123,7 +125,7 @@
       const stages = data.stages || [];
       for (const stage of stages) {
         const row = document.createElement('div');
-        row.className = 'stage' + (stage.ready ? ' ready' : '');
+        row.className = 'stage' + (stage.ready ? ' ready' : '') + (stage.blocking === false ? ' optional' : '');
         const icon = document.createElement('span');
         icon.className = 'stage-icon';
         const copy = document.createElement('div');
@@ -146,6 +148,8 @@
           steps.className = 'stage-detail';
           const indicators = market.indicators || {};
           steps.textContent = [
+            data.market_session?.requested === '24h' && `行情时段 ${data.market_session.confirmed}/${market.total}`,
+            `K 线已到 ${market.bars_ready ?? 0}/${market.total}`,
             indicators.total && `指标正文 ${indicators.loaded}/${indicators.total}`,
             indicators.name && `当前指标 ${indicators.name}`,
             `已发起订阅 ${market.subscribed}/${market.total}`,
@@ -161,12 +165,13 @@
         row.append(icon, copy);
         stagesEl.append(row);
       }
-      const readyCount = stages.filter(stage => stage.ready).length;
-      progressEl.style.width = (stages.length ? readyCount / stages.length * 100 : 0) + '%';
+      const required = stages.filter(stage => stage.blocking !== false);
+      const readyCount = required.filter(stage => stage.ready).length;
+      progressEl.style.width = (required.length ? readyCount / required.length * 100 : 0) + '%';
       elapsedEl.textContent = (data.elapsed || 0) + 's';
       errorEl.style.display = data.error ? 'block' : 'none';
       errorEl.textContent = data.error || '';
-      statusEl.textContent = data.ready ? '全部就绪' : '正在准备，请稍候';
+      statusEl.textContent = data.ready ? '工作区已就绪' : '正在准备，请稍候';
       const issues = data.cache_issues || [];
       cacheIssues.replaceChildren(...issues.map(issue => {
         const item = document.createElement('li');

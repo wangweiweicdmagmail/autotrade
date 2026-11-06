@@ -7,7 +7,8 @@
  * metaInfo.inputs 中 id="text" 的 defval（见上游 TradingView-API issue #354）。
  *
  * 本模块在加载指标时直接从 translate 响应提取 text 并用库导出的
- * PineIndicator 重建实例注入——每次启动都是最新正文，不依赖任何本地缓存，
+ * PineIndicator 重建实例注入。每次启动核对远端元数据；采集重连可优先
+ * 复用已验证为同版本的正文缓存，版本变化时重新取正文。
  * 也不修改 node_modules（重装依赖零影响）。translate 提取失败时回退
  * pine_texts.json 缓存（由 refresh_pine_texts.py 生成）。
  */
@@ -67,15 +68,20 @@ function sameVersion(a, b) {
 
 /**
  * getIndicator + 加密正文注入。缓存正文必须与远端版本一致，禁止把旧脚本
- * 拼到新元数据上（会静默丢 plot）。options 仅供离线测试注入正文与缓存。
+ * 拼到新元数据上（会静默丢 plot）。采集重连可选择同版本缓存优先；
+ * 测试可通过 options 注入正文获取器与缓存。
  */
 async function loadIndicatorWithText(TradingView, id, creds, options = {}) {
   const indic = await TradingView.getIndicator(id, 'last', creds.sessionid, creds.sessionid_sign);
   const fetchText = options.fetchText || fetchScriptText;
   const cache = options.cache || loadTextCache();
-  let text = null;
+  const cached = cache[id];
+  // Metadata is still fetched remotely above. Reuse text only after validating
+  // the remote version; reconnects need not repeat known-empty translations.
+  let text = options.preferVersionedCache && cached?.text && sameVersion(cached.version, indic.pineVersion)
+    ? cached.text : null;
   let fallbackError = '';
-  try {
+  if (!text) try {
     text = await fetchText(id, creds);
   } catch (e) {
     const reason = (e.message || e).toString().slice(0, 120);

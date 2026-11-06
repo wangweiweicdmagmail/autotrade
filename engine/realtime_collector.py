@@ -45,7 +45,12 @@ class RealtimeCollector:
     STARTUP_MAX_SECONDS = 180.0
     RESTART_COOLDOWN_SECONDS = 60.0
 
-    def __init__(self, symbols: List[str]):
+    def __init__(self, symbols: List[str], *, audit=None, market_session="extended", default_session_symbols=()):
+        self.audit = audit
+        self.market_session = market_session
+        self.default_session_symbols = frozenset(default_session_symbols)
+        self.market_sessions: dict[str, dict] = {}
+        self.market_frame_id = None
         self.symbols = [s.strip() for s in symbols if s.strip()]
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._reader_task: Optional[asyncio.Task] = None
@@ -54,7 +59,7 @@ class RealtimeCollector:
         self._snapshot: Dict[str, dict] = {}
         self._content_key = ""
         self._last_update = 0.0          # 最后一次收到有效 tick（传输心跳）
-        self._last_content_update = 0.0  # 最后一次 symbols 实际变化
+        self._last_content_update = 0.0  # 最后一次 K 线实际变化
         self._last_launch = 0.0
         self._last_startup_progress = 0.0
         self.startup_indicators: dict = {}
@@ -98,8 +103,16 @@ class RealtimeCollector:
         self._last_startup_progress = 0.0
         self.startup_indicators = {}
         self.startup_subscribed = 0
+        self.market_sessions = {}
+        if self.market_session == "24h":
+            self._snapshot = {}
+            self._content_key = ""
+            self.latest_bar_time = self._last_content_update = self._last_update = 0.0
+            self.bar_update_delay = None
         self._proc = await asyncio.create_subprocess_exec(
             "node", str(TV_DAEMON_JS), "--symbols", ",".join(self.symbols),
+            "--market-session", self.market_session,
+            "--default-session-symbols", ",".join(sorted(self.default_session_symbols)),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(SERVICE_DIR),
@@ -125,7 +138,7 @@ class RealtimeCollector:
                 break
             msg = line.decode("utf-8", "replace").rstrip()
             if msg:
-                if "study_error" in msg or "Can't parse pine" in msg:
+                if any(marker in msg for marker in ("local_indicator_error", "study_error", "Can't parse pine")):
                     self._study_errors.append(time.time())
                 logger.warning("[tv_cloud] %s", msg)
 
@@ -134,6 +147,18 @@ class RealtimeCollector:
         symbols = msg.get("symbols")
         if not isinstance(symbols, dict):
             return
+        sessions = msg.get("sessions")
+        if isinstance(sessions, dict):
+            self.market_sessions = sessions
+        if self.market_session == "24h" or self.default_session_symbols:
+            symbols = {
+                symbol: row for symbol, row in symbols.items()
+                if isinstance(row, dict) and row.get("bar")
+                and (
+                    (self.market_session == "extended" and symbol not in self.default_session_symbols)
+                    or self._confirmed_session(symbol, row.get("session") or {})
+                )
+            }
         now = time.time() if now is None else now
         self._last_update = now
         content_key = json.dumps(symbols, ensure_ascii=False, sort_keys=True,
@@ -142,12 +167,31 @@ class RealtimeCollector:
             symbols = {symbol: dict(data) for symbol, data in symbols.items()}
             for symbol, data in symbols.items():
                 previous = self._snapshot.get(symbol) or {}
+                bar = data.get("bar") or {}
+                old_bar = previous.get("bar") or {}
+                # Snapshot bars also carry Pine context. Its arrival must not
+                # make a stale market price appear newly observed.
+                changed = bool(bar) and any(
+                    bar.get(field) != old_bar.get(field)
+                    for field in ("time", "open", "high", "low", "close", "volume")
+                )
+                observation = data.get("price_observed_at")
+                if type(observation) not in (int, float) or not 0 < observation <= now:
+                    observation = None
+                if changed:
+                    self._last_content_update = max(self._last_content_update, observation or now)
                 data["price_observed_at"] = (
-                    now if data.get("bar") != previous.get("bar")
-                    else previous.get("price_observed_at", now))
+                    observation if observation is not None
+                    else now if changed else previous.get("price_observed_at")
+                )
             self._snapshot = symbols
             self._content_key = content_key
-            self._last_content_update = now
+
+        if self.audit is not None:
+            source_at = msg.get("ts")
+            self.market_frame_id = self.audit.capture(
+                self._snapshot, now, source_at if isinstance(source_at, (int, float)) else None,
+            )
 
         max_t = 0.0
         for s in self._snapshot.values():
@@ -184,10 +228,13 @@ class RealtimeCollector:
                 self._last_startup_progress = time.time()
                 self.startup_subscribed = msg["subscribed"]
             elif msg.get("type") == "indicator_startup":
-                self._last_startup_progress = time.time()
                 self.startup_indicators = {
-                    key: msg[key] for key in ("loaded", "total", "name") if key in msg
+                    key: msg[key] for key in ("loaded", "total", "name", "source", "tv_study_subscriptions")
+                    if key in msg
                 }
+                if msg.get("source") == "pinets" and msg.get("loaded") == msg.get("total"):
+                    logger.info("PineTS 本地指标就绪 %s/%s；TV 指标订阅数 %s",
+                                msg["loaded"], msg["total"], msg.get("tv_study_subscriptions"))
                 if issue := msg.get("cache_issue"):
                     self.cache_issues[issue["id"]] = issue
                 if loaded_id := msg.get("loaded_id"):
@@ -252,7 +299,7 @@ class RealtimeCollector:
             if now - self._last_restart < self.RESTART_COOLDOWN_SECONDS:
                 continue
             health = self.data_health(now)
-            if not health["stale"]:
+            if not health["stale"] or health["reason"] == "session_unavailable":
                 continue
             reason = health["reason"]
             try:
@@ -306,6 +353,36 @@ class RealtimeCollector:
     def _display_age(age: float) -> Optional[float]:
         return None if age == float("inf") else round(age, 1)
 
+    def _confirmed_session(self, symbol: str, session: dict) -> bool:
+        if symbol in self.default_session_symbols:
+            return (session.get("requested") == "default" and session.get("accepted") is True
+                    and not session.get("error"))
+        return session.get("resolved") == self.market_session and not session.get("error")
+
+    def _session_unavailable(self, symbol: str) -> bool:
+        session = self.market_sessions.get(symbol, {})
+        if symbol in self.default_session_symbols:
+            return bool(session.get("error"))
+        return self.market_session == "24h" and bool(
+            session.get("error") or session.get("resolved") not in (None, "24h")
+        )
+
+    def market_session_status(self) -> dict:
+        confirmed = sum(
+            bool(row.get("bar") and self._confirmed_session(symbol, row.get("session") or {}))
+            for symbol, row in self._snapshot.items()
+        )
+        return {
+            "requested": self.market_session,
+            "confirmed": confirmed,
+            "total": len(self.symbols),
+            "unavailable": {
+                symbol: session for symbol, session in self.market_sessions.items()
+                if self._session_unavailable(symbol)
+            },
+            "symbols": self.market_sessions,
+        }
+
     def data_health(self, now: Optional[float] = None,
                     trading: Optional[bool] = None) -> dict:
         """行情健康度；交易时段外的自然静默不触发重启或开仓拦截。"""
@@ -320,10 +397,16 @@ class RealtimeCollector:
                 reasons.append("daemon_stopped")
             if transport_age > self.TRANSPORT_STALE_SECONDS:
                 reasons.append("transport_stale")
-            if content_age > self.CONTENT_STALE_SECONDS:
-                reasons.append("content_stale")
-            if bar_age > self.BAR_STALE_SECONDS:
-                reasons.append("bar_stale")
+            unavailable = self.market_session == "24h" and self.symbols and all(
+                self._session_unavailable(symbol) for symbol in self.symbols
+            )
+            if unavailable:
+                reasons.append("session_unavailable")
+            else:
+                if content_age > self.CONTENT_STALE_SECONDS:
+                    reasons.append("content_stale")
+                if bar_age > self.BAR_STALE_SECONDS:
+                    reasons.append("bar_stale")
         reason = ",".join(reasons)
         return {
             "stale": bool(reasons),
@@ -333,6 +416,10 @@ class RealtimeCollector:
             "content_age": self._display_age(content_age),
             "transport_age": self._display_age(transport_age),
             "bar_age": self._display_age(bar_age),
+            **({"confirmed_24h_symbols": tuple(
+                symbol for symbol in self._snapshot if symbol not in self.default_session_symbols
+            )}
+               if self.market_session == "24h" else {}),
         }
 
     def age(self) -> float:

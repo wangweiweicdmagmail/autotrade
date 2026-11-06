@@ -17,24 +17,7 @@ class MonitoringService:
         self, ticker: str, sym: str, pos: float, close_px: Optional[float]
     ) -> bool:
         """趋势反向时只处理本工具 lot；外部持仓由独立清理循环处理。"""
-        ok = True
-        for lot in self.context.order_mgr.list_lots(active_only=True, symbol=sym):
-            if not self._uses_legacy_guards(lot):
-                continue
-            if lot["state"] == "PENDING":
-                lok, err = await self.context.order_mgr.cancel_lot(lot["lot_id"])
-            elif lot["state"] == "ACTIVE":
-                lok, err = await self.context.order_mgr.close_lot(
-                    lot["lot_id"], ref_px=close_px, exit_reason="st_flip"
-                )
-            else:
-                continue
-            if not lok:
-                ok = False
-                logger.warning(
-                    "趋势反向平仓 %s lot %s 失败: %s", ticker, lot["lot_id"], err
-                )
-        return ok
+        return False  # Compatibility entry point: ST alerts never authorize exits.
 
     def _legacy_tool_order_ids(self) -> set:
         ids = set()
@@ -339,7 +322,7 @@ class MonitoringService:
     async def _position_scan_loop(self) -> None:
         """持仓扫描（每分钟，双向）：持仓方向与 trend_state 确认值（ts_c，上一根
         已收盘 5M bar，不看盘中实时值）冲突时——多仓见 direction==-1、空仓见
-        direction==1——实盘自动平仓；平仓失败或开关关闭时每分钟弹窗提醒人工处理。"""
+        direction==1——默认仅提醒，由用户决定是否平仓。"""
         while True:
             await asyncio.sleep(60.0)
             try:
@@ -365,54 +348,22 @@ class MonitoringService:
                     if sym is None:
                         continue
                     data = market[sym]
-                    ts_c = self.context.trading._ts_c(data)
+                    ts_c = data.get("ts_c") or {}
+                    confirmed_bar = data.get("bar_c") or {}
+                    live_bar = data.get("bar") or {}
+                    if (not confirmed_bar.get("time") or ts_c.get("time") != confirmed_bar.get("time")
+                            or confirmed_bar["time"] + 300 != live_bar.get("time")):
+                        continue  # Never substitute live ST for a confirmed-ST alert.
                     direction = ts_c.get("direction")
                     flipped = (
                         pos > 0 and direction == -1 or (pos < 0 and direction == 1)
                     )
                     if not flipped:
+                        self.context.monitoring._scan_alerts.pop(ticker, None)
                         continue
                     st_line = ts_c.get("supertrend")
                     bar = data.get("bar") or {}
                     close = bar.get("close")
-                    live = bool(
-                        self.context.gateway.enabled and self.context.gateway._connected
-                    )
-                    if config.AUTO_CLOSE_ON_ST_FLIP and live:
-                        logger.warning(
-                            "持仓扫描: %s %s %s 股趋势已反向(ST %.2f)，自动平仓",
-                            ticker,
-                            side,
-                            abs(pos),
-                            st_line or 0,
-                        )
-                        ok = await self.context.monitoring._close_on_flip(
-                            ticker, sym, pos, close
-                        )
-                        self.context.events.record_event(
-                            "auto_close_st_flip",
-                            symbol=sym,
-                            ticker=ticker,
-                            side=side,
-                            qty=abs(pos),
-                            st_line=st_line,
-                            close=close,
-                            ok=ok,
-                            status="requested",
-                        )
-                        if ok:
-                            self.context.monitoring._scan_alerts.pop(ticker, None)
-                            self.context.monitoring._auto_close_notices[ticker] = {
-                                "symbol": sym,
-                                "ticker": ticker,
-                                "side": side,
-                                "qty": abs(pos),
-                                "st_line": st_line,
-                                "close": close,
-                                "closed_at": time.time(),
-                                "pending": True,
-                            }
-                            continue
                     self.context.monitoring._scan_alerts[ticker] = {
                         "symbol": sym,
                         "ticker": ticker,
@@ -420,9 +371,10 @@ class MonitoringService:
                         "qty": abs(pos),
                         "st_line": st_line,
                         "close": close,
-                        "auto_close_failed": bool(
-                            config.AUTO_CLOSE_ON_ST_FLIP and live
-                        ),
+                        "auto_close_failed": False,
+                        "confirmed_direction": direction,
+                        "realtime_direction": (data.get("ts") or {}).get("direction"),
+                        "confirmed_bar_time": ts_c.get("time"),
                         "scanned_at": time.time(),
                     }
                     logger.info(
@@ -437,6 +389,9 @@ class MonitoringService:
                         symbol=sym,
                         ticker=ticker,
                         side=side,
+                        confirmed_direction=direction,
+                        realtime_direction=(data.get("ts") or {}).get("direction"),
+                        confirmed_bar_time=ts_c.get("time"),
                         qty=abs(pos),
                         st_line=st_line,
                         close=close,
@@ -554,13 +509,15 @@ class MonitoringService:
             logger.warning(
                 "裸仓巡检: %s STP 缺失，自动补挂 @%.2f", lot.symbol, lot.stop_px
             )
-            ok = await self.context.order_mgr._restore_protection(lot)
+            ok = await self.context.order_mgr.restore_protection(lot.lot_id)
             if ok:
                 fails.pop(lot.lot_id, None)
                 await self.context.notifier.recover(
                     key, f"已自动补挂 STP @ {lot.stop_px}"
                 )
                 continue
+            if lot.state != "ACTIVE":
+                continue  # An exit won the lock; do not classify it as naked.
             fails[lot.lot_id] = fails.get(lot.lot_id, 0) + 1
             logger.error(
                 "裸仓巡检: %s 补挂失败（连续 %d 次）", lot.lot_id, fails[lot.lot_id]
@@ -635,8 +592,8 @@ class MonitoringService:
             await self.context.notifier.notify(
                 "tv_study_dead",
                 "critical",
-                "TV 指标数据中断",
-                f"study_error 60s内 {sh['study_errors_60s']} 条，ts_c 就绪 {sh['ts_ready']}/{sh['ts_total']}（持续 {int(sh['ts_dead_for'])}s）。运行 python3 service/tv_diag.py 分层定位",
+                "指标数据中断",
+                f"60 秒内指标错误 {sh['study_errors_60s']} 条，ts_c 就绪 {sh['ts_ready']}/{sh['ts_total']}（持续 {int(sh['ts_dead_for'])} 秒）。请查看行情采集日志",
             )
         else:
             await self.context.notifier.recover("tv_study_dead", "指标数据已恢复")
@@ -840,8 +797,8 @@ class MonitoringService:
 
     async def _fvg_reverse_guard_loop(self) -> None:
         """持仓反向 FVG 守卫（每秒，5M 收盘确认口径）：本工具 ACTIVE lot 的标的出现
-        反向缺口确认（fvg_c.time == bar_c.time 对齐）时——浮亏立即市价平仓，浮盈
-        立即保本 + 前端语音/弹框提醒平仓锁利。每 lot 每根确认 bar 只动作一次。"""
+        反向缺口确认（fvg_c.time == bar_c.time 对齐）时只提醒。
+        保本或退出必须由用户明确操作；每 lot 每根确认 bar 只提醒一次。"""
         while True:
             await asyncio.sleep(1.0)
             try:
@@ -889,99 +846,10 @@ class MonitoringService:
                     pnl = (
                         price - avg_fill if side == "long" else avg_fill - price
                     ) * qty
-                    if action == "close" and config.FVG_REVERSE_AUTO_CLOSE:
-                        logger.warning(
-                            "反向FVG守卫: %s %s 浮亏 %.2f，缺口 %.2f~%.2f，市价平仓",
-                            symbol,
-                            side,
-                            pnl,
-                            fvg_bottom or 0,
-                            fvg_top or 0,
-                        )
-                        ok, err = await self.context.order_mgr.close_lot(
-                            lot_id, ref_px=price, exit_reason="fvg_reverse"
-                        )
-                        self.context.events.record_event(
-                            "fvg_reverse_close",
-                            lot_id=lot_id,
-                            symbol=symbol,
-                            ticker=ticker,
-                            side=side,
-                            qty=qty,
-                            price=price,
-                            avg_fill=avg_fill,
-                            pnl=round(pnl, 2),
-                            fvg_top=fvg_top,
-                            fvg_bottom=fvg_bottom,
-                            ok=ok,
-                            error=err or "",
-                            status="requested",
-                        )
-                        if ok:
-                            self.context.monitoring._fvg_reverse_alerts.pop(
-                                lot_id, None
-                            )
-                            self.context.monitoring._fvg_reverse_notices[ticker] = {
-                                "symbol": symbol,
-                                "ticker": ticker,
-                                "side": side,
-                                "qty": qty,
-                                "price": price,
-                                "pnl": round(pnl, 2),
-                                "closed_at": time.time(),
-                                "pending": True,
-                            }
-                            continue
-                        logger.warning("反向FVG守卫: %s 自动平仓失败: %s", symbol, err)
-                        self.context.monitoring._fvg_reverse_alerts[lot_id] = {
-                            "kind": "close_failed",
-                            "lot_id": lot_id,
-                            "symbol": symbol,
-                            "ticker": ticker,
-                            "side": side,
-                            "qty": qty,
-                            "price": price,
-                            "pnl": round(pnl, 2),
-                            "alerted_at": time.time(),
-                        }
-                        continue
-                    if action == "close":
-                        self.context.monitoring._fvg_reverse_alerts[lot_id] = {
-                            "kind": "reverse_warning",
-                            "lot_id": lot_id,
-                            "symbol": symbol,
-                            "ticker": ticker,
-                            "side": side,
-                            "qty": qty,
-                            "price": price,
-                            "pnl": round(pnl, 2),
-                            "alerted_at": time.time(),
-                        }
-                        continue
-                    if not lot.get("breakeven_reached"):
-                        ok, err = await self.context.order_mgr.breakeven(lot_id)
-                        if ok:
-                            logger.warning(
-                                "反向FVG守卫: %s %s 浮盈 %.2f，已保本",
-                                symbol,
-                                side,
-                                pnl,
-                            )
-                            self.context.events.record_event(
-                                "fvg_reverse_breakeven",
-                                lot_id=lot_id,
-                                symbol=symbol,
-                                ticker=ticker,
-                                side=side,
-                                qty=qty,
-                                price=price,
-                                pnl=round(pnl, 2),
-                                new_stop=round(avg_fill, 2),
-                            )
-                        else:
-                            logger.warning("反向FVG守卫: %s 保本失败: %s", symbol, err)
                     self.context.monitoring._fvg_reverse_alerts[lot_id] = {
-                        "kind": "profit_lock",
+                        "kind": "reverse_warning",
+                        "requires_confirmation": True,
+                        "recommended_action": action,
                         "lot_id": lot_id,
                         "symbol": symbol,
                         "ticker": ticker,
@@ -995,6 +863,7 @@ class MonitoringService:
                     }
                     self.context.events.record_event(
                         "fvg_reverse_alert",
+                        requires_confirmation=True, recommended_action=action,
                         lot_id=lot_id,
                         symbol=symbol,
                         ticker=ticker,

@@ -151,7 +151,9 @@ class BtLoadRequest(BaseModel):
 class BtRunRequest(BtLoadRequest):
     """A complete, request-local execution backtest with a manual start time."""
 
-    start_time: str = Field(default="09:45", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    start_time: str = Field(default="09:45", **{
+        ("pattern" if hasattr(BaseModel, "model_validate") else "regex"): r"^(?:[01]\d|2[0-3]):[0-5]\d$"
+    })
     bars: int = Field(default=500, ge=1, le=5000)
 
 

@@ -7,6 +7,7 @@ import asyncio
 import config
 import time
 from console.shared import logger
+from engine.live_audit import decision_market_frame
 from console.schemas import AutoAdoptRequest, AutoRejectRequest, AutoStartRequest
 
 
@@ -41,6 +42,7 @@ class AutomaticService:
 
         while True:
             await asyncio.sleep(1.0)
+            token = decision_market_frame.set(self.context.collector.market_frame_id)
             try:
                 now = datetime.now(ZoneInfo("America/New_York"))
                 await self.context.strategy_runtime.step(
@@ -53,6 +55,8 @@ class AutomaticService:
                 raise
             except Exception:
                 logger.exception("Pine 执行调度异常")
+            finally:
+                decision_market_frame.reset(token)
 
     async def api_auto_models(self) -> dict:
         return {"models": self.context.auto_service.registry.describe()}

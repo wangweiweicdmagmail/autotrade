@@ -430,6 +430,19 @@ class TradingService:
     async def api_positions(self) -> List[dict]:
         return self.context.order_mgr.aggregate()
 
+    async def api_trade_history(self, *, symbol=None, before=None, limit=100) -> list:
+        records = await asyncio.to_thread(self.context.order_mgr._store.archive_records)
+        if symbol:
+            requested = symbol.upper()
+            records = [
+                row for row in records
+                if (row.get("symbol") or "").upper() == requested
+                or (":" not in requested and (row.get("symbol") or "").split(":")[-1].upper() == requested)
+            ]
+        if before is not None:
+            records = [row for row in records if (row.get("closed_at") or 0) < before]
+        return sorted(records, key=lambda row: row.get("closed_at") or 0, reverse=True)[:limit]
+
     async def api_place_opening_breakout(
         self, req: OpeningBreakoutOrderRequest, trader: str, *, deadline: float | None = None,
     ) -> dict:
@@ -562,6 +575,14 @@ class TradingService:
         if qty <= 0:
             raise HTTPException(400, "无法确定有效股数（请显式填写 qty）")
         signal_snapshot = self.context.trading._snapshot_for(symbol=req.symbol)
+        market_frame = getattr(self.context.collector, "market_frame_id", None)
+        if market_frame is not None:
+            signal_snapshot["decision_market_frame"] = market_frame
+        self.context.events.record_event(
+            "manual_entry_decision", symbol=req.symbol, side=req.side, trader=trader,
+            qty=qty, limit_px=limit_px, stop_px=stop_px, limit_type=req.limit_type,
+            reason=req.reason, force=req.force, decision_market_frame=market_frame,
+        )
         if opening:
             signal_snapshot.update(stop_source="opening_bar_extreme", stop_bar_time=data["bar"]["time"])
         if opening_breakout:
@@ -597,10 +618,15 @@ class TradingService:
             **({"submission_deadline": deadline} if deadline is not None else {}),
         )
         if lot is None:
+            self.context.events.record_event(
+                "manual_entry_rejected", symbol=req.symbol, side=req.side, trader=trader,
+                decision_market_frame=market_frame, reason=err,
+            )
             raise HTTPException(400, err)
         self.context.events.record_event(
             "order_placed",
             lot_id=lot.lot_id,
+            decision_market_frame=market_frame,
             symbol=req.symbol,
             side=req.side,
             qty=qty,

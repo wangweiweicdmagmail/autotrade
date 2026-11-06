@@ -1,0 +1,207 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// 原作 © TFlab / TradingFinder
+// 改进版（2026）：①区域用 box 对象绘制（替代 line+linefill+label），文字直接显示在框内
+//                 ②区域固定宽度可配置（默认6根K线，设多少画多少；0=动态延伸到缓解） ③颜色可配置 ④回踩警报
+//                 ⑤强/弱FVG分类：三根K线中最左边那根（K2/bar[2]）方向与缺口方向一致=强，不一致=弱
+//                 ⑥超级趋势模块：ST同向FVG累积计数（转向清零）+ 最后FVG上下边沿 + 当根FVG信号，四项输出到数据窗口
+//                 并修复了"形成当根K线即被误判为缓解"的逻辑漏洞；注释全部中文化
+//@version=5
+indicator("FVG 探测器改进版 [Fair Value Gap / 失衡区 / 缓解检测]", "FVG Finder+", overlay = true, max_boxes_count = 500)
+
+//==================== 输入参数 ====================
+string GRP_FVG  = 'FVG 检测设置'
+string GRP_ZONE = '区域显示设置'
+string GRP_ST   = '超级趋势设置'
+
+//—— FVG 检测设置 ——
+VFVGFilter = input.string('Off', 'FVG 过滤器', ['On', 'Off'],
+ tooltip = '开启后，将尝试用误差修正算法为订单块筛选更优质的 FVG。', group = GRP_FVG)
+
+VFVGFilterType = input.string('Defensive', '过滤器类型', ['Very Aggressive', 'Aggressive', 'Defensive', 'Very Defensive'],
+ tooltip = '四种方式的区别在于检出 FVG 的数量与质量：越偏防守（Defensive），检出的 FVG 越少、质量越高。', group = GRP_FVG)
+
+VShowDeFVG = input.bool(true, '显示需求区 FVG（看涨缺口）', group = GRP_FVG)
+VShowSuFVG = input.bool(true, '显示供应区 FVG（看跌缺口）', group = GRP_FVG)
+
+//—— 区域显示设置（新增）——
+VZoneLen = input.int(6, '区域固定宽度（K 线数）', minval = 0, group = GRP_ZONE,
+ tooltip = '大于 0 时：BOX 创建即画满该宽度，设多少根就是多少根，不再逐根延伸；填 0 表示动态延伸，一直画到被缓解为止。')
+
+VDeColor    = input.color(#a9d60580, '需求区填充颜色', group = GRP_ZONE)
+VSuColor    = input.color(#ff7d044d, '供应区填充颜色', group = GRP_ZONE)
+VLineColor  = input.color(color.rgb(0, 0, 0), '区域边框颜色', group = GRP_ZONE)
+VLabelColor = input.color(#000000, '框内文字颜色', group = GRP_ZONE)
+
+VMitMode = input.string('变灰', '区域被缓解后', ['保持原样', '变灰', '删除'], group = GRP_ZONE,
+ tooltip = '价格回补（缓解）FVG 后的处理方式：保持原样 / 变为灰色 / 直接从图上删除。')
+
+//—— 超级趋势设置（新增）：用于"与ST同向FVG累积计数"——
+VSTFactor = input.float(3.0, 'ST 乘数（Factor）', minval = 0.1, step = 0.1, group = GRP_ST)
+VSTPeriod = input.int(10, 'ST ATR 周期', minval = 1, group = GRP_ST)
+
+//==================== FVG 检测函数 ====================
+//返回值：[需求区回踩信号, 供应区回踩信号]，用于全局 alertcondition
+FVGDetector(string FVGFilter, string FVGFilterType, bool ShowDeFVG, bool ShowSuFVG, int ZoneLen, color DeColor, color SuColor, color LineColor, color LabelColor, string MitMode) =>
+    //—— 状态变量（var：跨 K 线保留上一次的值）——
+    var float DDFVG = 0.0   // 需求区远端（缺口下沿）
+    var float DPFVG = 0.0   // 需求区近端（缺口上沿）
+    var float SDFVG = 0.0   // 供应区远端（缺口上沿）
+    var float SPFVG = 0.0   // 供应区近端（缺口下沿）
+    var int BarDFVG = 0     // 需求区形成时的 K 线索引
+    var int BarSFVG = 0     // 供应区形成时的 K 线索引
+
+    var box DBox = na       // 需求区 BOX（替代原 line+linefill+label 组合）
+    var box SBox = na       // 供应区 BOX
+
+    var bool DMitigated = true  // 需求区是否仍然有效（false = 已被缓解）
+    var bool SMitigated = true  // 供应区是否仍然有效
+
+    //—— 强/弱 FVG 标记（新增）：true = 强，false = 弱 ——
+    //—— 判定规则：三根K线中最左边那根（bar[2]，按用户编号为 K2）的方向与缺口方向一致 = 强；不一致 = 弱 ——
+    var bool DStrong = false    // 需求区强弱标记：最左K线收阳（close[2] > open[2]）与看涨缺口同向 = 强
+    var bool SStrong = false    // 供应区强弱标记：最左K线收阴（close[2] < open[2]）与看跌缺口同向 = 强
+
+    //—— 最后一个 FVG 的两个边沿（新增）：任何方向的新 FVG 形成时更新 ——
+    var float LastTop = na      // 最后一个 FVG 上沿
+    var float LastBottom = na   // 最后一个 FVG 下沿
+
+    //—— ATR：过滤器中用作波动幅度基准（原脚本的 ATR(55)，如需调节可再参数化）——
+    ATR = ta.atr(55)
+
+    //—— 需求区 FVG 过滤条件（看涨缺口：当前最低价 > 前两根最高价，中间K线跳空向上）——
+    DConditionFVG = if FVGFilter == 'Off'
+        (low > high[2])
+    else if FVGFilter == 'On'
+        switch FVGFilterType
+            //非常激进：只要求缺口 + 新高
+            'Very Aggressive' => (low > high[2]) and (high > high[1])
+            //激进：中间K线实体幅度 ≥ 1.0 倍 ATR
+            'Aggressive' => ((low > high[2]) and ((high[1] - low[1]) >= (1.0 * ATR)) and (high > high[1]))
+            //防守：中间K线幅度 ≥ 1.5 倍 ATR，且（前两根连续收阳 或 中间K线实体占比 > 70%）
+            'Defensive' => ((low > high[2]) and ((high[1] - low[1]) >= (1.5 * ATR)) and (high > high[1]))
+             and ((close[2] - open[2] > 0 and close[1] - open[1] > 0) or math.abs((close[1] - open[1]) / (high[1] - low[1])) > 0.7)
+            //非常防守：在防守基础上，进一步要求前两根与当前K线实体占比 > 35%
+            'Very Defensive' => ((low > high[2]) and ((high[1] - low[1]) >= (1.5 * ATR)) and (high > high[1]))
+             and ((close[2] - open[2] > 0 and close[1] - open[1] > 0) and math.abs((close[1] - open[1]) / (high[1] - low[1])) > 0.7)
+             and math.abs((close[2] - open[2]) / (high[2] - low[2])) > 0.35 and math.abs((close - open) / (high - low)) > 0.35
+
+    //—— 供应区 FVG 过滤条件（看跌缺口：当前最高价 < 前两根最低价，中间K线跳空向下）——
+    SConditionFVG = if FVGFilter == 'Off'
+        (high < low[2])
+    else if FVGFilter == 'On'
+        switch FVGFilterType
+            'Very Aggressive' => (high < low[2]) and (low[1] > low)
+            'Aggressive' => ((high < low[2]) and ((high[1] - low[1]) >= (1.0 * ATR)) and (low[1] > low))
+            'Defensive' => ((high < low[2]) and ((high[1] - low[1]) >= (1.5 * ATR)) and (low[1] > low))
+             and ((close[2] - open[2] < 0 and close[1] - open[1] < 0) or math.abs((close[1] - open[1]) / (high[1] - low[1])) > 0.7)
+            'Very Defensive' => ((high < low[2]) and ((high[1] - low[1]) >= (1.5 * ATR)) and (low[1] > low))
+             and ((close[2] - open[2] < 0 and close[1] - open[1] < 0) and math.abs((close[1] - open[1]) / (high[1] - low[1])) > 0.7)
+             and math.abs((close[2] - open[2]) / (high[2] - low[2])) > 0.35 and math.abs((close - open) / (high - low)) > 0.35
+
+    //==================== 需求区 FVG 检测 ====================
+    if DConditionFVG and ShowDeFVG
+        DDFVG := high[2]      // 远端 = 前两根 K 线的最高价
+        DPFVG := low          // 近端 = 当前 K 线的最低价
+        BarDFVG := bar_index
+        DStrong := close[2] > open[2]   // 强弱判定：最左K线（K2/bar[2]）收阳 = 与看涨缺口方向一致 = 强 FVG
+        //用 box 绘制区域：上沿 = 近端，下沿 = 远端；左边界回溯 2 根，完整覆盖形成缺口的 3 根K线
+        //宽度模式：ZoneLen > 0 时一次画满固定宽度（总宽 = ZoneLen 根）；ZoneLen == 0 时先画 1 根，之后逐根动态延伸
+        //（全部使用命名参数，避免部分 TV 编译环境对混合参数的类型推断报错）
+        DBox := box.new(left = BarDFVG - 2, top = DPFVG,
+         right = ZoneLen > 0 ? BarDFVG - 2 + ZoneLen : BarDFVG + 1,
+         bottom = DDFVG, xloc = xloc.bar_index,
+         border_color = LineColor, border_style = line.style_dotted, border_width = 1,
+         bgcolor = DeColor,
+         text = DStrong ? 'FVG 强' : 'FVG 弱', text_color = LabelColor,
+         text_halign = text.align_center, text_valign = text.align_center, text_size = size.small)
+
+    //—— 动态延伸（仅 ZoneLen == 0 时生效）：未缓解则逐根向右延伸；固定宽度模式下无需延伸 ——
+    if ZoneLen == 0 and DMitigated and ((low > DDFVG) or DDFVG == DDFVG[1])
+        box.set_right(DBox, bar_index + 1)
+
+    //—— 需求区回踩信号（新增）：上一根最低价还在区域上方，本根最低价进入区域但未击穿远端 ——
+    //—— 仅在区域仍有效、且非形成当根K线时触发（修复了原脚本形成当根即误判缓解的问题）——
+    bool DRetest = DMitigated and bar_index != BarDFVG and (low[1] > DPFVG) and (low <= DPFVG) and (low > DDFVG)
+
+    //—— 缓解判定：最低价触及/跌破近端线，视为区域被回补 ——
+    if DMitigated and bar_index != BarDFVG and (low[1] >= DPFVG) and (low <= DPFVG)
+        DMitigated := false
+        //缓解后的区域处理（新增）：变灰或删除
+        switch MitMode
+            '变灰' => box.set_bgcolor(DBox, color.rgb(150, 150, 150, 80))
+            '删除' => box.delete(DBox)
+    if DConditionFVG
+        DMitigated := true  // 出现新需求区 FVG 时，重置为有效状态
+
+    //==================== 供应区 FVG 检测 ====================
+    if SConditionFVG and ShowSuFVG
+        SDFVG := low[2]       // 远端 = 前两根 K 线的最低价
+        SPFVG := high         // 近端 = 当前 K 线的最高价
+        BarSFVG := bar_index
+        SStrong := close[2] < open[2]   // 强弱判定：最左K线（K2/bar[2]）收阴 = 与看跌缺口方向一致 = 强 FVG
+        //用 box 绘制区域：上沿 = 远端，下沿 = 近端；左边界回溯 2 根，完整覆盖形成缺口的 3 根K线
+        //宽度模式同需求区：ZoneLen > 0 时固定宽度，ZoneLen == 0 时动态延伸
+        SBox := box.new(left = BarSFVG - 2, top = SDFVG,
+         right = ZoneLen > 0 ? BarSFVG - 2 + ZoneLen : BarSFVG + 1,
+         bottom = SPFVG, xloc = xloc.bar_index,
+         border_color = LineColor, border_style = line.style_dotted, border_width = 1,
+         bgcolor = SuColor,
+         text = SStrong ? 'FVG 强' : 'FVG 弱', text_color = LabelColor,
+         text_halign = text.align_center, text_valign = text.align_center, text_size = size.small)
+
+    //—— 供应区动态延伸（仅 ZoneLen == 0 时生效）——
+    if ZoneLen == 0 and SMitigated and ((high < SDFVG) or SDFVG == SDFVG[1])
+        box.set_right(SBox, bar_index + 1)
+
+    //—— 供应区回踩信号（新增）：上一根最高价还在区域下方，本根最高价进入区域但未击穿远端 ——
+    bool SRetest = SMitigated and bar_index != BarSFVG and (high[1] < SPFVG) and (high >= SPFVG) and (high < SDFVG)
+
+    //—— 供应区缓解判定：最高价触及/升破近端线，视为区域被回补 ——
+    if SMitigated and bar_index != BarSFVG and (high >= SPFVG) and (high[1] <= SPFVG)
+        SMitigated := false
+        switch MitMode
+            '变灰' => box.set_bgcolor(SBox, color.rgb(150, 150, 150, 80))
+            '删除' => box.delete(SBox)
+    if SConditionFVG
+        SMitigated := true  // 出现新供应区 FVG 时，重置为有效状态
+
+    //—— 新增：当前K线是否产生 FVG（1 = 需求区/看涨，-1 = 供应区/看跌，0 = 无）——
+    //—— 注：此判定与"显示开关"无关，只要过滤条件成立即记录 ——
+    int FVGEvent = DConditionFVG ? 1 : SConditionFVG ? -1 : 0
+
+    //—— 新增：更新最后一个 FVG 的边沿（需求区：上沿=近端；供应区：上沿=远端）——
+    if DConditionFVG
+        LastTop := DPFVG
+        LastBottom := DDFVG
+    if SConditionFVG
+        LastTop := SDFVG
+        LastBottom := SPFVG
+
+    //—— 返回：回踩信号 ×2 + FVG事件 + 最后FVG上下边沿，供全局使用 ——
+    [DRetest, SRetest, FVGEvent, LastTop, LastBottom]
+
+//==================== 调用检测函数 ====================
+[DRetestSignal, SRetestSignal, FVGEventSignal, LastFVGTop, LastFVGBottom] = FVGDetector(VFVGFilter, VFVGFilterType, VShowDeFVG, VShowSuFVG,
+ VZoneLen, VDeColor, VSuColor, VLineColor, VLabelColor, VMitMode)
+
+//==================== 超级趋势 + 同向 FVG 累积计数（新增）====================
+//ta.supertrend 返回 [ST线, 方向]；方向：-1 = 多头（ST线在价格下方），1 = 空头（ST线在价格上方）
+[STLine, STDir] = ta.supertrend(VSTFactor, VSTPeriod)
+
+var int CumFVG = 0          // 与当前 ST 方向同向的 FVG 累积计数
+if STDir != STDir[1]        // ST 转向时累积计数清零
+    CumFVG := 0
+//当前K线产生了与 ST 同向的 FVG，则累积 +1（多头方向计需求区，空头方向计供应区）
+CumFVG += (STDir == -1 and FVGEventSignal == 1) or (STDir == 1 and FVGEventSignal == -1) ? 1 : 0
+
+//==================== 数据导出到 Data Window（新增）====================
+//display = display.data_window：不在图表上绘制，只在右侧"数据窗口"中显示数值，供外部读取/抄录
+plot(CumFVG,        'ST同向FVG累积计数',  display = display.data_window)
+plot(LastFVGTop,    '最后FVG上沿',        display = display.data_window)
+plot(LastFVGBottom, '最后FVG下沿',        display = display.data_window)
+plot(FVGEventSignal, '当前K线FVG信号(1涨/-1跌/0无)', display = display.data_window)
+
+//==================== 回踩警报（新增）====================
+//使用方法：TradingView 右侧面板"警报"→ 创建警报 → 条件选择本指标 → 再选择下面两个条件之一
+alertcondition(DRetestSignal, title = '需求区 FVG 回踩警报', message = '价格回踩需求区 FVG（看涨缺口），关注潜在支撑反应')
+alertcondition(SRetestSignal, title = '供应区 FVG 回踩警报', message = '价格回踩供应区 FVG（看跌缺口），关注潜在压力反应')

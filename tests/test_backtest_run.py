@@ -128,3 +128,95 @@ def test_bad_run_inputs_fail_before_fetch(console_app, monkeypatch, changes, sta
     monkeypatch.setattr("backtest_trend.fetch_history", forbidden)
     request = {"symbol": SYMBOL, "day": DAY, "start_time": "10:00", **changes}
     assert TestClient(console_app.app).post("/api/bt/run", json=request).status_code == status
+
+
+def test_ema7_reuses_persistent_pine_outputs_when_start_changes(console_app, monkeypatch):
+    from datetime import timedelta
+
+    from engine import local_pine_history as local
+
+    first_bar = datetime.fromisoformat(f"{DAY}T09:30:00").replace(tzinfo=local.ET)
+    history = []
+    for index in range(-523, 78):
+        stamp = int((first_bar + timedelta(minutes=5 * index)).timestamp())
+        price = 100 + index * 0.03
+        history.append({"time": stamp, "open": price, "high": price + 0.25,
+                        "low": price - 0.25, "close": price + 0.05, "volume": 100})
+    dataset = {"metadata": {"timezone": "America/New_York", "session": "extended",
+                            "minmove": 1, "pricescale": 100}, "bars": history}
+    calls = []
+    run_node = local._node
+
+    async def node(script, *args, **kwargs):
+        calls.append(script)
+        if script == "tv_backtest_bars.js":
+            assert args == (SYMBOL, "601", str(int(first_bar.timestamp()) + 78 * 300))
+            return dataset
+        return await run_node(script, *args, **kwargs)
+
+    async def forbid_cloud(*args):
+        pytest.fail("EMA7 called the legacy cloud study downloader")
+
+    monkeypatch.setattr(local, "_node", node)
+    monkeypatch.setattr("backtest_trend.fetch_history", forbid_cloud)
+    client = TestClient(console_app.app)
+    request = {"symbol": SYMBOL, "day": DAY, "strategy": local.EMA7_MODEL}
+    first = client.post("/api/bt/run", json={**request, "start_time": "09:45"})
+    assert first.status_code == 200, first.text
+    assert first.json()["total_bars"] == 75
+    h1 = first.json()["run_context"]["history"]
+    assert h1["source"] == "pinets"
+    assert h1["pine_inputs"] == {"offsetMultiplier": 0}
+    assert h1["candles_reused"] is False
+    assert h1["calculation_reused"] is False
+
+    # Recreate the loader to show that a process-local cache is not required.
+    store = console_app.research._local_pine_history
+    console_app.research._local_pine_history = local.LocalPineHistory(store.path)
+    second = client.post("/api/bt/run", json={**request, "start_time": "10:02"})
+    assert second.status_code == 200, second.text
+    assert second.json()["run_context"]["first_bar_time"] == "10:05"
+    assert second.json()["total_bars"] == 71
+    h2 = second.json()["run_context"]["history"]
+    assert h2["calculation_revision"] == h1["calculation_revision"]
+    assert h2["candles_reused"] and h2["calculation_reused"]
+    assert second.json()["history_reused"] is True
+    assert calls == ["tv_backtest_bars.js", "pinets_backtest.js"]
+    overlap = [r for r in first.json()["replay_bars"] if r["hm"] >= "10:05"]
+    outputs = ("entry_signal", "direction", "entry_price", "long_stop", "short_stop")
+    assert [tuple(row[key] for key in outputs) for row in overlap] == [
+        tuple(row[key] for key in outputs) for row in second.json()["replay_bars"]
+    ]
+
+    monkeypatch.setattr(local, "INPUTS", {"offsetMultiplier": 0.2})
+    third = client.post("/api/bt/run", json={**request, "start_time": "10:02"})
+    assert third.status_code == 200, third.text
+    h3 = third.json()["run_context"]["history"]
+    assert h3["calculation_revision"] != h2["calculation_revision"]
+    assert h3["candles_reused"] and not h3["calculation_reused"]
+    assert calls[-1] == "pinets_backtest.js" and calls.count("tv_backtest_bars.js") == 1
+
+
+def test_ema7_rejects_incomplete_session_without_caching(console_app, monkeypatch):
+    from datetime import timedelta
+    from engine import local_pine_history as local
+
+    first = datetime.fromisoformat(f"{DAY}T09:30:00").replace(tzinfo=local.ET)
+    bars = [{"time": int((first + timedelta(minutes=5 * index)).timestamp()),
+             "open": 100, "high": 101, "low": 99, "close": 100, "volume": 100}
+            for index in range(-525, 77)]
+    calls = []
+
+    async def node(script, *args, **kwargs):
+        calls.append(script)
+        return {"metadata": {"timezone": "America/New_York", "session": "extended",
+                             "minmove": 1, "pricescale": 100}, "bars": bars}
+
+    monkeypatch.setattr(local, "_node", node)
+    client = TestClient(console_app.app)
+    request = {"symbol": SYMBOL, "day": DAY, "strategy": local.EMA7_MODEL}
+    for _ in range(2):
+        response = client.post("/api/bt/run", json=request)
+        assert response.status_code == 400
+        assert "缺少完整常规盘" in response.json()["detail"]
+    assert calls == ["tv_backtest_bars.js", "tv_backtest_bars.js"]

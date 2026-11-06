@@ -127,17 +127,17 @@ def test_partial_fill_rebases_mfe_only_after_fill():
     assert engine._instances[SYM].mfe_r == 0
 
 @pytest.mark.parametrize('direction', [1, -1])
-def test_confirmed_reverse_cancels_unfilled_seed(direction):
+def test_manual_exit_cancels_unfilled_seed(direction, monkeypatch):
     broker = PendingBroker()
     engine = engine_for(broker, direction)
     run(engine.on_price(SYM, 100, _e9(100, 1, direction), 600))
-    run(engine.on_bar(SYM, {'close': 100}, {'direction': -direction}))
+    run(engine.close_symbol(SYM,100))
     assert broker.lots['lot-1'].state == 'CANCELLED'
     run(engine.on_price(SYM, 100, _e9(100, 1, direction, 1300), 600))
     assert engine._instances[SYM].state == 'DONE'
     assert len(broker.calls) == 1
 
-def test_reverse_cancel_fill_race_is_closed():
+def test_manual_cancel_fill_race_is_closed(monkeypatch):
     broker = PendingBroker()
     engine = engine_for(broker)
     run(engine.on_price(SYM, 100, _e9(100, 1, 1), 600))
@@ -146,11 +146,11 @@ def test_reverse_cancel_fill_race_is_closed():
         broker.fill(lot_id, 10)
         return False
     broker.cancel = racing_cancel
-    run(engine.on_bar(SYM, {'close': 99}, {'direction': -1}))
+    run(engine.close_symbol(SYM,99))
     assert broker.lots['lot-1'].state == 'CLOSED'
     assert len(broker.closes) == 1
 
-def test_reverse_retries_without_waiting_for_next_closed_bar(monkeypatch):
+def test_manual_exit_retries_without_waiting_for_next_closed_bar(monkeypatch):
     import engine.pyramid_engine as module
     clock = [1000.0]
     monkeypatch.setattr(module.time, 'time', lambda: clock[0])
@@ -158,7 +158,7 @@ def test_reverse_retries_without_waiting_for_next_closed_bar(monkeypatch):
     engine = engine_for(broker)
     run(engine.on_price(SYM, 100, _e9(100, 1, 1), 600))
     broker.fail_close_once.add('lot-1')
-    run(engine.on_bar(SYM, {'close': 99}, {'direction': -1}))
+    run(engine.close_symbol(SYM,99))
     run(engine.on_price(SYM, 99, _e9(99, 1, 1, 1300), 600))
     assert len(broker.close_attempts) == 1
     clock[0] += 6
@@ -196,7 +196,7 @@ def test_legacy_recovery_blocks_add_without_guessing_first_r():
     inst = engine._instances[SYM]
     assert inst.entries == 2 and inst.initial_r == 0 and inst.recovery_block_reason
     assert engine.start([SYM], 300) == []
-    run(engine.on_bar(SYM, {'close': 100}, {'direction': -1}))
+    run(engine.close_symbol(SYM,100))
     assert broker.lots['old'].state == 'CLOSED'
 
 def test_restart_keeps_third_entry_limit_with_only_second_remaining():
@@ -221,7 +221,7 @@ def test_restart_retains_failed_exit_and_retries_instead_of_adding():
     engine = engine_for(broker)
     run(engine.on_price(SYM, 100, _e9(100, 1, 1), 600))
     broker.fail_close_once.add('lot-1')
-    run(engine.on_bar(SYM, {'close': 99}, {'direction': -1}))
+    run(engine.close_symbol(SYM,99))
     restored = PyramidEngine(broker)
     run(restored.adopt_manual_lots([row_for(broker.lots['lot-1'])]))
     assert restored._instances[SYM].state == 'CLOSING'

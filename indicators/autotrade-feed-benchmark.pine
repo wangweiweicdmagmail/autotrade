@@ -1,0 +1,362 @@
+//@version=6
+// TradingView 数据订阅对照实验。保留原脚本的计算和默认值，去掉图表装饰。
+// 原始脚本来自项目账户保存版本。趋势状态源的 MPL-2.0 声明随本文件保留。
+// © wangweiweicdma — https://mozilla.org/MPL/2.0/
+indicator("AutoTrade 七合一采集验证", shorttitle="AT Feed 7in1", overlay=true)
+
+// ts
+ts_atrPeriod = input.int(10, "ATR Length", minval = 1)
+
+ts_factor = input.float(
+     3.0,
+     "Supertrend Factor",
+     minval = 0.01,
+     step = 0.01
+)
+
+ts_channelATR = input.float(
+     1.2,
+     "Channel ATR Multiplier",
+     minval = 0.0,
+     step = 0.1
+)
+
+ts_grpState  = "趋势状态判断"
+ts_stateLB   = input.int(5, "回看 K 线数", minval = 1, group = ts_grpState)
+ts_atrMult   = input.float(1, "EMA 差值 > ATR ×", minval = 0.0, step = 0.1, group = ts_grpState)
+
+ts_emafast = ta.ema(close, 20)
+ts_emaslow = ta.ema(close, 100)
+
+ts_ema_size = ts_emafast - ts_emaslow
+
+
+[ts_supertrend, ts_direction] = ta.supertrend(ts_factor, ts_atrPeriod)
+
+ts_supertrend := barstate.isfirst ? na : ts_supertrend
+
+ts_atr = ta.atr(ts_atrPeriod)
+
+ts_isUpTrend = ts_direction < 0
+ts_isDownTrend = ts_direction > 0
+
+
+ts_stDir = ts_isUpTrend ? 1 : ts_isDownTrend ? -1 : 0
+ts_stFlip = ts_stDir != nz(ts_stDir[1], ts_stDir)
+ts_stPush = (ts_isUpTrend and not na(ts_supertrend[1]) and ts_supertrend > ts_supertrend[1]) or (ts_isDownTrend and not na(ts_supertrend[1]) and ts_supertrend < ts_supertrend[1])
+
+var int ts_stStartBar = bar_index
+var int ts_stPushCount = 0
+if ts_stFlip
+    ts_stStartBar := bar_index
+    ts_stPushCount := 0
+else if ts_stPush
+    ts_stPushCount += 1
+
+ts_stDurationBars = bar_index - ts_stStartBar
+
+
+ts_ema_size_prev = ts_ema_size[ts_stateLB]
+
+ts_dataOK = not na(ts_ema_size) and not na(ts_ema_size_prev) and not na(ts_atr)
+
+ts_bullAlign = close > ts_emafast and ts_emafast > ts_emaslow and close[ts_stateLB] > ts_emafast[ts_stateLB] and ts_emafast[ts_stateLB] > ts_emaslow[ts_stateLB]
+ts_bearAlign = close < ts_emafast and ts_emafast < ts_emaslow and close[ts_stateLB] < ts_emafast[ts_stateLB] and ts_emafast[ts_stateLB] < ts_emaslow[ts_stateLB]
+
+ts_bullOK = ts_dataOK and ts_isUpTrend   and ts_bullAlign and ts_ema_size >  ts_atr * ts_atrMult
+ts_bearOK = ts_dataOK and ts_isDownTrend and ts_bearAlign and ts_ema_size < -ts_atr * ts_atrMult
+
+ts_trendState = ts_bullOK ? 1 : ts_bearOK ? -1 : 0
+
+
+
+ts_channelEdge = ts_isUpTrend
+     ? ts_supertrend + ts_atr * ts_channelATR
+     : ts_supertrend - ts_atr * ts_channelATR
+
+ts_channelEdge := barstate.isfirst ? na : ts_channelEdge
+plot(ts_trendState, "ts_Trend_State", display=display.data_window)
+plot(ts_atr, "ts_Atr_Value", display=display.data_window)
+plot(ts_stDurationBars, "ts_ST_Duration_Bars", display=display.data_window)
+plot(ts_stPushCount, "ts_ST_Push_Count", display=display.data_window)
+plot(ts_emafast, "ts_EMA_Fast", display=display.data_window)
+plot(ts_emaslow, "ts_EMA_Slow", display=display.data_window)
+plot(ts_isUpTrend ? ts_supertrend : na, "ts_Up_Trend", display=display.data_window)
+plot(ts_isDownTrend ? ts_supertrend : na, "ts_Down_Trend", display=display.data_window)
+plot(ts_isUpTrend ? ts_channelEdge : na, "ts_Uptrend_Channel", display=display.data_window)
+plot(ts_isDownTrend ? ts_channelEdge : na, "ts_Downtrend_Channel", display=display.data_window)
+
+// ss
+ss_grpStop = "智能止损"
+ss_atrPeriod   = input.int(10, "ATR 周期", minval = 1, group = ss_grpStop,
+                        tooltip = "与 trend_state 指标保持一致的 ATR(10)")
+ss_stopLB      = input.int(3, "逻辑止损回看 K 线数", minval = 1, group = ss_grpStop,
+                        tooltip = "最近 N 根 K 线的极值作为结构止损点（跌破/突破即逻辑失效）")
+ss_stopMinMult = input.float(1.0, "止损下限 ×ATR", minval = 0.1, step = 0.1, group = ss_grpStop,
+                          tooltip = "止损距离下限：结构点太近时按此兜底，防止被波动扫掉")
+ss_stopMaxMult = input.float(2.0, "止损上限 ×ATR", minval = 0.2, step = 0.1, group = ss_grpStop,
+                          tooltip = "止损距离上限：激烈连续行情（结构点太远）时按此封顶，保住仓位")
+
+ss_atr = ta.atr(ss_atrPeriod)
+
+ss_lowN  = ta.lowest(low, ss_stopLB)
+ss_highN = ta.highest(high, ss_stopLB)
+
+ss_lo = ss_stopMinMult * ss_atr
+ss_hi = math.max(ss_stopMaxMult, ss_stopMinMult) * ss_atr
+
+ss_longDist  = math.min(math.max(close - ss_lowN,  ss_lo), ss_hi)   // 多头止损距离
+ss_shortDist = math.min(math.max(ss_highN - close, ss_lo), ss_hi)   // 空头止损距离
+
+ss_smartStopLong  = close - ss_longDist    // 价格下方的多头止损线
+ss_smartStopShort = close + ss_shortDist   // 价格上方的空头止损线
+
+ss_smartStopLong  := na(ss_atr) ? na : ss_smartStopLong
+ss_smartStopShort := na(ss_atr) ? na : ss_smartStopShort
+plot(ss_smartStopLong, "ss_Smart_Stop_Long", display=display.data_window)
+plot(ss_smartStopShort, "ss_Smart_Stop_Short", display=display.data_window)
+
+// fvg
+string fvg_GRP_FVG  = 'FVG 检测设置'
+string fvg_GRP_ST   = '超级趋势设置'
+
+fvg_VFVGFilter = input.string('Off', 'FVG 过滤器', ['On', 'Off'],
+ tooltip = '开启后，将尝试用误差修正算法为订单块筛选更优质的 FVG。', group = fvg_GRP_FVG)
+
+fvg_VFVGFilterType = input.string('Defensive', '过滤器类型', ['Very Aggressive', 'Aggressive', 'Defensive', 'Very Defensive'],
+ tooltip = '四种方式的区别在于检出 FVG 的数量与质量：越偏防守（Defensive），检出的 FVG 越少、质量越高。', group = fvg_GRP_FVG)
+
+fvg_VShowDeFVG = input.bool(true, '显示需求区 FVG（看涨缺口）', group = fvg_GRP_FVG)
+fvg_VShowSuFVG = input.bool(true, '显示供应区 FVG（看跌缺口）', group = fvg_GRP_FVG)
+
+fvg_VSTFactor = input.float(3.0, 'ST 乘数（Factor）', minval = 0.1, step = 0.1, group = fvg_GRP_ST)
+fvg_VSTPeriod = input.int(10, 'ST ATR 周期', minval = 1, group = fvg_GRP_ST)
+
+
+fvg_FVGDetector(string FVGFilter, string FVGFilterType, bool ShowDeFVG, bool ShowSuFVG) =>
+    var float DDFVG = 0.0
+    var float DPFVG = 0.0
+    var float SDFVG = 0.0
+    var float SPFVG = 0.0
+    var float LastTop = na
+    var float LastBottom = na
+    ATR = ta.atr(55)
+
+    DConditionFVG = if FVGFilter == 'Off'
+        (low > high[2])
+    else if FVGFilter == 'On'
+        switch FVGFilterType
+            'Very Aggressive' => (low > high[2]) and (high > high[1])
+            'Aggressive' => ((low > high[2]) and ((high[1] - low[1]) >= (1.0 * ATR)) and (high > high[1]))
+            'Defensive' => ((low > high[2]) and ((high[1] - low[1]) >= (1.5 * ATR)) and (high > high[1]))
+             and ((close[2] - open[2] > 0 and close[1] - open[1] > 0) or math.abs((close[1] - open[1]) / (high[1] - low[1])) > 0.7)
+            'Very Defensive' => ((low > high[2]) and ((high[1] - low[1]) >= (1.5 * ATR)) and (high > high[1]))
+             and ((close[2] - open[2] > 0 and close[1] - open[1] > 0) and math.abs((close[1] - open[1]) / (high[1] - low[1])) > 0.7)
+             and math.abs((close[2] - open[2]) / (high[2] - low[2])) > 0.35 and math.abs((close - open) / (high - low)) > 0.35
+
+    SConditionFVG = if FVGFilter == 'Off'
+        (high < low[2])
+    else if FVGFilter == 'On'
+        switch FVGFilterType
+            'Very Aggressive' => (high < low[2]) and (low[1] > low)
+            'Aggressive' => ((high < low[2]) and ((high[1] - low[1]) >= (1.0 * ATR)) and (low[1] > low))
+            'Defensive' => ((high < low[2]) and ((high[1] - low[1]) >= (1.5 * ATR)) and (low[1] > low))
+             and ((close[2] - open[2] < 0 and close[1] - open[1] < 0) or math.abs((close[1] - open[1]) / (high[1] - low[1])) > 0.7)
+            'Very Defensive' => ((high < low[2]) and ((high[1] - low[1]) >= (1.5 * ATR)) and (low[1] > low))
+             and ((close[2] - open[2] < 0 and close[1] - open[1] < 0) and math.abs((close[1] - open[1]) / (high[1] - low[1])) > 0.7)
+             and math.abs((close[2] - open[2]) / (high[2] - low[2])) > 0.35 and math.abs((close - open) / (high - low)) > 0.35
+
+    if DConditionFVG and ShowDeFVG
+        DDFVG := high[2]
+        DPFVG := low
+    if SConditionFVG and ShowSuFVG
+        SDFVG := low[2]
+        SPFVG := high
+    int FVGEvent = DConditionFVG ? 1 : SConditionFVG ? -1 : 0
+
+    if DConditionFVG
+        LastTop := DPFVG
+        LastBottom := DDFVG
+    if SConditionFVG
+        LastTop := SDFVG
+        LastBottom := SPFVG
+
+    [FVGEvent, LastTop, LastBottom]
+
+[fvg_FVGEventSignal, fvg_LastFVGTop, fvg_LastFVGBottom] = fvg_FVGDetector(fvg_VFVGFilter, fvg_VFVGFilterType, fvg_VShowDeFVG, fvg_VShowSuFVG)
+[fvg_STLine, fvg_STDir] = ta.supertrend(fvg_VSTFactor, fvg_VSTPeriod)
+
+var int fvg_CumFVG = 0          // 与当前 ST 方向同向的 FVG 累积计数
+if fvg_STDir != fvg_STDir[1]        // ST 转向时累积计数清零
+    fvg_CumFVG := 0
+fvg_CumFVG += (fvg_STDir == -1 and fvg_FVGEventSignal == 1) or (fvg_STDir == 1 and fvg_FVGEventSignal == -1) ? 1 : 0
+plot(fvg_CumFVG, "fvg_STFVG", display=display.data_window)
+plot(fvg_LastFVGTop, "fvg_FVG", display=display.data_window)
+plot(fvg_LastFVGBottom, "fvg_FVG_2", display=display.data_window)
+plot(fvg_FVGEventSignal, "fvg_KFVG110", display=display.data_window)
+
+// attack
+attack_isPremarket = not na(
+     time(timeframe.period, "0400-0929", "America/New_York"))
+
+attack_isRegularSession = not na(
+     time(timeframe.period, "0930-1600", "America/New_York"))
+
+attack_firstRegularBar =
+     attack_isRegularSession and not attack_isRegularSession[1]
+
+
+attack_newDay = ta.change(time("D")) != 0
+
+
+var float attack_premarketHigh = na
+var float attack_premarketLow  = na
+
+if attack_newDay
+    attack_premarketHigh := na
+    attack_premarketLow := na
+
+if attack_isPremarket
+    attack_premarketHigh := na(attack_premarketHigh) ? high :
+         math.max(attack_premarketHigh, high)
+
+    attack_premarketLow := na(attack_premarketLow) ? low :
+         math.min(attack_premarketLow, low)
+
+
+var int attack_regularBarCount = 0
+var float attack_opening3High = na
+var float attack_opening3Low  = na
+
+if attack_newDay
+    attack_regularBarCount := 0
+    attack_opening3High := na
+    attack_opening3Low := na
+
+if attack_isRegularSession and attack_regularBarCount < 3
+    attack_regularBarCount += 1
+
+    attack_opening3High := na(attack_opening3High) ? high :
+         math.max(attack_opening3High, high)
+
+    attack_opening3Low := na(attack_opening3Low) ? low :
+         math.min(attack_opening3Low, low)
+
+attack_opening3RangeJustCompleted =
+     attack_isRegularSession and
+     barstate.isconfirmed and
+     attack_regularBarCount == 3 and
+     attack_regularBarCount[1] == 2
+
+
+attack_opening3Mid = (attack_opening3High + attack_opening3Low) / 2.0
+attack_opening3HalfWidth = (attack_opening3High - attack_opening3Low) / 2.0
+attack_opening3DistanceReady = attack_regularBarCount == 3 and (attack_opening3RangeJustCompleted or attack_regularBarCount[1] == 3)
+attack_opening3Distance = attack_opening3DistanceReady and not na(attack_opening3HalfWidth) and attack_opening3HalfWidth > 0 ? (close - attack_opening3Mid) / attack_opening3HalfWidth : na
+plot(attack_premarketHigh, "attack_premarketHigh", display=display.data_window)
+plot(attack_premarketLow, "attack_premarketLow", display=display.data_window)
+plot(attack_opening3High, "attack_opening3High", display=display.data_window)
+plot(attack_opening3Low, "attack_opening3Low", display=display.data_window)
+plot(attack_opening3Distance, "attack_Opening3_Distance", display=display.data_window)
+
+// e9
+e9_stPeriod     = input.int(10,    "超级趋势周期", minval=1, group="方向：SuperTrend")
+e9_stMultiplier = input.float(3.0, "超级趋势倍数", minval=0.1, step=0.1, group="方向：SuperTrend")
+
+e9_emaLen = input.int(7, "EMA 周期", minval=1, group="EMA")
+
+e9_atrLen  = input.int(14,   "ATR 周期", minval=1, group="止损：ATR")
+e9_atrMult = input.float(1.2, "ATR 倍数", minval=0.1, step=0.1, group="止损：ATR")
+
+e9_ema9 = ta.ema(close, e9_emaLen)
+e9_atr  = ta.atr(e9_atrLen)
+
+[e9_supertrend, e9_dir] = ta.supertrend(e9_stMultiplier, e9_stPeriod)
+
+e9_isLong  = e9_dir < 0
+e9_isShort = e9_dir > 0
+
+e9_longStop  = e9_ema9 - e9_atr * e9_atrMult
+e9_shortStop = e9_ema9 + e9_atr * e9_atrMult
+e9_stopLine  = e9_isLong ? e9_longStop : e9_shortStop
+
+
+
+e9_touchEma9 = low <= e9_ema9 and high >= e9_ema9 ? 1 : 0
+
+
+
+e9_emaSlopeAtr = not na(e9_ema9[5]) and not na(e9_atr[1]) and e9_atr[1] > 0 ? (e9_ema9[1] - e9_ema9[5]) / e9_atr[1] : na
+
+e9_direction = e9_isLong ? 1 : e9_isShort ? -1 : 0
+plot(e9_emaSlopeAtr, "e9_EMA_Slope_ATR", display=display.data_window)
+plot(e9_direction, "e9_Direction", display=display.data_window)
+plot(e9_atr, "e9_ATR", display=display.data_window)
+plot(e9_touchEma9, "e9_Touch_EMA9", display=display.data_window)
+plot(e9_ema9, "e9_EMA_9", display=display.data_window)
+plot(e9_isLong ? e9_longStop : na, "e9_Long_Stop", display=display.data_window)
+plot(e9_isShort ? e9_shortStop : na, "e9_Short_Stop", display=display.data_window)
+
+// e20
+e20_emaLength = input.int(20, "EMA 周期", minval=1, group="回踩")
+e20_stLength = input.int(10, "超级趋势周期", minval=1, group="方向")
+e20_stFactor = input.float(3.0, "超级趋势倍数", minval=0.1, step=0.1, group="方向")
+e20_atrLength = input.int(14, "ATR 周期", minval=1, group="止损")
+e20_atrFactor = input.float(1.2, "ATR 倍数", minval=0.1, step=0.1, group="止损")
+
+e20_emaLine = ta.ema(close, e20_emaLength)
+e20_atrValue = ta.atr(e20_atrLength)
+[e20_supertrend, e20_trend] = ta.supertrend(e20_stFactor, e20_stLength)
+int e20_direction = na(e20_supertrend) or na(e20_trend) ? 0 : e20_trend < 0 ? 1 : e20_trend > 0 ? -1 : 0
+
+e20_entryPrice = math.round_to_mintick(e20_emaLine)
+e20_longStop = math.round_to_mintick(e20_emaLine - e20_atrValue * e20_atrFactor)
+e20_shortStop = math.round_to_mintick(e20_emaLine + e20_atrValue * e20_atrFactor)
+e20_priceReady = not na(e20_entryPrice) and e20_entryPrice > 0
+e20_atrReady = not na(e20_atrValue) and e20_atrValue > 0
+e20_validLong = e20_priceReady and e20_atrReady and not na(e20_longStop) and e20_longStop > 0 and e20_longStop < e20_entryPrice
+e20_validShort = e20_priceReady and e20_atrReady and not na(e20_shortStop) and e20_shortStop > e20_entryPrice
+
+e20_touched = e20_priceReady and low <= e20_entryPrice and high >= e20_entryPrice
+e20_longSignal = e20_direction == 1 and e20_validLong and e20_touched
+e20_shortSignal = e20_direction == -1 and e20_validShort and e20_touched
+plot(e20_longSignal or e20_shortSignal ? 1 : 0, "e20_Entry_Signal", display=display.data_window)
+plot(e20_direction, "e20_Direction", display=display.data_window)
+plot(e20_priceReady ? e20_entryPrice : na, "e20_Entry_Price", display=display.data_window)
+plot(e20_direction == 1 and e20_validLong ? e20_longStop : na, "e20_Long_Stop", display=display.data_window)
+plot(e20_direction == -1 and e20_validShort ? e20_shortStop : na, "e20_Short_Stop", display=display.data_window)
+plot(e20_atrValue, "e20_ATR", display=display.data_window)
+
+// e7v2
+e7v2_stPeriod = input.int(10, "超级趋势周期", minval=1, group="方向")
+e7v2_stMultiplier = input.float(3.0, "超级趋势倍数", minval=0.1, step=0.1, group="方向")
+e7v2_atrLength = input.int(14, "ATR 周期", minval=1, group="保护止损")
+e7v2_stopMultiplier = input.float(1.2, "止损 ATR 倍数", minval=0.1, step=0.1, group="保护止损")
+e7v2_offsetMultiplier = input.float(0.0, "预测偏移 ATR 倍数", minval=0, step=0.05, group="触线")
+e7v2_toleranceTicks = input.int(1, "触线后允许偏离的最小跳动数", minval=0, group="触线")
+
+e7v2_ema7 = ta.ema(close, 7)
+e7v2_confirmedAtr = ta.atr(e7v2_atrLength)[1]
+[e7v2_supertrend, e7v2_stDirection] = ta.supertrend(e7v2_stMultiplier, e7v2_stPeriod)
+int e7v2_direction = na(e7v2_supertrend) or na(e7v2_stDirection) ? 0 : e7v2_stDirection < 0 ? 1 : -1
+
+e7v2_velocity = (e7v2_ema7[1] - e7v2_ema7[4]) / 3.0
+e7v2_forecast = e7v2_ema7[1] + e7v2_velocity
+e7v2_entryPrice = math.round_to_mintick(e7v2_forecast + math.sign(e7v2_velocity) * e7v2_offsetMultiplier * e7v2_confirmedAtr)
+e7v2_longStop = math.round_to_mintick(e7v2_entryPrice - e7v2_stopMultiplier * e7v2_confirmedAtr)
+e7v2_shortStop = math.round_to_mintick(e7v2_entryPrice + e7v2_stopMultiplier * e7v2_confirmedAtr)
+e7v2_ready = not na(e7v2_entryPrice) and e7v2_entryPrice > 0 and not na(e7v2_confirmedAtr) and e7v2_confirmedAtr > 0
+e7v2_validLong = e7v2_ready and e7v2_longStop > 0 and e7v2_longStop < e7v2_entryPrice
+e7v2_validShort = e7v2_ready and e7v2_shortStop > e7v2_entryPrice
+
+e7v2_longTouch = e7v2_validLong and e7v2_direction == 1 and e7v2_velocity > 0 and open > e7v2_entryPrice and low <= e7v2_entryPrice
+e7v2_shortTouch = e7v2_validShort and e7v2_direction == -1 and e7v2_velocity < 0 and open < e7v2_entryPrice and high >= e7v2_entryPrice
+e7v2_nearLine = e7v2_ready and math.abs(close - e7v2_entryPrice) <= e7v2_toleranceTicks * syminfo.mintick + syminfo.mintick * 1e-6
+e7v2_longSignal = e7v2_longTouch and e7v2_nearLine and close > e7v2_longStop
+e7v2_shortSignal = e7v2_shortTouch and e7v2_nearLine and close < e7v2_shortStop
+plot(e7v2_longSignal or e7v2_shortSignal ? 1 : 0, "e7v2_Entry_Signal", display=display.data_window)
+plot(e7v2_direction, "e7v2_Direction", display=display.data_window)
+plot(e7v2_ready ? e7v2_entryPrice : na, "e7v2_Entry_Price", display=display.data_window)
+plot(e7v2_direction == 1 and e7v2_validLong ? e7v2_longStop : na, "e7v2_Long_Stop", display=display.data_window)
+plot(e7v2_direction == -1 and e7v2_validShort ? e7v2_shortStop : na, "e7v2_Short_Stop", display=display.data_window)
+plot(e7v2_confirmedAtr, "e7v2_ATR", display=display.data_window)

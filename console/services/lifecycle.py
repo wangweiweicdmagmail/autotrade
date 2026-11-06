@@ -17,23 +17,23 @@ class LifecycleService:
         self._cache_repair_running = False
 
     def _startup_status(self) -> dict:
-        snap = self.context.collector.latest() or {}
-        total = len(snap)
-        confirmed = sum(
-            (
-                1
-                for v in snap.values()
-                if isinstance(v.get("ts_c"), dict)
-                and v["ts_c"].get("trend_state") is not None
-            )
-        )
+        collector = self.context.collector
+        snap = collector.latest() or {}
+        session = collector.market_session_status()
+        unavailable = session["unavailable"]
+        confirmed_symbols = {
+            symbol for symbol in config.WATCHLIST
+            if (snap.get(symbol, {}).get("ts_c") or {}).get("trend_state") is not None
+        }
+        bars_ready = sum(bool((snap.get(symbol) or {}).get("bar")) for symbol in config.WATCHLIST)
         pending = [symbol for symbol in config.WATCHLIST
-                   if (snap.get(symbol, {}).get("ts_c") or {}).get("trend_state") is None]
+                   if symbol not in confirmed_symbols and symbol not in unavailable]
+        confirmed = len(confirmed_symbols)
         expected = len(config.WATCHLIST)
-        market_ready = (
-            self.context.collector.running
-            and total >= expected
-            and (confirmed >= total)
+        elapsed = time.time() - self.context.lifecycle._startup_state["started_at"]
+        market_ready = collector.running and not pending and confirmed == expected
+        allow_session_review = collector.running and session["requested"] == "24h" and (
+            not pending or (collector.startup_subscribed >= expected and elapsed > 120)
         )
         ibkr_required = bool(self.context.gateway.enabled)
         ibkr_ready = bool(self.context.gateway._connected) or not ibkr_required
@@ -50,16 +50,18 @@ class LifecycleService:
                 "key": "ibkr",
                 "label": "IBKR",
                 "ready": ibkr_ready,
+                "blocking": False,
                 "detail": "TWS 已连接"
                 if self.context.gateway._connected
                 else "DRY-RUN 模式"
                 if not ibkr_required
-                else "等待 TWS 连接（7496）",
+                else "TWS 未连接，后台重试中",
             },
             {
                 "key": "market",
                 "label": "行情与指标",
                 "ready": market_ready,
+                "blocking": market_ready or not allow_session_review,
                 "detail": f"确认指标 {confirmed}/{expected}",
             },
             {
@@ -88,20 +90,26 @@ class LifecycleService:
             errors.append(
                 "TradingView 指标通道异常，请运行 python3 service/tv_diag.py 检查"
             )
-        if pending and time.time() - self.context.lifecycle._startup_state["started_at"] > 240:
+        if unavailable:
+            errors.append("行情时段未确认：" + "、".join(
+                f'{symbol}（{info.get("resolved") or "订阅错误"}）'
+                for symbol, info in unavailable.items()
+            ))
+        if pending and elapsed > 240:
             errors.append("行情订阅未完成，等待：" + "、".join(pending))
         return {
             "market_pending": pending,
+            "market_session": session,
             "ready": bool(self.context.lifecycle._startup_state["ready"]),
             "stages": stages,
             "error": "；".join(errors),
-            "elapsed": round(
-                time.time() - self.context.lifecycle._startup_state["started_at"]
-            ),
-            "all_ready": all((s["ready"] for s in stages)),
+            "elapsed": round(elapsed),
+            "all_ready": all(s["ready"] for s in stages),
+            "workspace_ready": all(s["ready"] for s in stages if s.get("blocking", True)),
             "market_progress": {
                 "indicators": self.context.collector.startup_indicators,
                 "subscribed": self.context.collector.startup_subscribed,
+                "bars_ready": bars_ready,
                 "confirmed": confirmed,
                 "total": expected,
             },
@@ -120,10 +128,12 @@ class LifecycleService:
         self.context.execution_writer_acquired = True
         self.context.order_mgr._load(allow_recovery=True)  # reload after owning the writer lock, before broker access
         self.context.order_mgr._save()  # validate/migrate local ledger before any broker side effects
+        self.context.market_audit.start()
+        self.context.gateway.on_order_audit = self.context.events.record_event
         connected = await self.context.gateway.connect()
         if config.EXECUTION_ENABLED and (not connected):
             logger.error(
-                "EXECUTION_ENABLED=1 但 IBKR 未连接，将持续重连，就绪后进入主页面"
+                "实盘 TWS 未连接，后台持续重连，控制台继续启动"
             )
             self.context.gateway._start_reconnect()
         elif not connected:
@@ -250,6 +260,7 @@ class LifecycleService:
             self.context.copy_supervisor.stop_all,
             self.context.collector.stop,
             self.context.gateway.disconnect,
+            self.context.market_audit.stop,
         ):
             try:
                 await stop()

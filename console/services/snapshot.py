@@ -20,6 +20,7 @@ class SnapshotService:
         return {
             "type": "snapshot",
             "ts": time.time(),
+            "market_frame_id": self.context.collector.market_frame_id,
             "status": {
                 "execution_enabled": bool(self.context.gateway.enabled),
                 "connected": bool(self.context.gateway._connected),
@@ -63,6 +64,7 @@ class SnapshotService:
                 "market_stale": self.context.collector.data_health()["stale"],
                 "market_stale_reason": self.context.collector.data_health()["reason"],
                 "market_running": self.context.collector.running,
+                "market_session": self.context.collector.market_session_status(),
                 "data_time": self.context.collector.latest_bar_time,
                 "server_time": time.time(),
                 "ibkr_time": self.context.gateway.ibkr_time,

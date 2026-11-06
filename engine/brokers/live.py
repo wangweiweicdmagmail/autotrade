@@ -2,6 +2,7 @@
 
 from typing import Optional
 from domain.contracts import OrderPlan
+from engine.live_audit import decision_market_frame
 
 
 class LiveBroker:
@@ -33,6 +34,10 @@ class LiveBroker:
         plan = OrderPlan(symbol, side, qty, limit_px, stop_px, (meta or {}).get("risk_budget", 0),
                          (meta or {}).get("risk_reference_price", 0),
                          entry_order_type=(meta or {}).get("entry_order_type", "LMT"))
+        signal_snapshot = {**(meta or {}), "auto_strategy": True}
+        frame = decision_market_frame.get()
+        if frame is not None:
+            signal_snapshot["decision_market_frame"] = frame
         lot, err = await self._om.place_limit_stop_lot(
             symbol=plan.symbol,
             side=plan.side,
@@ -44,7 +49,7 @@ class LiveBroker:
             risk_usd=plan.risk_budget,
             risk_ref_px=plan.reference_price,
             entry_order_type=plan.entry_order_type,
-            signal_snapshot={**(meta or {}), "auto_strategy": True},
+            signal_snapshot=signal_snapshot,
             trader="auto",
         )  # 策略引擎下单归属标记（与人工单区分）
         if lot is None:

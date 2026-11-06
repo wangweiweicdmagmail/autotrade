@@ -33,4 +33,12 @@ function outputFromPeriod(model, period) {
   return values;
 }
 
-module.exports = { loadPineModels, outputFromPeriod };
+function periodFromOutput(model, output) {
+  if (!output) return null;
+  return {
+    $time: output.time,
+    ...Object.fromEntries(Object.entries(model.plots).map(([field, plot]) => [plot, output[field]])),
+  };
+}
+
+module.exports = { loadPineModels, outputFromPeriod, periodFromOutput };

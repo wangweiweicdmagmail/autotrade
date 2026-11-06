@@ -59,26 +59,29 @@ else:
     sys.exit(1)
 print(f"  API 上线（{time.time()-t0:.0f}s）")
 
-# 阶段 2：TV 数据就绪（最多 240s）
-from config import WATCHLIST
-expected = len(WATCHLIST)
-ready = total = 0
+# 阶段 2：使用控制台的行情就绪口径。明确返回其他时段的标的单独报告。
+ready = expected = 0
+unavailable = {}
+tv_ok = False
 while time.time() - t0 < 300:
     try:
-        mk = get("/api/market")
+        startup = get("/api/startup")
     except Exception:
-        time.sleep(5); continue
-    syms = mk.get("symbols", {})
-    total = len(syms)
-    ready = sum(1 for v in syms.values() if isinstance(v, dict)
-                and isinstance(v.get("ts_c"), dict)
-                and v["ts_c"].get("trend_state") is not None)
-    if total >= expected and ready >= total:
+        time.sleep(3)
+        continue
+    progress = startup["market_progress"]
+    ready, expected = progress["confirmed"], progress["total"]
+    pending = startup["market_pending"]
+    unavailable = startup.get("market_session", {}).get("unavailable", {})
+    if expected and not pending and progress["subscribed"] >= expected:
+        tv_ok = ready > 0
         break
-    print(f"  数据准备中… ts_c {ready}/{total}（{time.time()-t0:.0f}s）", flush=True)
-    time.sleep(10)
-tv_ok = total >= expected and ready >= total
-print(f"  {'✅' if tv_ok else '❌'} TV 数据 ts_c {ready}/{total}（{time.time()-t0:.0f}s）")
+    print(f"  数据准备中… 确认指标 {ready}/{expected}，等待 {len(pending)}，"
+          f"时段未确认 {len(unavailable)}（{time.time()-t0:.0f}s）", flush=True)
+    time.sleep(3)
+print(f"  {'✅' if tv_ok else '❌'} TV 确认指标 {ready}/{expected}（{time.time()-t0:.0f}s）")
+for symbol, info in unavailable.items():
+    print(f"  ⚠️  {symbol} 24 小时行情不可用（服务端返回 {info.get('resolved') or '订阅错误'}）")
 
 # 阶段 3：IBKR 连接状态（只报告，不等待——重连循环会持续尝试）
 st = get("/api/status")

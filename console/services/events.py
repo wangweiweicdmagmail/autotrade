@@ -1,9 +1,11 @@
 """events application functions and owned state. No console.app dependency."""
 
 from typing import Optional
+import asyncio
 import logging
 import time
 from console.shared import logger
+from engine.live_audit import decision_market_frame
 
 
 class _BufferHandler(logging.Handler):
@@ -40,6 +42,12 @@ class EventsService:
             path = self.context.paths.data_dir / f"events-{day}.jsonl"
             path.parent.mkdir(parents=True, exist_ok=True)
             rec = {"ts": time.time(), "type": event_type, **data}
+            decision_frame = decision_market_frame.get()
+            event_frame = getattr(getattr(self.context, "collector", None), "market_frame_id", None)
+            if decision_frame is not None:
+                rec.setdefault("decision_market_frame", decision_frame)
+            if event_frame is not None:
+                rec.setdefault("market_frame_at_event", event_frame)
             with open(path, "a", encoding="utf-8") as f:
                 f.write(_json.dumps(rec, ensure_ascii=False) + "\n")
         except Exception as e:
@@ -99,9 +107,13 @@ class EventsService:
         return logs[-limit:]
 
     async def api_events(
-        self, event_type: Optional[str] = None, limit: int = 500
+        self, event_type: Optional[str] = None, limit: int = 500,
+        *, lot_id: Optional[str] = None, order_id: Optional[int] = None,
     ) -> list:
         """查询历史事件（JSONL 持久日志，可回溯分析）。"""
+        return await asyncio.to_thread(self._read_events, event_type, limit, lot_id, order_id)
+
+    def _read_events(self, event_type, limit, lot_id, order_id):
         import glob
         import json as _json
 
@@ -114,9 +126,21 @@ class EventsService:
                         line = line.strip()
                         if not line:
                             continue
-                        r = _json.loads(line)
-                        if event_type is None or r.get("type") == event_type:
-                            records.append(r)
+                        try:
+                            r = _json.loads(line)
+                        except ValueError:
+                            continue
+                        if not isinstance(r, dict):
+                            continue
+                        if event_type is not None and r.get("type") != event_type:
+                            continue
+                        if lot_id is not None and r.get("lot_id") != lot_id:
+                            continue
+                        if order_id is not None and order_id not in (
+                            r.get("order_id"), r.get("entry_order_id"), r.get("stop_order_id"),
+                        ):
+                            continue
+                        records.append(r)
             except Exception:
                 continue
         records.sort(key=lambda x: x.get("ts", 0), reverse=True)

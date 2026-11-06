@@ -111,7 +111,7 @@ def test_second_mapping_uses_same_executor_and_own_pine_stop():
     assert len(broker.calls) == 1 and broker.lots["lot-1"].stop_px == 99
     run(engine.on_bar(SYM, {"close": 101}, {"bias": 1, "protect_long": 99.5}))
     assert broker.lots["lot-1"].stop_px == 99.5
-    run(engine.on_bar(SYM, {"close": 100}, {"bias": -1}))
+    run(engine.close_symbol(SYM,100))
     assert broker.lots["lot-1"].state == "CLOSED"
 
 
@@ -140,7 +140,7 @@ def test_two_models_same_symbol_have_separate_orders_and_recovery():
     run(restored.adopt_manual_lots(rows))
     assert restored.instances()[0]["lot_ids"] == ["lot-2"]
     assert restored.instances()[0]["strategy"] == "fixture_pullback"
-    run(first.on_bar(SYM, {"close": 99}, {"direction": -1}))
+    run(first.close_symbol(SYM,99))
     assert broker.lots["lot-1"].state == "CLOSED"
     assert broker.lots["lot-2"].state == "ACTIVE"
 

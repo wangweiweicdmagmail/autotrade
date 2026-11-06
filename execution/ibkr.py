@@ -104,6 +104,7 @@ class IBKRGateway:
         self.fa_method = fa_method
         self.enabled = enabled
         self.on_entry_stage = None
+        self.on_order_audit = None
         self.ib = None          # ib_async.IB，connect 后可用
         self._connected = False
         self.ibkr_time = 0.0                # IBKR 服务器时间戳（心跳探测时更新）
@@ -155,6 +156,15 @@ class IBKRGateway:
         self.ib = IB()
         self.ib.errorEvent += self._on_error
         self.ib.disconnectedEvent += self._on_disconnect
+        if self.on_order_audit is not None:
+            for event, action in (
+                (self.ib.newOrderEvent, "submitted"),
+                (self.ib.orderModifyEvent, "modified"),
+                (self.ib.cancelOrderEvent, "cancel_requested"),
+                (self.ib.orderStatusEvent, "status"),
+                (self.ib.execDetailsEvent, "fill"),
+            ):
+                event.connect(functools.partial(self._audit_trade, action), keep_ref=True)
         try:
             await self.ib.connectAsync(
                 self.host, self.port, clientId=self.client_id,
@@ -241,6 +251,35 @@ class IBKRGateway:
             except Exception:
                 logger.exception("断线回调异常")
 
+    def _audit_trade(self, action, trade, fill=None) -> None:
+        if self.on_order_audit is None:
+            return
+        try:
+            order = trade.order
+            status = trade.orderStatus
+            data = {
+                "action": action, "client_id": order.clientId,
+                "order_id": order.orderId, "perm_id": order.permId,
+                "parent_id": order.parentId, "order_ref": order.orderRef,
+                "symbol": trade.contract.symbol, "side": order.action,
+                "order_type": order.orderType, "qty": order.totalQuantity,
+                "limit_px": order.lmtPrice, "aux_px": order.auxPrice,
+                "oca_group": order.ocaGroup, "tif": order.tif,
+                "status": status.status, "filled_qty": status.filled,
+                "remaining_qty": status.remaining, "avg_fill": status.avgFillPrice,
+            }
+            if order.orderRef.startswith("autotrade:"):
+                data["lot_id"] = order.orderRef.split(":", 2)[1]
+            if fill is not None:
+                fill_execution = fill.execution
+                data.update(
+                    exec_id=fill_execution.execId, fill_time=fill_execution.time.isoformat(),
+                    fill_qty=fill_execution.shares, fill_px=fill_execution.price,
+                )
+            self.on_order_audit("broker_order", **data)
+        except Exception:
+            logger.exception("券商订单审计回调失败")
+
     def _on_error(self, reqId, errorCode, errorString, contract=None) -> None:
         rec = {"reqId": reqId, "code": errorCode, "msg": errorString,
                "ts": time.time()}
@@ -252,9 +291,10 @@ class IBKRGateway:
             logger.warning("IBKR error %s [reqId=%s]: %s",
                            errorCode, reqId, errorString)
 
-    def _recent_fatal_error(self, since: float) -> Optional[dict]:
+    def _recent_fatal_error(self, since: float, order_ids=None) -> Optional[dict]:
         for e in reversed(self._errors):
-            if e["ts"] >= since and e["code"] in _FATAL_ERROR_CODES:
+            if (e["ts"] >= since and e["code"] in _FATAL_ERROR_CODES
+                    and (order_ids is None or e["reqId"] in order_ids)):
                 return e
         return None
 
@@ -376,7 +416,9 @@ class IBKRGateway:
         action = "BUY" if unit.side == "long" else "SELL"
         opp = "SELL" if unit.side == "long" else "BUY"
 
-        if not (self.enabled and self._connected):
+        if self.enabled and not self._connected:
+            return {"ok": False, "error": "IBKR 未连接，入场未提交"}
+        if not self.enabled:
             fake_entry = next(self._fake_ids)
             fake_trail = next(self._fake_ids)
             logger.info("[DRY-RUN] 括号单 %s: %s x%d @LMT %.2f (ref %.2f) + "
@@ -441,7 +483,9 @@ class IBKRGateway:
         action = "BUY" if side == "long" else "SELL"
         opp = "SELL" if side == "long" else "BUY"
 
-        if not (self.enabled and self._connected):
+        if self.enabled and not self._connected:
+            return {"ok": False, "error": "IBKR 未连接，入场未提交"}
+        if not self.enabled:
             fake_entry = next(self._fake_ids)
             fake_stop = next(self._fake_ids)
             logger.info("[DRY-RUN] 市价+STOP 子单 %s: %s x%d @MKT | STOP %s %.2f | FA=%s",
@@ -590,7 +634,9 @@ class IBKRGateway:
         action = "BUY" if side == "long" else "SELL"
         opp = "SELL" if side == "long" else "BUY"
 
-        if not (self.enabled and self._connected):
+        if self.enabled and not self._connected:
+            return {"ok": False, "error": "IBKR 未连接，入场未提交"}
+        if not self.enabled:
             fake_entry = next(self._fake_ids)
             fake_stop = next(self._fake_ids)
             fake_brk = next(self._fake_ids)
@@ -698,13 +744,15 @@ class IBKRGateway:
         trade = self.ib.placeOrder(contract, order)
         await asyncio.sleep(2.5)
         status = trade.orderStatus.status
-        fatal = self._recent_fatal_error(t0)
+        fatal = self._recent_fatal_error(t0, {order.orderId})
         bad = ("Cancelled", "Inactive", "ApiCancelled")
         if fatal or status in bad:
             err = fatal["msg"] if fatal else f"平仓 {status}"
-            logger.error("平仓失败 %s: %s", symbol, err)
+            logger.error("平仓失败 %s orderId=%s status=%s fatalReqId=%s: %s",
+                         symbol, order.orderId, status, fatal["reqId"] if fatal else None, err)
             return {"ok": False, "order_id": order.orderId,
-                    "status": status, "error": err}
+                    "status": status, "error": err, "trade": trade,
+                    "permId": getattr(trade.order, "permId", None)}
         logger.info("平仓已提交 %s %s x%d @%.2f | orderId=%d(%s)",
                     symbol, action, qty, lmt, order.orderId, status)
         return {"ok": True, "order_id": order.orderId, "status": status,
@@ -743,14 +791,14 @@ class IBKRGateway:
         trade = self.ib.placeOrder(contract, order)
         await asyncio.sleep(2.5)
         status = trade.orderStatus.status
-        fatal = self._recent_fatal_error(t0)
+        fatal = self._recent_fatal_error(t0, {order.orderId})
         bad = ("Cancelled", "Inactive", "ApiCancelled")
         if fatal or status in bad:
             err = fatal["msg"] if fatal else f"独立 STOP {status}"
             logger.error("独立 STOP 保护单失败 %s: %s", symbol, err)
             return {"ok": False, "order_id": order.orderId,
                     "stop_order_id": order.orderId, "status": status,
-                    "error": err}
+                    "error": err, "trade": trade}
         logger.info("独立 STOP 保护单已提交 %s %s x%d @%.2f | orderId=%d(%s)",
                     symbol, action, qty, stop_px, order.orderId, status)
         return {"ok": True, "order_id": order.orderId,
@@ -1191,9 +1239,11 @@ class IBKRGateway:
             return None
 
     def cancel_order(self, trade) -> bool:
-        """撤单个订单（dry-run / 未连接时返回 True 表示无需真实撤单）。"""
-        if not (self.enabled and self._connected):
+        """撤单个订单，实盘断线时返回失败。"""
+        if not self.enabled:
             return True
+        if not self._connected:
+            return False
         try:
             if trade is not None and not trade.isDone():
                 self.ib.cancelOrder(trade.order)
@@ -1229,12 +1279,13 @@ class IBKRGateway:
 
     async def closing_fill_avg(self, symbol: str, side: str,
                                since_ts: float = 0.0,
-                               legacy_order_ids=None) -> Optional[tuple]:
+                               legacy_order_ids=None, *, exact_order_ids=None) -> Optional[tuple]:
         """统计本工具平仓成交的 (加权均价, 总股数)，无匹配则 None。
 
         side 是持仓方向（long 的平仓是 SLD）。只统计 88 号段订单；
-        legacy_order_ids 可显式传入旧平仓单 orderId 白名单。不会仅按
-        symbol/direction 混入人工或其他程序的成交。
+        legacy_order_ids 可显式传入旧平仓单 orderId 白名单。
+        exact_order_ids 指定时严格限制这些订单号，其他88号段批次也排除；
+        不指定时保留历史聚合接口。订单管理器必须使用精确归属查询。
         """
         if not self._connected:
             return None
@@ -1252,6 +1303,7 @@ class IBKRGateway:
         except Exception as e:
             logger.warning("成交回报查询失败: %s", e)
             return None
+        exact_ids = set(exact_order_ids) if exact_order_ids is not None else None
         total_shares = 0.0
         total_amt = 0.0
         for f in fills:
@@ -1260,8 +1312,10 @@ class IBKRGateway:
                     continue
                 ex = f.execution
                 order_id = int(ex.orderId)
-                if (not self.is_tool_order_id(order_id)
-                        and order_id not in legacy_ids):
+                if exact_ids is not None:
+                    if order_id not in exact_ids:
+                        continue
+                elif not self.is_tool_order_id(order_id) and order_id not in legacy_ids:
                     continue
                 if ex.side != want:
                     continue

@@ -141,6 +141,8 @@ class CopyFollower:
         self._managed_ready = False
         self._simulation = bool(dry_run)
         self.gateway.disconnect_callback = self._on_ibkr_disconnect
+        if isinstance(self.gateway, IBKRGateway):
+            self.gateway.on_order_audit = self._event
 
         # master lot_id -> {"symbol","side","qty","stop_px","state",
         #                   "follower_order_ids":[],"entry_order_id","stop_order_id"}

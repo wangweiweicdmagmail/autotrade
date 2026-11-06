@@ -17,10 +17,10 @@ AUTO_MAX_INSTANCES（5）。
   移到实际入场成本（券商确认后才标记，1 次，只紧不松）；
 - **其余持仓管理在 bar 收盘执行**：
   1. 保本后按 supertrend 线值棘轮（单向，1 美分防抖）；
-  2. 趋势反向（ts_c.direction 与持仓相反）→ 平仓；
+  2. 趋势反向（ts_c.direction 与持仓相反）→ 默认仅提醒；
   3. 手动取消/平仓（含 TWS 操作，对账发现）→ 实例 DONE；
 - **本地持仓恢复管理**：引擎收养 OrderManager 中未被实例管理的 ACTIVE lot
-  （含重启后的 auto_ lot），同一套 2R 保本 + ST 跟踪 + 反向平仓逻辑
+  （含重启后的 auto_ lot），同一套 2R 保本 + ST 跟踪 + 反向提醒逻辑
   （跳过 WATCHING/PENDING；不扫描外部 TWS 持仓）。
 
 确定性（策略与管理回测口径）：结果 = 数据 × 策略代码 × 参数。
@@ -708,18 +708,9 @@ class StrategyEngine:
                   (inst.side == "short" and direction == 1)
         if flipped:
             ref = close or inst.entry_px
-            ok = await self._broker.close(inst.lot_id, ref, "trend_reverse",
-                                          ts=bt)
-            self._emit("auto_reverse_close", symbol=symbol, side=inst.side,
-                       ref_px=ref, ok=ok, lot_id=inst.lot_id,
-                       status=getattr(lot, "state", ""))
-            if ok:
-                logger.info("趋势反向平仓已提交 %s %s @%.2f", symbol, inst.side, ref)
-                if getattr(lot, "state", "") in ("CLOSED", DONE):
-                    self._finish(inst, "trend_reverse")
-            else:
-                logger.warning("趋势反向平仓失败 %s lot %s，保持 ACTIVE 等待重试",
-                               symbol, inst.lot_id)
+            self._emit("auto_trend_reverse_alert", symbol=symbol, side=inst.side,
+                       qty=inst.qty, price=ref, lot_id=inst.lot_id, bar_time=bt)
+            logger.warning("ST 转向仅提醒 %s %s，不自动平仓", symbol, inst.side)
 
     # ---- 回测专用：bar 极值模拟 tick（口径统一，见模块 docstring）----
 

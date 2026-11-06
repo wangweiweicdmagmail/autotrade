@@ -18,7 +18,7 @@ Python 不用均线或价格形态重新生成 Pine 入场信号。
 
 ```text
 service/pine_strategies.json（模型与 plot 映射，共用声明）
-  ├─ Node pine_models.js → TradingView Study → 每秒行情快照
+  ├─ TradingView K 线 → Node PineTS → 每秒行情快照
   └─ Python PineModelRegistry → PineOutput
        → AutoService（模型、执行实例、全局实例容量）
        → StrategyRuntime（按模型/实例/标的分发实时值和确认值）
@@ -27,6 +27,74 @@ service/pine_strategies.json（模型与 plot 映射，共用声明）
 
 相同 PineExecutionEngine + SimBroker → BacktestSession
 ```
+
+## 实盘审计与 Agent 读取
+
+实盘行情、指标快照、交易事件及订单账本的关系和查询接口见 [实盘数据审计与 Agent 只读查询](docs/LIVE_AUDIT.md)。
+
+## PineTS 本地指标计算架构
+
+生产行情采集从 TradingView 订阅 5 分钟 K 线和日线。美股 5 分钟行情默认请求 `24h`，收到服务端明确确认后才接收行情。配置 `TV_DEFAULT_SESSION_SYMBOLS` 中的 WTI、NAS100 和 SPX500 使用数据商的默认交易时段，收到标的信息和 K 线后计入行情就绪。控制台顶栏展示逐标的时段结果。需要恢复美股延长交易时段时，以 `TV_MARKET_SESSION=extended` 启动控制台。七个指标由 PineTS 运行，行情与信号接入层按原协议发布实时快照和确认快照。EMA7 历史回测复用计算模块，使用缓存的 K 线。
+
+```mermaid
+flowchart LR
+    TV["TradingView 5 分钟 K 线和日线"] --> Feed["Node 行情接入"]
+    Feed --> Cache["按行情序列缓存 K 线"]
+    Cache --> Pool["按标的分配的 PineTS worker 池"]
+    Registry["指标源码、参数和输出映射"] --> Pool
+    Pool --> Snap["对齐版本并组装实时 / 确认快照"]
+    Feed --> Snap
+    Study["独立 TradingView 指标对照"] --> Audit
+    Snap --> Tick["现有每秒 Tick JSON"]
+    Snap --> Audit["影子对照与延迟记录"]
+    Tick --> Py["Python 执行编排、选股、监控"]
+    DB["历史 SQLite"] --> Replay["共用 PineTS 计算模块"]
+    Registry --> Replay
+    Replay --> Backtest["现有 Python 回测"]
+```
+
+### 数据共享和计算分工
+
+- **行情缓存**按数据源、标的、周期、时段、复权方式组织。历史和已确认 K 线按开盘时间索引，当前 K 线按同一开盘时间更新，并赋予递增的 `revision`。标的元数据包括交易所时区、最小价格跳动。5M 进攻区域的 `request.security()` 由适配器提供同口径日线和正确的前一交易日边界。
+- **指标定义**按指标 ID、源码版本和参数管理。每个 worker 可缓存已编译的 `Indicator`，在同参数的多个标的间复用；执行状态按行情序列和指标版本隔离。53 个标的 × 7 个指标是 371 组计算关系，同一标的只维护一份相同时段、周期和复权口径的 K 线。
+- **worker 池**按标的分配任务，同一标的的事件有序处理。现有行情发布循环与 PineTS 计算分开。确认任务有独立队列并优先处理；实时任务过载时按标的合并到最新版本，记录被合并的更新及可能错过的瞬时信号。worker 数量根据真实开盘回放的延迟、积压、CPU 和内存决定。5M 进攻区域单独统计日线请求及计算耗时，避免它拖延回踩指标。
+- **历史回测**与盘中 worker 共用 PineTS 调用、标的元数据和 plot 映射。回测缓存继续按数据、源码、参数和运行版本失效，人工启动时间只影响 Python 回放。EMA7 始终采用批量 `run()`。其余六个指标在同一根 K 线内更新当前结果，连续换根时输入上一根最终值和新根。历史修正、数据缺口、日线变化或连续更新达到 24 根时重新预热。Pine 源码版本固定在 [本地指标目录](indicators/pinets)，升级时按对应 TV 版本重新核对输出。
+
+### 内部接口与现有 Tick
+
+| 接口 | 输入与输出 |
+|---|---|
+| `observe(symbol, periods, infos, raw, daily)` | 接收新行情及标的元数据。至少有 400 根已收盘 K 线时开始本地计算，按标的分发最新版本，换根任务优先。 |
+| worker 请求与响应 | 请求带 `dataset` 和历史是否变化标记；响应按指标给出从最新到历史的结果及单项错误。行情接入层保留请求的图表代次、价格版本和观察时间。 |
+| `snapshot(symbol, raw)` | 返回配对的行情、各指标结果和观察时间。上一根确认值独立缓存。 |
+| Node → Python | 保留每秒 `type: "tick"`、`ts`、`symbols` 和既有字段。项目接口的 K 线时间继续用 Unix 秒，PineTS 适配器内部转换为毫秒。 |
+
+实时指标与同一轮计算采样的价格一起发布。同一根 K 线允许短暂继续发布已完成的配对快照，新行情到达后最多保留 1.6 秒，且保留原始价格观察时间。超出窗口或已进入下一根时，先发最新行情，待本地实时指标就绪再发布。确认值按已收盘 K 线缓存，只有时间和最终 OHLCV 与 `bar_c` 匹配才交给执行模型。重建图表时丢弃旧图表的任务结果，并从重新订阅的历史数据预热。
+
+### 七个指标的兼容范围
+
+| 指标 | 上层现有接口与迁移验收 |
+|---|---|
+| EMA9-ST-ATR | `e9/e9_c`、斜率、突破上下文和 `ema7_closed` 历史。CFD 的 VWAP 差异单独记录，该字段当前不在策略输出映射中。 |
+| EMA20-ST-ATR | `e20/e20_c`。核对触线、方向、参考价和止损。启动确认中展示 QQQ 方向供参考。 |
+| EMA7 回踩 | `e7v2/e7v2_c`。使用批量计算。固定参考线由已收盘数据确定，当前 K 线最低价触及多头参考线或最高价触及空头参考线后，方向及止损检查通过即输出入场信号。根内价格离开参考线后，已触线状态由 K 线极值保留。历史 OHLC 只能验证这根 K 线曾经触及参考线。 |
+| 趋势状态 | `ts/ts_c` 的趋势、方向、通道和 ATR，以及突破使用的 ATR 历史。对照 EMA100 起算点的微小差异是否改变上层排序和过滤。 |
+| FVG Finder+ | `fvg/fvg_c` 的事件、方向、计数和上下沿。核对最后一次 FVG 的方向能否在重启后恢复。 |
+| 智能止损 | 保留合入 `ts/ts_c` 的多空止损字段，覆盖手动交易的止损参考。 |
+| 5M 进攻区域 | `attack/attack_c` 及突破历史所需的开盘区间。分别验证盘前、开盘前三根、确认后区间及跨日。 |
+
+### 验证与诊断
+
+七个原始脚本已完成 53 个标的的历史对照，每个指标覆盖 4,134 根常规盘 K 线。生产默认路径使用同一份本地源码和映射。EMA7 独立对照命令：
+
+```sh
+node service/tv_cloud_daemon.js --symbols NASDAQ:MSFT,NASDAQ:NVDA,NASDAQ:QQQ \
+  --ema7-shadow-only 1 --ema7-shadow-log logs/ema7-shadow.jsonl
+```
+
+独立模式仅订阅所选标的的 K 线和 TV EMA7，并用同一份 K 线在后台 worker 计算本地实时值和确认值。JSONL 记录版本、就绪状态、输入至结果延迟、合并次数及差异。TV 的 Study 和行情消息各自到达，实时对照标记为同根 K 线对照，并记录两边接收时间；收盘对照按确认 K 线时间配对。
+
+相关入口：[现有行情采集](service/tv_cloud_daemon.js)、[回测 PineTS 调用](service/pinets_backtest.js)、[模型注册表](service/pine_strategies.json)、[Python 执行编排](console/runtime/strategy.py)、[策略输出契约](docs/PINE_INDICATOR_CONTRACT.md)。
 
 ## 模型声明与接入
 
@@ -241,3 +309,9 @@ npm test
 ## 小区间突破研究接入
 
 既有突破提醒是显式的 Python 组合信号适配器，不属于 Pine 入场脉冲接口。`engine/opening_breakout.py` 统一实时预选、收盘确认和离线研究筛选，直接读取 Pine 的区间、EMA7 与斜率；不在 Python 重算 EMA7。人工预约后才进入现有订单管理与操作协调器。详细条件及与均线策略的边界见 [小区间突破规则](docs/OPENING_BREAKOUT_RULES.md)。
+
+## 当前退出权限与订单归因
+
+2026-11-06 起，ST/策略方向确认反向只能提醒，禁止自动操作仓位，由用户决定是否平仓。保护止损、明确手动退出与已授权的其他退出规则仍由订单管理模块处理。持仓扫描、公共 Pine 执行模型、历史执行器与订单管理入口均禁止ST/策略反向自动退出，旧兼容开关不能启用该行为；回测同步采用同一规则，启动快照记录 `reverse_action`。订单错误、恢复成交与补挂保护的归因边界见 [退出安全修复](docs/ORDER_EXIT_SAFETY_2026-11-06.md)。
+
+反向FVG同样只提醒：浮盈不能自动移动到保本，浮亏不能自动平仓，须用户对对应订单批次明确操作确认后执行。

@@ -167,14 +167,15 @@ def test_manual_seed_rejects_direction_mismatch():
     with pytest.raises(ValueError, match='方向不一致'):
         run(engine.adopt_seed('NASDAQ:NVDA', _manual_seed_lot(), 300, {'direction': -1}))
 
-def test_reverse_closes_entire_basket_and_requires_explicit_new_round():
+def test_manual_exit_closes_entire_basket_and_requires_explicit_new_round(monkeypatch):
     broker = FakeBroker()
     engine = _start(broker)
     run(engine.on_price('NASDAQ:NVDA', 207.37, _e9(207.37, 0.85), 600))
     run(engine.on_price('NASDAQ:NVDA', 207.37, _e9(207.37, 0.85), 600))
-    run(engine.on_bar('NASDAQ:NVDA', {'close': 207.5}, {'direction': 1}))
+    run(engine.close_symbol('NASDAQ:NVDA',207.5))
     assert len(broker.closes) == 1
-    run(engine.on_bar('NASDAQ:NVDA', {'close': 207.5}, {'direction': 1}))
+    run(engine.close_symbol('NASDAQ:NVDA',207.5))
+    run(engine.on_bar('NASDAQ:NVDA', {'close': 100}, {'direction': 0}))
     inst = engine._instances['NASDAQ:NVDA']
     assert inst.total_qty == 0 and inst.entries == 1 and (inst.state == 'DONE')
 
@@ -235,8 +236,9 @@ def test_start_direction_is_locked_and_finished_round_cannot_reopen():
     run(engine.on_price('NASDAQ:NVDA', 100, _e9(100, 1, direction=1, time=1100), 600))
     run(engine.on_price('NASDAQ:NVDA', 100, _e9(100, 1, direction=1, time=1100), 600))
     assert len(broker.calls) == 1
-    run(engine.on_bar('NASDAQ:NVDA', {'close': 101}, {'direction': -1}))
-    run(engine.on_bar('NASDAQ:NVDA', {'close': 101}, {'direction': -1}))
+    run(engine.close_symbol('NASDAQ:NVDA',101))
+    run(engine.close_symbol('NASDAQ:NVDA',101))
+    run(engine.on_bar('NASDAQ:NVDA', {'close': 100}, {'direction': 0}))
     inst = engine._instances['NASDAQ:NVDA']
     assert inst.state == 'DONE'
     run(engine.on_price('NASDAQ:NVDA', 102, _e9(102, 1, direction=1, time=1200), 600))
@@ -274,8 +276,9 @@ def test_fill_and_flat_events_describe_actual_execution():
     assert filled['entries'] == 1
     assert filled['qty'] == 300
     assert filled['entry_px'] == 100
-    run(engine.on_bar('NASDAQ:NVDA', {'close': 99}, {'direction': -1}))
-    run(engine.on_bar('NASDAQ:NVDA', {'close': 99}, {'direction': -1}))
+    run(engine.close_symbol('NASDAQ:NVDA',99))
+    run(engine.close_symbol('NASDAQ:NVDA',99))
+    run(engine.on_bar('NASDAQ:NVDA', {'close': 100}, {'direction': 0}))
     flat = next((data for event, data in events if event == 'pyramid_flat'))
     assert flat['had_fill'] is True
     assert flat['side'] == 'long'
@@ -343,19 +346,18 @@ def test_api_start_uses_current_risk_and_requires_e9(console_app, monkeypatch):
     with pytest.raises(app.HTTPException, match='尚未确认'):
         run(app.automatic.api_auto_start(req, trader='master'))
     req.confirmed_directions = preview['directions']
-    for direction, reason in [(-1, '方向不一致'), (0, '方向未就绪')]:
+    for direction in [-1, 0]:
         market['NASDAQ:QQQ']['e9']['direction'] = direction
-        with pytest.raises(app.HTTPException, match=reason):
-            run(app.automatic.api_auto_start(req, trader='master'))
-    market['NASDAQ:QQQ']['e9']['direction'] = -1
+        updated_preview = run(app.automatic.api_auto_start(req, trader='master', preview=True))
+        assert updated_preview['directions']['NASDAQ:QQQ'] == direction
+        result = run(app.automatic.api_auto_start(req, trader='master'))
+        assert result['started'] == ['NASDAQ:NVDA']
+    market.pop('NASDAQ:QQQ')
+    assert run(app.automatic.api_auto_start(req, trader='master'))['started'] == ['NASDAQ:NVDA']
     market['NASDAQ:NVDA']['e9']['direction'] = -1
     with pytest.raises(app.HTTPException, match='已变化'):
         run(app.automatic.api_auto_start(req, trader='master'))
-    assert calls == []
-    market['NASDAQ:QQQ']['e9']['direction'] = 1
-    market['NASDAQ:NVDA']['e9']['direction'] = 1
-    result = run(app.automatic.api_auto_start(req, trader='master'))
-    assert calls == [(['NASDAQ:NVDA'], 700.0, {'NASDAQ:NVDA': 1})]
+    assert calls == [(['NASDAQ:NVDA'], 700.0, {'NASDAQ:NVDA': 1})] * 3
     assert result['params']['risk_ratios'] == [1.0, 2.0 / 3.0, 1.0 / 3.0]
 
 def test_api_start_rejects_missing_e9(console_app, monkeypatch):

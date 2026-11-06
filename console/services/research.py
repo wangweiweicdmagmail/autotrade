@@ -1,6 +1,7 @@
 """research application functions and owned state. No console.app dependency."""
 
 from engine.backtest_session import BacktestSession
+from engine.local_pine_history import EMA7_MODEL, LocalPineHistory, LocalPineHistoryError
 from fastapi import HTTPException
 from pathlib import Path
 from collections import OrderedDict
@@ -17,6 +18,7 @@ class ResearchService:
         self.context = context
         self._backtest_history = OrderedDict()
         self._backtest_history_lock = asyncio.Lock()
+        self._local_pine_history = LocalPineHistory(context.paths.data_dir / "backtest_history.sqlite3")
 
     async def api_bt_run(self, req: BtRunRequest) -> dict:
         """Reuse historical inputs while running a fresh private simulation."""
@@ -48,10 +50,17 @@ class ResearchService:
         current_day = now.date().isoformat()
         window = (current_day, now.time() >= clock_time(16)) if day in ("", current_day) else None
         key = (symbol, day, req.strategy, req.bars, window)
+        local_history = None
         async with self._backtest_history_lock:
             cached = self._backtest_history.get(key)
             reused = cached is not None
-            if cached is None:
+            if req.strategy == EMA7_MODEL:
+                try:
+                    day, rows, local_history = await self._local_pine_history.load(symbol, day, req.bars, now)
+                except LocalPineHistoryError as error:
+                    raise HTTPException(400, f"EMA7 本地回测数据不可用: {error}") from error
+                reused = local_history["calculation_reused"]
+            elif cached is None:
                 try:
                     rows = await fetch_history(symbol, req.bars, day)
                 except Exception as error:
@@ -86,6 +95,8 @@ class ResearchService:
         # The session and simulated broker are local to this request.
         result = await asyncio.to_thread(lambda: asyncio.run(session.run_all()))
         result["history_reused"] = reused
+        if local_history is not None:
+            result["run_context"]["history"] = local_history
         return result
 
     async def api_shadow(self) -> dict:

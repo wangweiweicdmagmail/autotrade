@@ -67,6 +67,9 @@ class FakeOrderMgr:
     def get(self, lot_id):
         return self._lots.get(lot_id)
 
+    async def restore_protection(self, lot_id):
+        return await self._restore_protection(self._lots[lot_id])
+
     async def _restore_protection(self, lot):
         self.restore_calls.append(lot.lot_id)
         if self.restore_ok:

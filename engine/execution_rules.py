@@ -6,7 +6,7 @@ from typing import Optional
 def fvg_reverse_action(
     side: str, fvg_event: int, avg_fill: Optional[float], price: Optional[float]
 ) -> Optional[str]:
-    """反向 FVG 收盘确认后的动作判定（纯函数）：
+    """反向 FVG 收盘确认后的建议分类（纯函数，不授权任何订单操作）：
     同向缺口/数据缺失 → None；浮亏 → "close"；浮盈（含持平）→ "protect"。"""
     if side == "long" and fvg_event != -1:
         return None

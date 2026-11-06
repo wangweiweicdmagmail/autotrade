@@ -16,6 +16,7 @@ from execution.order_lot import OrderManager
 from pathlib import Path
 from engine.pyramid_engine import PyramidEngine
 from engine.realtime_collector import RealtimeCollector
+from engine.live_audit import LiveMarketAudit
 from execution.risk import RiskConfig
 from execution.risk import RiskGate
 from typing import Set
@@ -148,7 +149,11 @@ class ConsoleServices:
         self.trading._retest_reprice_task: Optional[asyncio.Task] = None
         self.monitoring._external_cleanup_task: Optional[asyncio.Task] = None
         self.trading._midpoint_escalate_attempted: set = set()
-        self.collector: RealtimeCollector = RealtimeCollector(config.WATCHLIST)
+        self.market_audit = LiveMarketAudit(self.paths.data_dir / "live_audit.sqlite3")
+        self.collector: RealtimeCollector = RealtimeCollector(
+            config.WATCHLIST, audit=self.market_audit, market_session=config.TV_MARKET_SESSION,
+            default_session_symbols=config.TV_DEFAULT_SESSION_SYMBOLS,
+        )
         self.order_mgr.market_health = self.collector.data_health
         self.accounts._equity_cache = {"equity": None, "daily_pnl": None, "ts": 0.0}
         self.monitoring._scan_alerts: dict = {}
@@ -175,6 +180,8 @@ class ConsoleServices:
             "pyramid_order_failed",
             "pyramid_close_requested",
             "pyramid_flat",
+            "pyramid_trend_reverse_alert",
+            "auto_trend_reverse_alert",
         }
         self.automatic._auto_notices: dict = {}
         self.auto_engine: PyramidEngine = PyramidEngine(

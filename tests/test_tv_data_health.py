@@ -52,6 +52,15 @@ def test_real_content_change_recovers_health():
     assert health["trade_allowed"] is True
 
 
+def test_local_calculation_does_not_make_an_older_price_look_fresh():
+    c = _collector()
+    tick = _tick(bar_time=1000)
+    tick["symbols"]["NASDAQ:QQQ"]["price_observed_at"] = 1001
+    c._accept_tick(tick, now=1002)
+    assert c.latest()["NASDAQ:QQQ"]["price_observed_at"] == 1001
+    assert c.data_health(1003, trading=True)["content_age"] == 2
+
+
 def test_off_hours_silence_does_not_block_or_restart():
     c = _collector()
     now = time.time()
@@ -250,3 +259,53 @@ def test_watchdog_recovers_dead_reader_outside_trading_hours(monkeypatch):
         with pytest.raises(asyncio.CancelledError): await c._watchdog_loop()
         assert calls==['行情读取任务已停止']
     run(go())
+
+
+def test_24h_feed_rejects_unconfirmed_data_and_removes_prior_quotes():
+    c = RealtimeCollector(["NASDAQ:QQQ", "NASDAQ:MSFT"], market_session="24h")
+    bar = {"time": 1000, "close": 101}
+    good = {"resolved": "24h"}
+    wrong = {"resolved": "extended"}
+    c._accept_tick({
+        "sessions": {"NASDAQ:QQQ": good, "NASDAQ:MSFT": wrong},
+        "symbols": {
+            "NASDAQ:QQQ": {"bar": bar, "session": good},
+            "NASDAQ:MSFT": {"bar": bar, "session": wrong},
+        },
+    }, now=1001)
+    assert set(c.latest()) == {"NASDAQ:QQQ"}
+    assert c.data_health(now=1001, trading=False)["confirmed_24h_symbols"] == ("NASDAQ:QQQ",)
+    assert set(c.market_session_status()["unavailable"]) == {"NASDAQ:MSFT"}
+
+    c._accept_tick({
+        "sessions": {"NASDAQ:QQQ": wrong, "NASDAQ:MSFT": wrong},
+        "symbols": {"NASDAQ:QQQ": {"bar": bar, "session": wrong}},
+    }, now=1002)
+    assert c.latest() == {}
+    assert c.market_session_status()["confirmed"] == 0
+
+
+def test_24h_feed_counts_default_sessions_only_for_configured_symbols():
+    stock = "NASDAQ:QQQ"
+    index = "CAPITALCOM:NAS100"
+    c = RealtimeCollector([stock, index], market_session="24h", default_session_symbols=[index])
+    bar = {"time": 1000, "close": 101}
+    stock_session = {"requested": "24h", "resolved": "24h", "accepted": True}
+    default_session = {"requested": "default", "resolved": None, "accepted": True}
+
+    def tick(stock_info, index_info, now):
+        sessions = {stock: stock_info, index: index_info}
+        c._accept_tick({
+            "sessions": sessions,
+            "symbols": {symbol: {"bar": bar, "session": info} for symbol, info in sessions.items()},
+        }, now=now)
+
+    tick(stock_session, default_session, 1001)
+    assert set(c.latest()) == {stock, index}
+    assert c.market_session_status()["confirmed"] == 2
+    assert c.market_session_status()["unavailable"] == {}
+    assert c.data_health(now=1001, trading=False)["confirmed_24h_symbols"] == (stock,)
+
+    tick({**default_session, "resolved": "regular"}, {**default_session, "error": "series error"}, 1002)
+    assert c.latest() == {}
+    assert set(c.market_session_status()["unavailable"]) == {stock, index}
