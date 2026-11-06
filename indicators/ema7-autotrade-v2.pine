@@ -6,7 +6,6 @@ stMultiplier = input.float(3.0, "超级趋势倍数", minval=0.1, step=0.1, grou
 atrLength = input.int(14, "ATR 周期", minval=1, group="保护止损")
 stopMultiplier = input.float(1.2, "止损 ATR 倍数", minval=0.1, step=0.1, group="保护止损")
 offsetMultiplier = input.float(0.2, "预测偏移 ATR 倍数", minval=0, step=0.05, group="触线")
-toleranceTicks = input.int(1, "触线后允许偏离的最小跳动数", minval=0, group="触线")
 
 ema7 = ta.ema(close, 7)
 confirmedAtr = ta.atr(atrLength)[1]
@@ -23,13 +22,12 @@ ready = not na(entryPrice) and entryPrice > 0 and not na(confirmedAtr) and confi
 validLong = ready and longStop > 0 and longStop < entryPrice
 validShort = ready and shortStop > entryPrice
 
-// 固定触线价在本根开盘即已知。开盘价判定来向，根内极值记录曾触达。
-// 实时 close 离开容差后撤掉信号；历史 close 只能代表本根最终状态。
+// 固定触线价在本根开盘即已知，开盘价判定来向。
+// 根内极值一旦触线，价格离开参考线也保留触线状态。现价须仍在保护止损的安全侧。
 longTouch = validLong and direction == 1 and velocity > 0 and open > entryPrice and low <= entryPrice
 shortTouch = validShort and direction == -1 and velocity < 0 and open < entryPrice and high >= entryPrice
-nearLine = ready and math.abs(close - entryPrice) <= toleranceTicks * syminfo.mintick + syminfo.mintick * 1e-6
-longSignal = longTouch and nearLine and close > longStop
-shortSignal = shortTouch and nearLine and close < shortStop
+longSignal = longTouch and close > longStop
+shortSignal = shortTouch and close < shortStop
 
 plot(longSignal or shortSignal ? 1 : 0, "Entry_Signal", display=display.data_window, offset=0)
 plot(direction, "Direction", display=display.data_window, offset=0)
