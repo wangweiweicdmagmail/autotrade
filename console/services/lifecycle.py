@@ -157,6 +157,7 @@ class LifecycleService:
         self.context.automatic._auto_strategy_name = self.context.auto_service.strategy_name
         await self.context.collector.start()
         await self.context.copy_supervisor.start(self.context.copy._load_copy_servers())
+        self.context.tv_paper_sync.start()
         self.context.snapshot._broadcast_task = self.context.tasks.start(
             "snapshot._broadcast", lambda: self.context.snapshot._broadcast_loop()
         )

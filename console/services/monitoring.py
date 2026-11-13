@@ -88,7 +88,8 @@ class MonitoringService:
             return stats
         accounts = set(await self.context.gateway.fa_accounts())
         legacy_ids = self.context.monitoring._legacy_tool_order_ids()
-        if not config.EXTERNAL_ORDER_CLEANUP_ENABLED:
+        if (not config.EXTERNAL_ORDER_CLEANUP_ENABLED
+                or getattr(self.context.order_mgr, "external_adoption_enabled", False)):
             alerts = []
             for trade in list(trades.values()):
                 if trade.isDone():
@@ -483,7 +484,7 @@ class MonitoringService:
         actives = [
             l
             for l in self.context.order_mgr.list_lots(active_only=True)
-            if l["state"] == "ACTIVE" and (l.get("filled_qty") or 0) > 0
+            if l["state"] == "ACTIVE" and not l.get("external_managed") and (l.get("filled_qty") or 0) > 0
         ]
         if not actives:
             return
@@ -705,7 +706,7 @@ class MonitoringService:
                 now = time.time()
                 for lot in active:
                     lot_id = lot.get("lot_id")
-                    if self.context.monitoring._is_pyramid_lot(lot):
+                    if lot.get("external_managed") or self.context.monitoring._is_pyramid_lot(lot):
                         continue
                     if lot.get("state") != "ACTIVE":
                         continue

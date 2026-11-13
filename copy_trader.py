@@ -448,7 +448,7 @@ class CopyFollower:
             if mid in self.skip:
                 continue
 
-            if state == M_ACTIVE and int(lot.get("filled_qty") or 0) > 0:
+            if state == M_ACTIVE and not lot.get("external_managed") and int(lot.get("filled_qty") or 0) > 0:
                 # 首帧快照：已 ACTIVE 的历史仓按配置决定跟不跟
                 if first and not self.cfg.get("copy_existing_on_start"):
                     self.skip.add(mid)
@@ -542,7 +542,7 @@ class CopyFollower:
             state = lot.get("state")
             self._seen[mid] = state
             rows = groups.get(mid, [])
-            if not rows and (mid in self.map or mid in self.skip):
+            if not rows and (lot.get("external_managed") or mid in self.map or mid in self.skip):
                 continue
             if not rows and self._first_snapshot and not self.cfg.get("copy_existing_on_start"):
                 if state in (M_ACTIVE, M_CLOSING):
@@ -698,6 +698,8 @@ class CopyFollower:
     async def _attempt_entry(self, lot: dict) -> str:
         """执行一次入场尝试；返回 "ok" / "retry" / "fatal"。"""
         mid = lot["lot_id"]
+        if lot.get("external_managed"):
+            return "fatal"
         symbol, side = lot.get("symbol"), lot.get("side")
         avg_fill = float(lot.get("avg_fill") or 0)
         stop_px = float(lot.get("stop_px") or 0)

@@ -329,6 +329,10 @@
               <div class="orders-tab-panel">
                 <div class="panel-title order-title">
                   <span>订单批次</span>
+                  <el-tag v-if="status?.tv_paper_sync?.enabled" size="small"
+                          :type="status.tv_paper_sync.state === '运行中' ? 'info' : 'warning'">
+                    TV 模拟同步 · {{ status.tv_paper_sync.state }}（{{ status.tv_paper_sync.linked }}）
+                  </el-tag>
                   <el-tag v-if="demoMode" type="warning" size="small">演示</el-tag>
                   <el-select v-model="orderSymbolFilter" size="small" clearable placeholder="全部标的" style="width:110px">
                     <el-option v-for="sym in watchlist" :key="sym" :label="sym.split(':').pop()" :value="sym"></el-option>
@@ -339,10 +343,18 @@
                     <el-option label="手动单" value="manual"></el-option>
                   </el-select>
                 </div>
+                <div v-if="status?.tv_paper_sync?.notices?.length" role="status">
+                  <div v-for="notice in status.tv_paper_sync.notices" :key="notice.symbol" class="auto-meta">
+                    {{ tickerOf(notice.symbol) }} · {{ notice.message }}
+                    <template v-if="notice.paper_stop != null">
+                      · 批次 {{ notice.lot_id }} · 实盘 {{ notice.live_stop }} → 建议 {{ notice.paper_stop }}
+                    </template>
+                  </div>
+                </div>
                 <el-table :data="sortedLots" size="small" style="width:100%" :row-class-name="lotRowClass"
                           class="tv-link-table" @row-click="row => row.symbol && tvShow(row.symbol)">
                   <el-table-column label="标的 / 归属" width="175" fixed="left">
-                    <template #default="{ row }"><span class="lot-symbol">{{ tickerOf(row.symbol) }}</span><small class="auto-meta">{{ row.signal_snapshot && row.signal_snapshot.strategy_id ? autoModelName(row.signal_snapshot.strategy_id) + ' · ' + (row.signal_snapshot.strategy_instance_id || 'default') : '手动 / 历史订单' }}</small></template>
+                    <template #default="{ row }"><span class="lot-symbol">{{ tickerOf(row.symbol) }}</span><small class="auto-meta">{{ row.signal_snapshot && row.signal_snapshot.strategy_id ? autoModelName(row.signal_snapshot.strategy_id) + ' · ' + (row.signal_snapshot.strategy_instance_id || 'default') : row.external_managed ? 'IBKR 接管' : '手动 / 历史订单' }}</small></template>
                   </el-table-column>
                   <el-table-column label="开仓方向" width="105" fixed="left">
                     <template #default="{ row }"><b :class="row.side === 'long' ? 'pnl-pos' : row.side === 'short' ? 'pnl-neg' : 'muted'">{{ lotSideLabel(row) }}</b><small class="auto-meta">{{ lotEntryAction(row) }}</small></template>
@@ -386,7 +398,8 @@
                   <el-table-column prop="reason" label="备注" min-width="120" show-overflow-tooltip></el-table-column>
                   <el-table-column label="操作" width="228" fixed="right">
                     <template #default="{ row }">
-                      <div class="order-primary-actions" @click.stop>
+                      <span v-if="row.external_managed && row.state === 'ACTIVE'" class="muted">在 TWS 管理</span>
+                      <div v-else class="order-primary-actions" @click.stop>
                         <el-button v-if="row.state === 'ACTIVE'" size="small" type="success" plain :disabled="demoMode || row.breakeven_reached" @click="breakevenLot(row)">保本</el-button>
                         <el-button v-if="row.state === 'ACTIVE'" size="small" type="danger" plain :disabled="demoMode" @click="closeLot(row)">平仓</el-button>
                         <el-button v-if="row.state === 'PENDING' || (status.dry_run && row.state === 'ACTIVE')" size="small" type="warning" plain :disabled="demoMode" @click="cancelLot(row)">撤单</el-button>

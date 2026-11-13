@@ -23,6 +23,7 @@ symbol 计 / 日亏损熔断 / qty 上限），「持仓数上限」按 symbol �
 
 import asyncio
 import logging
+import math
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
@@ -33,6 +34,7 @@ from typing import Dict, List, Optional, Tuple
 import config
 from engine.opening_breakout import RULES_VERSION, ET, entry_window
 from domain.contracts import finite_number, FillEvent, OrderPlan, OrderState, StopAmendment, OPEN_ORDER_VALUES
+from execution.external_adoption import adoption_candidates
 from execution.state_store import ExecutionStateStore, PersistenceError, RecoveryRequired
 from execution.operations import OperationKind, OrderOperationCoordinator, serialized_placement, placement_received_at
 
@@ -117,6 +119,14 @@ class OrderLot:
     entry_submission_pending: bool = False  # durable intent: broker outcome not yet known
     entry_cumulative_qty: int = 0
     entry_cumulative_avg: float = 0.0
+    external_account: str = ""
+    external_fa_group: str = ""
+    external_allocations: dict = field(default_factory=dict)
+    external_remaining: dict = field(default_factory=dict)
+    external_exit_fills: dict = field(default_factory=dict)
+    external_entry_perm_id: int = 0
+    external_stop_perm_id: int = 0
+    external_contract_id: int = 0
     entry_broker_time: float = 0.0
     last_fill_received_at: float = 0.0
     last_fill_broker_time: float = 0.0
@@ -159,6 +169,10 @@ class OrderLot:
         else:
             self.pnl = round((self.avg_fill - self.last_px) * self.filled_qty, 2)
 
+    @property
+    def external_managed(self):
+        return bool(self.external_account or self.external_fa_group)
+
     def to_dict(self) -> dict:
         d = asdict(self)
         d.pop("entry_trade", None)
@@ -169,6 +183,8 @@ class OrderLot:
         quantity = getattr(getattr(self.trail_trade, "order", None), "totalQuantity", None)
         d["protection_order_status"] = status
         d["protection_order_qty"] = quantity
+        if self.external_managed and quantity is not None:
+            d["protection_order_qty"] = float(quantity) - float(self.trail_trade.orderStatus.filled)
         return d
 
     @staticmethod
@@ -205,6 +221,7 @@ class OrderManager:
         self._recent_places: Dict[tuple, float] = {}   # 下单幂等：近期相同单时间戳
         self._watchers: Dict[tuple, asyncio.Task] = {}  # (lot_id, kind) -> watcher 任务
         self._revive_done: set = set()      # 已复活过的 lot（每 lot 只复活一次）
+        self.external_adoption_enabled = False
         self.on_lot_closed = None      # 平仓回调 fn(lot_dict)，由上层（console）注入
         self.on_lot_revived = None     # 对账复活回调 fn(lot_dict)，由上层（console）注入
         self.on_entry_stage = None
@@ -578,6 +595,8 @@ class OrderManager:
         lot = self._lots.get(lot_id)
         if lot is None:
             return False, f"lot 不存在: {lot_id}"
+        if lot.external_managed:
+            return False, "IBKR 外部批次的实盘操作请在 TWS 完成"
         async with self._operations.run(lot_id, OperationKind.EXIT, lock=self._lot_lock(lot)) as decision:
             if not decision.allowed:
                 return False, decision.reason
@@ -736,6 +755,8 @@ class OrderManager:
         lot = self._lots.get(lot_id)
         if lot is None:
             return False, f"lot 不存在: {lot_id}"
+        if lot.external_managed:
+            return False, "IBKR 外部批次的实盘操作请在 TWS 完成"
         async with self._operations.run(lot_id, OperationKind.REDUCE, lock=self._lot_lock(lot)) as decision:
             if not decision.allowed:
                 return False, decision.reason
@@ -1050,7 +1071,7 @@ class OrderManager:
 
     async def _restore_protection(self, lot: OrderLot) -> bool:
         """优先认回原括号子单并调整数量；确认缺失后才恢复独立 STOP。"""
-        if lot.state != ACTIVE:
+        if lot.state != ACTIVE or lot.external_managed:
             return False
         if lot.filled_qty <= 0:
             lot.protection_restore_needed = False
@@ -1810,6 +1831,146 @@ class OrderManager:
                 self._reconcile_error = str(error) or type(error).__name__
                 raise
 
+    async def _reconcile_external_positions(self, broker_pos):
+        tracked = [lot for lot in self._lots.values()
+                   if lot.external_managed and lot.state == ACTIVE]
+        symbols = {}
+        for symbol in config.WATCHLIST:
+            symbols.setdefault(symbol.split(":")[-1].upper(), []).append(symbol)
+        tickers = {ticker for ticker in broker_pos if len(symbols.get(ticker, ())) == 1}
+        tickers.update(lot.symbol.split(":")[-1].upper() for lot in tracked)
+        snapshot = await self._gw.external_adoption_snapshot(tickers)
+        if snapshot is None:
+            self._reconcile_issues.append({
+                "kind": "external_adoption", "reason": "TWS 未确认 FA 成员或成交/订单快照，暂停接管和 TV 同步",
+            })
+            return
+        positions, fills, active_orders, accounts = snapshot
+        async with self._placement_lock:
+            tracked_tickers = {lot.symbol.split(":")[-1].upper() for lot in self._lots.values()
+                               if lot.state in _OPEN_STATES or lot.entry_submission_pending}
+            owned = {oid for lot in self._lots.values() for oid in self.legacy_order_ids(lot)}
+            for ticker in sorted(tickers):
+                rows = [p for p in positions if p.contract.symbol.upper() == ticker]
+                active = [t for t in active_orders if t.contract.symbol.upper() == ticker
+                          and t.contract.secType == "STK" and not t.isDone()]
+                lot = next((row for row in tracked if row.symbol.split(":")[-1].upper() == ticker), None)
+                if lot:
+                    members = set(lot.external_allocations) or {lot.external_account}
+                    if not members <= accounts or (lot.external_fa_group and lot.external_fa_group != self._gw.fa_group):
+                        self._reconcile_issues.append({
+                            "kind": "reconcile", "lot_id": lot.lot_id, "symbol": lot.symbol,
+                            "reason": "原 IBKR 账户不在当前对账范围",
+                        })
+                        continue
+                    self._reconcile_external_lot(lot, rows, active, fills, broker_pos.get(ticker, 0))
+                elif self.external_adoption_enabled and ticker not in tracked_tickers:
+                    if sum(float(p.position) for p in rows) != broker_pos.get(ticker, 0):
+                        continue
+                    candidates = adoption_candidates(rows, active, fills, owned, self._gw.is_tool_order_id, self._gw.fa_group)
+                    for group, allocations, perm_id, entry_id, qty, price, ts, long, stop in candidates:
+                        stop_px = float(stop.order.auxPrice)
+                        adopted = OrderLot(
+                            lot_id=f"ibkr-external-{perm_id}", symbol=symbols[ticker][0],
+                            side="long" if long else "short", qty=qty, entry_px=price,
+                            stop_px=stop_px, trail_amount=0, state=ACTIVE, filled_qty=qty,
+                            avg_fill=price, last_px=price, entry_time=ts, entry_broker_time=ts,
+                            entry_order_id=entry_id, trail_order_id=self._trade_order_id(stop),
+                            trail_trade=stop, limit_type="ibkr_external", trader="master",
+                            note="IBKR 外部仓位已接管，在 TWS 管理实盘订单",
+                            external_account=next(iter(allocations)) if not group else "",
+                            external_fa_group=group, external_allocations=allocations,
+                            external_remaining=dict(allocations),
+                            external_entry_perm_id=perm_id,
+                            external_stop_perm_id=stop.order.permId,
+                            external_contract_id=stop.contract.conId,
+                        )
+                        if adopted.lot_id in self._lots:
+                            continue
+                        self._remember_order(adopted, entry_id, perm_id, adopted.trail_order_id,
+                                             adopted.external_stop_perm_id)
+                        self._lots[adopted.lot_id] = adopted
+                        logger.info("IBKR 外部仓位已接管 %s %s ×%d", adopted.lot_id, adopted.symbol, qty)
+
+    def _reconcile_external_lot(self, lot, positions, active, fills, broker_qty):
+        def issue(reason):
+            self._reconcile_issues.append({"kind": "reconcile", "lot_id": lot.lot_id,
+                                           "symbol": lot.symbol, "reason": reason})
+
+        allocations = lot.external_allocations or {lot.external_account: lot.qty}
+        if any(p.account not in allocations or p.contract.conId != lot.external_contract_id
+               or (p.position > 0) != (lot.side == "long")
+               for p in positions):
+            issue("同标的账户或合约归属变化")
+            return
+        signed_qty = sum(float(p.position) for p in positions)
+        remaining = signed_qty * (1 if lot.side == "long" else -1)
+        if signed_qty != broker_qty or not float(remaining).is_integer() or not 0 <= remaining <= lot.filled_qty:
+            issue("券商余仓与原批次归属不符")
+            return
+        broker_by_account = {p.account: abs(float(p.position)) for p in positions}
+        prior_remaining = lot.external_remaining or (allocations if lot.external_fa_group else
+                                                      {lot.external_account: lot.filled_qty})
+        if any(qty > prior_remaining.get(account, 0) for account, qty in broker_by_account.items()):
+            issue("FA 成员账户持仓增加，无法归属到原批次")
+            return
+        if remaining < lot.filled_qty:
+            exit_side = "SLD" if lot.side == "long" else "BOT"
+            exits = dict(lot.external_exit_fills)
+            observed = set()
+            for fill in fills:
+                ex = fill.execution
+                timestamp = getattr(ex, "time", fill.time).timestamp()
+                if (fill.contract.conId != lot.external_contract_id or ex.acctNumber not in allocations
+                        or ex.permId == lot.external_entry_perm_id or timestamp < lot.entry_time):
+                    continue
+                key = ex.execId.rsplit(".", 1)[0]
+                row = {"id": ex.execId, "account": ex.acctNumber, "perm": ex.permId,
+                       "qty": float(ex.shares), "price": float(ex.price)}
+                if (not ex.execId or not ex.permId or ex.side != exit_side or key in observed
+                        or not all(math.isfinite(row[k]) and row[k] > 0 for k in ("qty", "price"))
+                        or (key in exits and exits[key] != row)):
+                    issue("外部退出成交存在更正或归属冲突")
+                    return
+                observed.add(key)
+                exits[key] = row
+            for account, initial_qty in allocations.items():
+                member_exit = sum(row["qty"] for row in exits.values() if row["account"] == account)
+                if member_exit != initial_qty - broker_by_account.get(account, 0):
+                    issue("FA 成员账户的减仓成交与余仓不符")
+                    return
+            exit_qty = sum(row["qty"] for row in exits.values())
+            if exit_qty != lot.qty - remaining or not exit_qty.is_integer():
+                issue("外部退出成交数量与余仓不符")
+                return
+            exit_px = sum(row["qty"] * row["price"] for row in exits.values()) / exit_qty
+            lot.external_exit_fills = exits
+            lot.close_filled_qty = int(exit_qty)
+            lot.close_avg_fill = exit_px
+            if not remaining:
+                reason = "stop" if all(row["perm"] == lot.external_stop_perm_id for row in exits.values()) else "external_close"
+                if self._finalize_close(lot, exit_px, reason):
+                    self._emit_closed(lot)
+                return
+            lot.filled_qty = int(remaining)
+            lot.external_remaining = broker_by_account
+        stop = active[0] if len(active) == 1 else None
+        if (stop is None or self._trade_perm_id(stop) != lot.external_stop_perm_id
+                or stop.contract.conId != lot.external_contract_id
+                or getattr(stop.order, "faGroup", "") != lot.external_fa_group
+                or (not lot.external_fa_group and stop.order.account != lot.external_account)
+                or stop.order.orderType != "STP"
+                or stop.order.action != ("SELL" if lot.side == "long" else "BUY")
+                or stop.orderStatus.status not in {"Submitted", "PreSubmitted"}
+                or float(stop.order.totalQuantity) - float(stop.orderStatus.filled) != remaining
+                or not math.isfinite(self._protective_price(stop) or math.inf)):
+            lot.trail_trade = None
+            issue("外部保护单身份或覆盖数量变化，请在 TWS 核对")
+            return
+        lot.trail_trade = stop
+        lot.trail_order_id = self._trade_order_id(stop)
+        lot.stop_px = self._protective_price(stop)
+
     async def _reconcile_once(self) -> None:
         """按本 lot 自有订单对账；快照未知或无法归因时只保留并告警。"""
         if not (self._gw.enabled and self._gw._connected):
@@ -1824,7 +1985,7 @@ class OrderManager:
             and l.filled_qty <= 0 and l.close_filled_qty <= 0
             and l.entry_order_id is not None
             and l.lot_id not in self._revive_done]
-        if not open_lots and not revive_candidates:
+        if not open_lots and not revive_candidates and not self.external_adoption_enabled:
             self._reconcile_phase = "checked"
             self._reconcile_error = ""
             self._reconciled_at = time.time()
@@ -1844,6 +2005,9 @@ class OrderManager:
                            "禁止本轮任何撤改平", type(trades).__name__,
                            type(broker_pos).__name__)
             return
+
+        if self.external_adoption_enabled or any(lot.external_managed for lot in open_lots):
+            await self._reconcile_external_positions(broker_pos)
 
         # 复活通道：券商仍有同向持仓 + 本 lot 订单确有成交（OCA 竞态漏报）
         # → 复活为 ACTIVE 并恢复保护。每 lot 只复活一次（_revive_done）。
@@ -1871,6 +2035,8 @@ class OrderManager:
                             logger.exception("on_lot_revived 回调异常")
 
         for lot in open_lots:
+            if lot.external_managed:
+                continue
             async with self._lot_lock(lot):
                 await self._recover_submission(lot, trades)
                 if lot.entry_submission_pending:
@@ -2060,7 +2226,16 @@ class OrderManager:
         if active_only:
             lots = [l for l in lots if l.state in _OPEN_STATES]
         lots.sort(key=lambda l: l.created_at)
-        return [l.to_dict() for l in lots]
+        rows = []
+        for lot in lots:
+            row = lot.to_dict()
+            row.pop("external_account", None)
+            row.pop("external_allocations", None)
+            row.pop("external_remaining", None)
+            row.pop("external_exit_fills", None)
+            row["external_managed"] = lot.external_managed
+            rows.append(row)
+        return rows
 
     def aggregate(self) -> List[dict]:
         """按 symbol 聚合：总览是一个仓位，底层多个 lot 各自跟踪。"""
@@ -2330,6 +2505,8 @@ class OrderManager:
         lot = self._lots.get(lot_id)
         if lot is None:
             return False, f"lot 不存在: {lot_id}"
+        if lot.external_managed:
+            return False, "IBKR 外部批次的实盘操作请在 TWS 完成"
         async with self._operations.run(lot_id, OperationKind.STOP, lock=self._lot_lock(lot)) as decision:
             if not decision.allowed:
                 return False, decision.reason
@@ -2343,6 +2520,8 @@ class OrderManager:
         if lot is None:
             return {"ok": False, "action": "missing", "detail": "订单不存在"}
         result = {"ok": True, "action": "waiting"}
+        if lot.external_managed:
+            return {"ok": False, "action": "external", "detail": "IBKR 外部批次的实盘操作请在 TWS 完成"}
         async with self._operations.run(lot_id, OperationKind.STOP, lock=self._lot_lock(lot)) as decision:
             if not decision.allowed:
                 return {"ok": False, "action": "blocked", "detail": decision.reason}
@@ -2450,6 +2629,8 @@ class OrderManager:
         lot = self._lots.get(lot_id)
         if lot is None:
             return False, f"lot 不存在: {lot_id}"
+        if lot.external_managed:
+            return False, "IBKR 外部批次的实盘操作请在 TWS 完成"
         async with self._operations.run(lot_id, OperationKind.STOP, lock=self._lot_lock(lot)) as decision:
             if not decision.allowed:
                 return False, decision.reason
@@ -2525,6 +2706,8 @@ class OrderManager:
         lot = self._lots.get(lot_id)
         if lot is None:
             return False, f"lot 不存在: {lot_id}"
+        if lot.external_managed:
+            return False, "IBKR 外部批次的实盘操作请在 TWS 完成"
         async with self._operations.run(lot_id, OperationKind.CANCEL, lock=self._lot_lock(lot)) as decision:
             if not decision.allowed:
                 return False, decision.reason
@@ -2700,5 +2883,5 @@ class OrderManager:
                 "schema_version": self._store.SCHEMA, "revision": self._store.revision,
                 "phase": self._reconcile_phase, "checked_at": self._reconciled_at,
                 "error": self._reconcile_error, "export_error": self._store.export_error,
-                "blocks_entry": bool(issues), "issues": issues,
+                "blocks_entry": any(issue["kind"] != "external_adoption" for issue in issues), "issues": issues,
                 "position_differences": self._position_differences}

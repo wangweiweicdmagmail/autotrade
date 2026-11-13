@@ -1,6 +1,7 @@
 """Explicit composition root. Tests pass temporary paths; import does not read production state."""
 
 from console.services.night_test import NightTestService
+from console.services.tv_paper_sync import TvPaperSync, configured_paper_account
 from console.services.strategy_shadow import StrategyShadow
 from console.services.auto import AutoService
 from engine.backtest_session import BacktestSession
@@ -66,6 +67,7 @@ class ConsoleServices:
         self.paths = paths or RuntimePaths()
         self.tasks = TaskRegistry()
         self.night_test = NightTestService(self.paths.data_dir, self.tasks)
+        self.tv_paper_sync = TvPaperSync(self, configured_paper_account(self.paths.data_dir))
         self.app = None
         self.execution_writer_acquired = False
         self.config = config
@@ -141,6 +143,7 @@ class ConsoleServices:
             self.risk_gate,
             state_path=self.paths.data_dir / "lots_state.json",
         )
+        self.order_mgr.external_adoption_enabled = True
         self.snapshot._ws_clients: Set[WebSocket] = set()
         self.snapshot._broadcast_task: Optional[asyncio.Task] = None
         self.monitoring._eod_task: Optional[asyncio.Task] = None

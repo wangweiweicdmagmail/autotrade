@@ -71,6 +71,7 @@ class SnapshotService:
                 "bar_update_delay": self.context.collector.bar_update_delay,
                 "tv_study": self.context.collector.study_health(),
                 "tv_view": self.context.desktop._tv_view_info,
+                "tv_paper_sync": self.context.tv_paper_sync.status(),
             },
             "market": {
                 symbol: {key: value for key, value in data.items() if key != "opening_breakout_history"}

@@ -376,6 +376,9 @@ def test_managed_follow_uses_actual_fills_and_reduces_to_target(tmp_path):
     async def scenario():
         await follower.startup()
         await follower.process_snapshot(snap([]))
+        external = lot("external", "ACTIVE", qty=10, filled=10, avg=100, stop=99)
+        await follower.process_snapshot(snap([dict(external, external_managed=True)]))
+        assert not manager.list_lots()
         await follower.process_snapshot(snap([
             lot("a", "ACTIVE", qty=40, filled=10, avg=100, stop=99),
         ]))

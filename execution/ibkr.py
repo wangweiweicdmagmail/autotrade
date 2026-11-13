@@ -107,6 +107,7 @@ class IBKRGateway:
         self.on_order_audit = None
         self.ib = None          # ib_async.IB，connect 后可用
         self._connected = False
+        self.connected_at = 0.0
         self.ibkr_time = 0.0                # IBKR 服务器时间戳（心跳探测时更新）
         self._heartbeat_task = None          # 心跳监控任务
         self.auto_reconnect = True           # 断线后自动重连
@@ -169,6 +170,7 @@ class IBKRGateway:
             await self.ib.connectAsync(
                 self.host, self.port, clientId=self.client_id,
                 timeout=timeout, account=self.account_id)
+            self.connected_at = time.time()
             self._connected = True
             accounts = self.ib.managedAccounts()
             logger.info("IBKR 已连接: %s:%d clientId=%d 账户=%s (执行=%s)",
@@ -1394,14 +1396,14 @@ class IBKRGateway:
         return {oid: (int(shares), round(amt / shares, 4))
                 for oid, (shares, amt) in out.items() if shares > 0}
 
-    async def fa_accounts(self) -> List[str]:
+    async def fa_accounts(self, *, confirmed_only=False) -> List[str]:
         """
         FA 账户组（self.fa_group）的成员账户列表。运行时从 TWS 的
         FA Groups 配置动态查询（requestFA, type=1）；查询失败回退
         config.IBKR_FA_ACCOUNTS。资金/盈亏/持仓/对账均只针对这组。
         """
         if not self._connected:
-            return list(config.IBKR_FA_ACCOUNTS)
+            return [] if confirmed_only else list(config.IBKR_FA_ACCOUNTS)
         try:
             xml = await asyncio.wait_for(self.ib.requestFAAsync(1), timeout=8)
             root = ET.fromstring(xml)
@@ -1417,9 +1419,31 @@ class IBKRGateway:
                                         self.fa_group, accts)
                         return accts
         except Exception as e:
-            logger.warning("动态查询 FA 组 %s 失败，回退 config: %s",
+            logger.warning("动态查询 FA 组 %s 失败: %s",
                            self.fa_group, e)
-        return list(config.IBKR_FA_ACCOUNTS)
+        return [] if confirmed_only else list(config.IBKR_FA_ACCOUNTS)
+
+    async def external_adoption_snapshot(self, tickers):
+        """Read positions by account plus broker executions, without binding orders."""
+        if not self._connected:
+            return None
+        ib = self.ib
+        try:
+            accounts = set(await self.fa_accounts(confirmed_only=True))
+            if not accounts or not self._connected or self.ib is not ib:
+                return None
+            if not tickers:
+                return [], [], [], accounts
+            fills = await asyncio.wait_for(ib.reqExecutionsAsync(ExecutionFilter()), timeout=10)
+            active_orders = await asyncio.wait_for(ib.reqAllOpenOrdersAsync(), timeout=10)
+            positions = [p for p in ib.positions() if p.account in accounts
+                         and p.contract.secType == "STK" and p.position
+                         and p.contract.symbol.upper() in tickers]
+            if self._connected and self.ib is ib:
+                return positions, fills, active_orders, accounts
+        except Exception:
+            logger.exception("IBKR 外部仓位接管快照不可用")
+        return None
 
     async def positions(self) -> Optional[Dict[str, float]]:
         """FA 组成员账户的股票持仓按 symbol 聚合。

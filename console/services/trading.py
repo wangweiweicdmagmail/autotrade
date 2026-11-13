@@ -432,6 +432,11 @@ class TradingService:
 
     async def api_trade_history(self, *, symbol=None, before=None, limit=100) -> list:
         records = await asyncio.to_thread(self.context.order_mgr._store.archive_records)
+        for row in records:
+            row.pop("external_account", None)
+            row.pop("external_allocations", None)
+            row.pop("external_remaining", None)
+            row.pop("external_exit_fills", None)
         if symbol:
             requested = symbol.upper()
             records = [

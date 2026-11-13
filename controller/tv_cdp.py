@@ -148,13 +148,18 @@ class TradingViewCDPController:
         self._msg_id = 0
         self._pending: Dict[int, asyncio.Future] = {}
         self._reader_task: Optional[asyncio.Task] = None
+        self.binding_events = asyncio.Queue(maxsize=1)
 
     # ------------------------------------------------------------------
     # 连接生命周期
     # ------------------------------------------------------------------
 
     async def __aenter__(self) -> "TradingViewCDPController":
-        await self.connect()
+        try:
+            await self.connect()
+        except BaseException:
+            await self.close()
+            raise
         return self
 
     async def __aexit__(self, *exc) -> None:
@@ -162,7 +167,7 @@ class TradingViewCDPController:
 
     async def connect(self) -> None:
         """发现 TradingView 图表页 target 并建立 CDP WebSocket 会话。"""
-        ws_url = self._find_tv_ws_url()
+        ws_url = await asyncio.to_thread(self._find_tv_ws_url)
         logger.info("连接 CDP target: %s", ws_url[:80])
         self._ws = await websockets.connect(ws_url, max_size=16 * 1024 * 1024)
         self._reader_task = asyncio.create_task(self._reader_loop())
@@ -210,10 +215,13 @@ class TradingViewCDPController:
         msg_id = self._msg_id
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[msg_id] = fut
-        await self._ws.send(json.dumps({
-            "id": msg_id, "method": method, "params": params or {},
-        }))
-        reply = await asyncio.wait_for(fut, timeout=config.CDP_TIMEOUT)
+        try:
+            await self._ws.send(json.dumps({
+                "id": msg_id, "method": method, "params": params or {},
+            }))
+            reply = await asyncio.wait_for(fut, timeout=config.CDP_TIMEOUT)
+        finally:
+            self._pending.pop(msg_id, None)
         if "error" in reply:
             raise RuntimeError(f"CDP {method} 失败: {reply['error']}")
         return reply.get("result", {})
@@ -223,8 +231,13 @@ class TradingViewCDPController:
             async for raw in self._ws:
                 msg = json.loads(raw)
                 msg_id = msg.get("id")
-                if msg_id in self._pending:
-                    self._pending.pop(msg_id).set_result(msg)
+                fut = self._pending.pop(msg_id, None)
+                if fut is not None and not fut.done():
+                    fut.set_result(msg)
+                if msg.get("method") == "Runtime.bindingCalled":
+                    params = msg.get("params", {})
+                    if params.get("name") == "__autotradePaperChanged" and not self.binding_events.full():
+                        self.binding_events.put_nowait(None)
         except (asyncio.CancelledError, websockets.ConnectionClosed):
             pass
 

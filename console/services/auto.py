@@ -278,6 +278,8 @@ class AutoService:
         )
         if lot is None:
             raise AutoServiceError(404, "未找到该股票的 ACTIVE 手动仓")
+        if lot.get("external_managed"):
+            raise AutoServiceError(409, "IBKR 外部批次在 TWS 管理")
         if any(
             lot_id in row["lot_ids"]
             for other in self.engines()
