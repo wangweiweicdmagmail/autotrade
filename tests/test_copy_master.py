@@ -269,3 +269,27 @@ def test_snapshot_copy_section(app, tmp_path, monkeypatch):
         assert row2["process_alive"] is False
 
     run(go())
+
+
+def test_copy_socket_requires_token_and_returns_copy_frame(app, monkeypatch):
+    from starlette.websockets import WebSocketDisconnect
+
+    token = "a" * 64
+    client = TestClient(app.app)
+    async def snapshot():
+        return {"type": "snapshot", "ts": 1, "lots": [],
+                "status": {"dry_run": False, "equity": 100}, "logs": ["private"]}
+
+    monkeypatch.setattr(app.snapshot, "build_snapshot", snapshot)
+    monkeypatch.delenv("COPY_CHANNEL_TOKEN", raising=False)
+    with pytest.raises(WebSocketDisconnect), client.websocket_connect("/ws/copy"):
+        pass
+    monkeypatch.setenv("COPY_CHANNEL_TOKEN", token)
+    with pytest.raises(WebSocketDisconnect), client.websocket_connect(
+            "/ws/copy", headers={"Authorization": "Bearer invalid"}):
+        pass
+    with client.websocket_connect("/ws/copy", headers={"Authorization": f"Bearer {token}"}) as ws:
+        assert ws.receive_json() == {"type": "snapshot", "ts": 1, "lots": [],
+                                     "status": {"dry_run": False, "equity": 100}}
+    with client.websocket_connect("/ws") as ws:
+        assert ws.receive_json()["logs"] == ["private"]

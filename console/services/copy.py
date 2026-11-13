@@ -5,6 +5,7 @@ from typing import Optional
 from pathlib import Path
 import asyncio
 import config
+from execution.copy_channel import copy_channel_url
 import json
 import os
 import time
@@ -248,8 +249,10 @@ class CopyService:
             return "size_multiplier 必须为正"
         if float(cfg.get("max_drawdown_pct") or 0) <= 0:
             return "max_drawdown_pct 必须为正"
-        if not str(cfg.get("master_ws") or "").startswith(("ws://", "wss://")):
-            return "master_ws 必须是 ws:// 或 wss:// 地址"
+        try:
+            copy_channel_url(str(cfg.get("master_ws") or ""))
+        except ValueError as error:
+            return str(error)
         cid = int(cfg.get("client_id") or 0)
         if cid <= 0:
             return "client_id 必须为正"

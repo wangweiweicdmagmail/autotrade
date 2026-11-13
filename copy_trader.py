@@ -5,7 +5,7 @@
 =========================
 
 follower 是 master 控制台（默认 127.0.0.1:8000）的「纯执行影子」：
-消费 master `/ws` 每秒快照，把 master 的 lot 生命周期镜像到本服务器的
+消费 master `/ws/copy` 每秒快照，把 master 的 lot 生命周期镜像到本服务器的
 IBKR 账户。每个 IBKR 服务器一个独立进程：
 
     python3 copy_trader.py --name A            # 读 logs/copy_servers.json 中 name==A
@@ -46,6 +46,7 @@ import math
 import os
 import sys
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -53,6 +54,7 @@ from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 import config
+from execution.copy_channel import copy_channel_token, copy_channel_url
 from execution.ibkr import IBKRGateway
 from execution.order_lot import OrderManager
 from execution.risk import RiskConfig, RiskGate
@@ -137,7 +139,7 @@ class CopyFollower:
         self._last_snapshot = 0.0
         self._next_reconcile = 0.0
         self._recovery_block = ""
-        self._last_submit = {}
+        self._entry_blocks = {}
         self._managed_ready = False
         self._simulation = bool(dry_run)
         self.gateway.disconnect_callback = self._on_ibkr_disconnect
@@ -193,6 +195,11 @@ class CopyFollower:
             self.baseline_equity = float(risk.get("baseline_equity", 0))
             self.baseline_date = str(risk.get("baseline_date", ""))
             self.skip = set(payload.get("skip", []))
+            blocks = payload.get("entry_blocks", {})
+            if not isinstance(blocks, dict) or any(not isinstance(value, str) or not (value == "rejected" or value.startswith("unknown:"))
+                                                   for value in blocks.values()):
+                raise ValueError("跟单入场状态格式无效")
+            self._entry_blocks = blocks
             if isinstance(m, dict):
                 self.map = m
                 logger.info("映射已加载: %d 条 (%s)", len(self.map), self.map_path)
@@ -207,7 +214,7 @@ class CopyFollower:
         if self._recovery_block:
             return
         _atomic_write_json(self.map_path, {
-            "map": self.map, "skip": sorted(self.skip),
+            "map": self.map, "skip": sorted(self.skip), "entry_blocks": self._entry_blocks,
             "binding": self._binding(),
             "risk": {"halted": self.halted, "baseline_equity": self.baseline_equity,
                      "baseline_date": self.baseline_date},
@@ -411,7 +418,7 @@ class CopyFollower:
 
     async def process_snapshot(self, snap: dict) -> None:
         """处理一帧 master /ws 快照。"""
-        if snap.get("type") not in (None, "snapshot"):
+        if not isinstance(snap, dict) or snap.get("type") not in (None, "snapshot"):
             return
         if self._managed:
             async with self._copy_lock:
@@ -542,6 +549,20 @@ class CopyFollower:
             state = lot.get("state")
             self._seen[mid] = state
             rows = groups.get(mid, [])
+            block = self._entry_blocks.get(mid, "")
+            if block.startswith("unknown:"):
+                attempt = block.partition(":")[2]
+                match = [row for row in rows if (row.get("signal_snapshot") or {}).get("copy_attempt_id") == attempt]
+                if len(match) == 1 and not match[0].get("entry_submission_pending"):
+                    state_after_reconcile = match[0]["state"]
+                    if state_after_reconcile in ("FAILED", "CANCELLED"):
+                        self._entry_blocks[mid] = "rejected"
+                        self._record_failure(mid, "entry", match[0].get("note") or "券商确认订单未成交")
+                        self._map_dirty = True
+                    elif state_after_reconcile == "ACTIVE":
+                        self._entry_blocks.pop(mid)
+                        self._clear_failures(mid, "entry")
+                        self._map_dirty = True
             if not rows and (lot.get("external_managed") or mid in self.map or mid in self.skip):
                 continue
             if not rows and self._first_snapshot and not self.cfg.get("copy_existing_on_start"):
@@ -624,9 +645,8 @@ class CopyFollower:
             return  # Do not refill after cancellation, stop execution or manual intervention.
         if self.order_manager.recovery_status()["blocks_entry"]:
             return
-        if time.time() < self._last_submit.get(mid, 0):
+        if mid in self._entry_blocks:
             return
-        self._last_submit[mid] = time.time() + 5
         symbol, side = master.get("symbol"), master.get("side")
         avg = float(master.get("avg_fill") or 0)
         if not symbol or side not in ("long", "short") or not all(
@@ -645,16 +665,34 @@ class CopyFollower:
             return
         if not rows:
             ratio = qty / actual
-        placed, error = await self.order_manager.place_limit_stop_lot(
-            symbol, side, qty, limit, stop, limit_type="copy", entry_order_type="LMT",
-            trader=f"copy:{self.name}",
-            signal_snapshot={"copy_master_lot_id": mid, "copy_size_ratio": ratio},
-        )
+        attempt = uuid.uuid4().hex
+        self._entry_blocks[mid] = f"unknown:{attempt}"
+        self._save_map()
+        try:
+            placed, error = await self.order_manager.place_limit_stop_lot(
+                symbol, side, qty, limit, stop, limit_type="copy", entry_order_type="LMT",
+                trader=f"copy:{self.name}",
+                signal_snapshot={"copy_master_lot_id": mid, "copy_size_ratio": ratio,
+                                 "copy_attempt_id": attempt},
+            )
+        except Exception:
+            self._next_reconcile = 0
+            self._record_failure(mid, "entry", "券商受理结果未知，等待对账")
+            logger.exception("跟单入场结果未知 %s", mid)
+            return
         if placed is None:
+            if any((row.get("signal_snapshot") or {}).get("copy_attempt_id") == attempt
+                   for row in self._managed_groups().get(mid, [])):
+                self._next_reconcile = 0
+                self._record_failure(mid, "entry", "券商订单待对账")
+                return
+            self._entry_blocks[mid] = "rejected"
             self._record_failure(mid, "entry", error)
         else:
+            self._entry_blocks.pop(mid)
             self._clear_failures(mid, "entry")
             self.synced += 1
+        self._save_map()
 
     def _managed_status(self):
         orders = []
@@ -678,6 +716,7 @@ class CopyFollower:
             "failed": sum(not row.get("dismissed") for row in self.failures),
             "last_sync_ts": self.last_sync_ts, "drawdown_pct": self.drawdown_pct,
             "halted": self.halted, "orders": orders, "failures": self.failures,
+            "entry_blocks": {mid: state.partition(":")[0] for mid, state in self._entry_blocks.items()},
             "recovery": recovery, "last_error": self._recovery_block or (
                 "跟单账户尚未完成对账或持仓存在差异" if not self._managed_ready else
                 "跟单订单待核对，暂停新入场" if recovery["blocks_entry"] else self.last_error
@@ -721,18 +760,25 @@ class CopyFollower:
                         side=side, error=err)
             return "fatal"
         limit = self._entry_limit(side, avg_fill)
+        if mid in self._entry_blocks:
+            return "fatal"
+        self._entry_blocks[mid] = "unknown:legacy"
+        self._save_map()
         try:
             res = await self.gateway.place_limit_with_stop(
                 symbol, side, qty, limit, stop_px)
         except Exception as e:
             logger.exception("入场下单异常 %s", symbol)
             self.last_error = f"entry {symbol}: {e}"
-            return "retry"
+            self._record_failure(mid, "entry", "券商受理结果未知，等待人工对账")
+            return "fatal"
         if not res.get("ok"):
             err = res.get("error") or f"status={res.get('status')}"
             logger.warning("入场失败 %s %s: %s", symbol, mid, err)
             self.last_error = f"entry {symbol}: {err}"
-            return "retry"
+            self._record_failure(mid, "entry", err)
+            return "fatal"
+        self._entry_blocks.pop(mid)
         entry_id = res.get("entry_order_id")
         stop_id = res.get("stop_order_id")
         self.map[mid] = {
@@ -1014,6 +1060,10 @@ class CopyFollower:
         for mid in data.get("retry") or []:
             if self._managed:
                 self._next_reconcile = 0.0
+                if self._entry_blocks.get(mid) == "rejected":
+                    self._entry_blocks.pop(mid)
+                    self._clear_failures(mid, "entry")
+                    self._map_dirty = True
                 continue
             self._clear_failures(mid)
             rec = self.map.get(mid)
@@ -1129,12 +1179,22 @@ class CopyFollower:
         注意用 legacy 客户端实现：websockets 16 的新 asyncio 客户端在本环境
         （Python 3.11 + uvicorn）握手会被 EOF（实测连最小 uvicorn ws 也失败），
         legacy 实现稳定可用。"""
-        from websockets.legacy.client import connect as ws_connect
-        url = self.cfg.get("master_ws", "ws://127.0.0.1:8000/ws")
+        from websockets.exceptions import SecurityError
+        from websockets.legacy.client import Connect
+
+        class CopyConnect(Connect):
+            def handle_redirect(self, uri):
+                raise SecurityError("跟单通道不接受重定向")
+
         backoff = 1.0
         while not self._exit:
             try:
-                async with ws_connect(url, ping_interval=20,
+                url = copy_channel_url(self.cfg.get("master_ws", "ws://127.0.0.1:8000/ws"))
+                token = copy_channel_token()
+                if not token:
+                    raise RuntimeError("缺少有效的 COPY_CHANNEL_TOKEN")
+                async with CopyConnect(url, extra_headers={"Authorization": f"Bearer {token}"},
+                                      ping_interval=20,
                                       ping_timeout=10,
                                       max_size=16 * 1024 * 1024) as ws:
                     was_reconnect = backoff > 1.0 or self.last_sync_ts > 0

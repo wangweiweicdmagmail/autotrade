@@ -438,3 +438,44 @@ def test_managed_disconnect_keeps_real_position_and_pending_order(tmp_path):
     assert not run(manager.cancel_lot("pending"))[0]
     assert (active.state, active.filled_qty, pending.state) == ("ACTIVE", 10, "PENDING")
     assert not gw.calls
+
+
+@pytest.mark.parametrize("unknown", [False, True])
+def test_managed_entry_failure_stays_blocked_across_restart(tmp_path, unknown):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    legacy, gw = make_follower(tmp_path, {"size_mode": "multiplier", "size_multiplier": 1.0})
+    gw.enabled = False
+    place = AsyncMock(side_effect=TimeoutError if unknown else None,
+                      return_value=(None, "明确拒单"))
+    manager = SimpleNamespace(list_lots=lambda **_: [], place_limit_stop_lot=place,
+                              recovery_status=lambda: {"blocks_entry": False})
+
+    def start():
+        follower = CopyFollower("failure", legacy.cfg, dry_run=True, logs_dir=tmp_path,
+                                gateway=gw, order_manager=manager)
+        follower._load_map()
+        follower._managed_ready = True
+        follower.equity = 100000
+        follower._first_snapshot = False
+        return follower
+
+    async def scenario():
+        master = lot("blocked", "ACTIVE", qty=10, filled=10, avg=100, stop=99)
+        follower = start()
+        await follower.process_snapshot(snap([master]))
+        follower = start()
+        await follower.process_snapshot(snap([master]))
+        assert place.await_count == 1
+        if unknown:
+            follower.cmd_path.write_text(json.dumps({"retry": ["blocked"]}))
+            await follower._process_cmd()
+            await follower.process_snapshot(snap([master]))
+            assert place.await_count == 1
+            assert follower._entry_blocks["blocked"].startswith("unknown:")
+            assert follower._next_reconcile == 0.0
+        else:
+            assert follower._entry_blocks["blocked"] == "rejected"
+
+    run(scenario())

@@ -16,3 +16,8 @@ async def api_status(*, services=Depends(get_services)) -> dict:
 @router.websocket("/ws")
 async def ws_endpoint(ws: WebSocket, *, services=Depends(get_services)) -> None:
     return await services.snapshot.ws_endpoint(ws=ws)
+
+
+@router.websocket("/ws/copy")
+async def ws_copy_endpoint(ws: WebSocket, *, services=Depends(get_services)) -> None:
+    await services.snapshot.ws_copy_endpoint(ws)

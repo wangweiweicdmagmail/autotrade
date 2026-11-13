@@ -1,11 +1,14 @@
 """snapshot application functions and owned state. No console.app dependency."""
 
-from fastapi import WebSocket
-from fastapi import WebSocketDisconnect
 import asyncio
-import config
 import time
+from hmac import compare_digest
+
+from fastapi import WebSocket, WebSocketDisconnect
+
+import config
 from console.shared import logger
+from execution.copy_channel import copy_channel_token
 
 
 class SnapshotService:
@@ -149,7 +152,10 @@ class SnapshotService:
                 dead = []
                 for ws in list(self.context.snapshot._ws_clients):
                     try:
-                        await ws.send_json(snapshot)
+                        if ws.url.path == "/ws/copy":
+                            await ws.send_json(self._copy_frame(snapshot))
+                        else:
+                            await ws.send_json(snapshot)
                     except Exception:
                         dead.append(ws)
                 for ws in dead:
@@ -163,11 +169,26 @@ class SnapshotService:
     async def api_status(self) -> dict:
         return (await self.context.snapshot.build_snapshot())["status"]
 
-    async def ws_endpoint(self, ws: WebSocket) -> None:
+    @staticmethod
+    def _copy_frame(snapshot):
+        status = snapshot["status"]
+        return {"type": "snapshot", "ts": snapshot["ts"], "lots": snapshot["lots"],
+                "status": {"equity": status.get("equity"), "dry_run": status.get("dry_run")}}
+
+    async def ws_copy_endpoint(self, ws: WebSocket) -> None:
+        token = copy_channel_token()
+        supplied = ws.headers.get("authorization", "").encode("utf-8")
+        if not token or not compare_digest(supplied, f"Bearer {token}".encode()):
+            await ws.close(code=1008)
+            return
+        await self.ws_endpoint(ws, copy_only=True)
+
+    async def ws_endpoint(self, ws: WebSocket, *, copy_only=False) -> None:
         await ws.accept()
         self.context.snapshot._ws_clients.add(ws)
         try:
-            await ws.send_json(await self.context.snapshot.build_snapshot())
+            snapshot = await self.context.snapshot.build_snapshot()
+            await ws.send_json(self._copy_frame(snapshot) if copy_only else snapshot)
             while True:
                 await ws.receive_text()
         except WebSocketDisconnect:
