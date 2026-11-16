@@ -30,7 +30,14 @@ sleep 1
 
 echo "== [3/4] 实盘启动 =="
 echo "=== restart $(date) LIVE (restart_live.sh) ===" >> "$LOG"
-EXECUTION_ENABLED=1 nohup python3 -m uvicorn console.app:app --host 0.0.0.0 --port 8000 >> "$LOG" 2>&1 &
+guard_fa_default=1
+if [[ -n "${EXTERNAL_MANUAL_GUARD_TEST_ACCOUNT:-}" ]]; then
+  guard_fa_default=0
+fi
+EXECUTION_ENABLED=1 \
+EXTERNAL_MANUAL_GUARD_ENABLED="${EXTERNAL_MANUAL_GUARD_ENABLED:-1}" \
+EXTERNAL_MANUAL_GUARD_FA_SCOPE="${EXTERNAL_MANUAL_GUARD_FA_SCOPE:-$guard_fa_default}" \
+nohup python3 -m uvicorn console.app:app --host 0.0.0.0 --port 8000 >> "$LOG" 2>&1 &
 echo "  已启动 pid $!（日志 ${LOG}）"
 
 echo "== [4/4] 就绪验证 =="

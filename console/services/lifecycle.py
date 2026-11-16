@@ -256,6 +256,12 @@ class LifecycleService:
         ):
             if t:
                 t.cancel()
+        external = getattr(self.context, "external_guard_gateway", None)
+        if external is not None and external is not self.context.gateway:
+            task = self.context.monitoring._external_cleanup_task
+            if task:
+                await asyncio.gather(task, return_exceptions=True)
+            await external.disconnect()
         for stop in (
             self.context.night_test.disconnect,
             self.context.copy_supervisor.stop_all,

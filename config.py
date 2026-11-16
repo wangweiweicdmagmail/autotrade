@@ -281,6 +281,10 @@ FVG_REVERSE_AUTO_CLOSE = False   # 保留兼容标识；当前反向FVG守卫始
 # 外部订单/持仓处理：1=自动撤挂单+市价平残余持仓（默认，2026-10-23 用户恢复：
 # 非 autotrade 工具下单的仓位立即市价平仓）；0=告警模式（只检测+弹框提醒不动作）
 EXTERNAL_ORDER_CLEANUP_ENABLED = _os.environ.get("EXTERNAL_ORDER_CLEANUP_ENABLED", "1") == "1"
+# Opt in after verifying TWS client 0 and FA-member execution in isolation.
+EXTERNAL_MANUAL_GUARD_ENABLED = _os.environ.get("EXTERNAL_MANUAL_GUARD_ENABLED", "0") == "1"
+EXTERNAL_MANUAL_GUARD_TEST_ACCOUNT = _os.environ.get("EXTERNAL_MANUAL_GUARD_TEST_ACCOUNT", "").strip()
+EXTERNAL_MANUAL_GUARD_FA_SCOPE = _os.environ.get("EXTERNAL_MANUAL_GUARD_FA_SCOPE", "0") == "1"
 
 # 全自动策略：单引擎并行实例上限（理论无上限，实际最多 5 个）
 AUTO_MAX_INSTANCES = 5
@@ -303,6 +307,11 @@ TV_DEFAULT_SESSION_SYMBOLS = ("BLACKBULL:WTI", "CAPITALCOM:NAS100", "CAPITALCOM:
 
 
 def validate_config() -> None:
+    if EXTERNAL_MANUAL_GUARD_ENABLED:
+        if IBKR_CLIENT_ID == 0:
+            raise RuntimeError("clientId=0 保留给 TWS 外部手动单绑定和撤单")
+        if EXTERNAL_MANUAL_GUARD_FA_SCOPE == bool(EXTERNAL_MANUAL_GUARD_TEST_ACCOUNT):
+            raise RuntimeError("外部手动单处理需明确选择 FA 组范围或指定测试账户")
     if TV_MARKET_SESSION not in ("24h", "extended"):
         raise RuntimeError("TV_MARKET_SESSION 必须为 24h 或 extended")
     required = (

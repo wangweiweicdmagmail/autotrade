@@ -20,6 +20,9 @@ class SnapshotService:
         open_symbols = len(
             {l["symbol"] for l in self.context.order_mgr.list_lots(active_only=True)}
         )
+        external = getattr(self.context, "external_guard_gateway", None)
+        verified_accounts = (external._guard_verified_accounts if external and external._connected
+                             and external._guard_verified_connection is not None else ())
         return {
             "type": "snapshot",
             "ts": time.time(),
@@ -32,6 +35,15 @@ class SnapshotService:
                     "fa_group": getattr(self.context.gateway, "fa_group", None),
                 },
                 "dry_run": not bool(self.context.gateway.enabled),
+                "external_order_guard": {
+                    "enabled": external is not None,
+                    "connected": bool(external and external._connected),
+                    "client_id": external.client_id if external else None,
+                    "submit_client_id": self.context.gateway.client_id if external else None,
+                    "fa_group": external.fa_group if external else None,
+                    "confirmed_member_count": len(verified_accounts),
+                    "member_suffixes": sorted(account[-4:] for account in verified_accounts),
+                },
                 "equity": status["equity"],
                 "daily_pnl": status["daily_pnl"],
                 "halted": self.context.risk_gate.is_halted(),

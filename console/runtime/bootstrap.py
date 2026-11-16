@@ -127,6 +127,13 @@ class ConsoleServices:
         self.copy._COPY_CLIENT_ID_RESERVED = (2, 3, 12, 46)
         self.copy_supervisor: CopySupervisor = CopySupervisor(self)
         self.gateway: IBKRGateway = IBKRGateway.from_config()
+        self.external_guard_gateway = None
+        if self.gateway.enabled and config.EXTERNAL_MANUAL_GUARD_ENABLED:
+            self.external_guard_gateway = IBKRGateway(
+                self.gateway.host, self.gateway.port, 0, self.gateway.account_id,
+                self.gateway.fa_group, enabled=True,
+            )
+            self.external_guard_gateway.external_order_writer = self.gateway
         self.risk_gate: RiskGate = RiskGate(
             RiskConfig(
                 per_trade_pct=config.RISK_PER_TRADE_PCT,
@@ -142,8 +149,9 @@ class ConsoleServices:
             self.gateway,
             self.risk_gate,
             state_path=self.paths.data_dir / "lots_state.json",
+            external_guard_gateway=self.external_guard_gateway,
         )
-        self.order_mgr.external_adoption_enabled = True
+        self.order_mgr.external_adoption_enabled = not config.EXTERNAL_MANUAL_GUARD_ENABLED
         self.snapshot._ws_clients: Set[WebSocket] = set()
         self.snapshot._broadcast_task: Optional[asyncio.Task] = None
         self.monitoring._eod_task: Optional[asyncio.Task] = None

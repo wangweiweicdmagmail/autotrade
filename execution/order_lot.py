@@ -35,6 +35,7 @@ import config
 from engine.opening_breakout import RULES_VERSION, ET, entry_window
 from domain.contracts import finite_number, FillEvent, OrderPlan, OrderState, StopAmendment, OPEN_ORDER_VALUES
 from execution.external_adoption import adoption_candidates
+from execution.external_guard import ExternalEntryGuard
 from execution.state_store import ExecutionStateStore, PersistenceError, RecoveryRequired
 from execution.operations import OperationKind, OrderOperationCoordinator, serialized_placement, placement_received_at
 
@@ -199,7 +200,7 @@ class OrderLot:
 class OrderManager:
     """分批建仓的批次管理器：下单 / 聚合 / 改 STOP / 撤平 / 持久化。"""
 
-    def __init__(self, gateway, risk_gate, state_path: Path = STATE_PATH) -> None:
+    def __init__(self, gateway, risk_gate, state_path: Path = STATE_PATH, *, external_guard_gateway=None) -> None:
         self._operations = OrderOperationCoordinator()
         self._placement_lock = asyncio.Lock()
         self._reconcile_lock = asyncio.Lock()
@@ -222,6 +223,11 @@ class OrderManager:
         self._watchers: Dict[tuple, asyncio.Task] = {}  # (lot_id, kind) -> watcher 任务
         self._revive_done: set = set()      # 已复活过的 lot（每 lot 只复活一次）
         self.external_adoption_enabled = False
+        self._external_entry_guard = ExternalEntryGuard(
+            external_guard_gateway if external_guard_gateway is not None else gateway,
+            self._state_path.with_name("external_entry_guard.sqlite3"),
+            test_account=config.EXTERNAL_MANUAL_GUARD_TEST_ACCOUNT or None,
+        )
         self.on_lot_closed = None      # 平仓回调 fn(lot_dict)，由上层（console）注入
         self.on_lot_revived = None     # 对账复活回调 fn(lot_dict)，由上层（console）注入
         self.on_entry_stage = None
@@ -1830,6 +1836,19 @@ class OrderManager:
                 self._reconcile_phase = "unavailable"
                 self._reconcile_error = str(error) or type(error).__name__
                 raise
+
+    async def enforce_external_entry_policy(self, *, allow_market):
+        async with self._placement_lock:
+            if self._storage_error or self._needs_storage_recovery:
+                logger.warning("执行账本未确认，跳过外部交易处理")
+                return
+            internal = [lot for lot in self._lots.values() if not lot.external_managed]
+            owned = {oid for lot in internal for oid in self.legacy_order_ids(lot)}
+            managed = {
+                lot.symbol.split(":")[-1].upper() for lot in internal
+                if lot.state in _OPEN_STATES or lot.entry_submission_pending
+            }
+            await self._external_entry_guard.run(owned, managed, allow_market=allow_market)
 
     async def _reconcile_external_positions(self, broker_pos):
         tracked = [lot for lot in self._lots.values()

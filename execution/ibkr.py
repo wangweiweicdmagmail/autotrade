@@ -32,7 +32,12 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
+import math
 import config
+from execution.external_guard import (
+    GuardPreflightChanged, in_test_scope, scoped_order_account,
+    singleton_allocation_fills, unallocated_singleton_positions,
+)
 from ib_async import ExecutionFilter
 
 logger = logging.getLogger(__name__)
@@ -53,6 +58,8 @@ _IBKR_CONTROL_METHODS = (
     "place_midpoint_oca", "place_close", "place_stop_only", "modify_stop",
     "modify_stop_qty", "modify_limit_stop", "modify_limit_stop_qty",
     "modify_midpoint_oca", "convert_entry_to_market", "cancel_order",
+    "cancel_external_bound_order", "submit_external_close", "restore_external_stop",
+    "_place_external_guard_order",
 )
 
 
@@ -119,6 +126,11 @@ class IBKRGateway:
         self._tool_order_id_lock = threading.Lock()
         self._control_allowed = True
         self._active_controls = 0
+        self._open_orders_lock = asyncio.Lock()
+        self._external_snapshot_lock = asyncio.Lock()
+        self._guard_verified_connection = None
+        self._guard_verified_accounts = frozenset()
+        self.external_order_writer = None
 
     def _begin_control(self) -> None:
         if not getattr(self, "_control_allowed", True):
@@ -1258,6 +1270,19 @@ class IBKRGateway:
     # 只读查询
     # ------------------------------------------------------------------
 
+    async def open_orders_snapshot(self):
+        """Fresh TWS open orders. An empty list is authoritative; None is unknown."""
+        async with self._open_orders_lock:
+            ib = self.ib
+            if not self._connected:
+                return None
+            try:
+                orders = await asyncio.wait_for(ib.reqAllOpenOrdersAsync(), timeout=10)
+            except Exception as error:
+                logger.warning("开放订单查询失败: %s", error)
+                return None
+            return orders if self._connected and self.ib is ib else None
+
     async def trade_map(self) -> Optional[Dict[int, object]]:
         """当前可见订单表（orderId -> Trade），供按订单号恢复句柄。
 
@@ -1422,6 +1447,171 @@ class IBKRGateway:
             logger.warning("动态查询 FA 组 %s 失败: %s",
                            self.fa_group, e)
         return [] if confirmed_only else list(config.IBKR_FA_ACCOUNTS)
+
+    async def external_guard_snapshot(self):
+        """Confirm FA membership and check open orders around the position read."""
+        self._guard_verified_connection = None
+        self._guard_verified_accounts = frozenset()
+        account = config.EXTERNAL_MANUAL_GUARD_TEST_ACCOUNT
+        if (not self.enabled or not self._connected or self.client_id != 0
+                or (not account and not config.EXTERNAL_MANUAL_GUARD_FA_SCOPE)):
+            return None
+        async with self._external_snapshot_lock:
+            ib = self.ib
+            try:
+                accounts = set(await self.fa_accounts(confirmed_only=True))
+                if (not accounts or (account and account not in accounts)
+                        or not self._connected or self.ib is not ib):
+                    return None
+
+                def signature(orders):
+                    return {
+                        (t.contract.conId, t.order.permId, t.order.orderId, t.order.account,
+                         t.order.faGroup, t.order.action, t.order.totalQuantity,
+                         t.order.orderType, t.order.parentId, t.order.auxPrice,
+                         t.orderStatus.status, t.orderStatus.filled)
+                        for t in orders if (not account or t.contract.symbol == "GOOGL") and not t.isDone()
+                    }
+
+                initial = await self.open_orders_snapshot()
+                if initial is None:
+                    return None
+                initial_orders = signature(initial)
+                fills = await asyncio.wait_for(ib.reqExecutionsAsync(ExecutionFilter()), timeout=10)
+                rows = await asyncio.wait_for(ib.reqPositionsAsync(), timeout=10)
+                pending = unallocated_singleton_positions(rows, fills, accounts)
+                if pending:
+                    try:
+                        completed = await asyncio.wait_for(ib.reqCompletedOrdersAsync(apiOnly=False), timeout=10)
+                        fills = list(fills) + singleton_allocation_fills(
+                            pending, fills, completed, self.fa_group,
+                        )
+                    except Exception:
+                        logger.warning("无法核对 FA 主账户的分配成交", exc_info=True)
+                orders = await self.open_orders_snapshot()
+
+                def test_position(positions):
+                    return sorted(
+                        (p.account, p.contract.conId, p.position) for p in positions
+                        if p.account in accounts and (not account or
+                           (p.account == account and p.contract.symbol == "GOOGL"))
+                        and p.contract.secType == "STK" and p.position
+                    )
+
+                if (orders is not None and self._connected and self.ib is ib
+                        and initial_orders == signature(orders)
+                        and test_position(rows) == test_position(ib.positions())):
+                    self._guard_verified_connection = (ib, account)
+                    self._guard_verified_accounts = frozenset(accounts)
+                    return ([row for row in rows if row.account in accounts
+                             and row.contract.secType == "STK" and row.position],
+                            fills, orders, accounts)
+            except Exception:
+                logger.exception("TWS 外部订单对账快照不可用")
+        return None
+
+    def _guard_write_allowed(self, contract, account, qty):
+        selected = config.EXTERNAL_MANUAL_GUARD_TEST_ACCOUNT
+        return (
+            self.enabled and self._connected and self.client_id == 0
+            and self._guard_verified_connection == (self.ib, selected)
+            and (
+                in_test_scope(contract, account, qty, selected) if selected else
+                config.EXTERNAL_MANUAL_GUARD_FA_SCOPE
+                and account in self._guard_verified_accounts
+                and contract.secType == "STK" and contract.currency == "USD"
+                and contract.conId > 0 and math.isfinite(float(qty)) and float(qty) > 0
+            )
+        )
+
+    def cancel_external_bound_order(self, trade):
+        order = trade.order
+        selected = config.EXTERNAL_MANUAL_GUARD_TEST_ACCOUNT
+        accounts = self._guard_verified_accounts
+        if selected:
+            account = scoped_order_account(order, selected, self.fa_group, accounts)
+        elif order.faGroup:
+            account = next(iter(accounts), None) if order.faGroup == self.fa_group else None
+        else:
+            account = order.account
+        if (not self._guard_write_allowed(trade.contract, account, order.totalQuantity)
+                or order.clientId != 0 or order.orderId >= 0
+                or not any(bound is trade for bound in self.ib.openTrades())):
+            return False
+        return self.cancel_order(trade)
+
+    def _submit_guard_exit(self, position, entry_perm_id, *, stop_price=None, tif="DAY", outside_rth=False):
+        from ib_async import Contract, MarketOrder, StopOrder
+
+        source = position.contract
+        quantity = abs(float(position.position))
+        if not self._guard_write_allowed(source, position.account, quantity):
+            raise GuardPreflightChanged("外部订单写操作超出已确认的 FA 账户范围")
+        current = [row.position for row in self.ib.positions()
+                   if row.account == position.account and row.contract.conId == source.conId
+                   and row.position]
+        if (current != [position.position]
+                or any(trade.contract.conId == source.conId and not trade.isDone()
+                       and (trade.order.faGroup or trade.order.account == position.account
+                            or trade.order.account not in self._guard_verified_accounts)
+                       for trade in self.ib.openTrades())):
+            raise GuardPreflightChanged("外部订单提交前余仓或活动订单已有变化")
+        contract = Contract(conId=source.conId, secType="STK", exchange="SMART",
+                            currency=source.currency)
+        action = "SELL" if position.position > 0 else "BUY"
+        common = dict(tif=tif, account=position.account)
+        if stop_price is None:
+            order = MarketOrder(action, quantity, orderRef=f"external-guard:{entry_perm_id}", **common)
+        else:
+            order = StopOrder(action, quantity, stop_price, outsideRth=outside_rth,
+                              orderRef=f"external-guard-stop:{entry_perm_id}", **common)
+        writer = self.external_order_writer
+        if writer is None:
+            raise GuardPreflightChanged("外部仓位平仓连接未配置")
+        return writer._place_external_guard_order(contract, order)
+
+    def _place_external_guard_order(self, contract, order):
+        if not self.enabled or not self._connected or self.client_id == 0:
+            raise GuardPreflightChanged("非零下单连接未就绪")
+        order.orderId = self._next_tool_order_id()
+        return self.ib.placeOrder(contract, order)
+
+    def submit_external_close(self, position, entry_perm_id):
+        return self._submit_guard_exit(position, entry_perm_id)
+
+    def restore_external_stop(self, position, entry_perm_id, price, tif, outside_rth):
+        return self._submit_guard_exit(
+            position, entry_perm_id, stop_price=price, tif=tif, outside_rth=outside_rth,
+        )
+
+    async def external_close_rejected(self, account, contract_id, entry_perm_id):
+        if not self._connected:
+            return False
+        ib = self.ib
+        ref = f"external-guard:{entry_perm_id}"
+
+        def matched(trade):
+            return (trade.contract.conId == contract_id and trade.order.account == account
+                    and trade.order.orderRef == ref and self.is_tool_order_id(trade.order.orderId))
+
+        trades = list(ib.trades())
+        writer = self.external_order_writer
+        if writer and writer._connected:
+            trades.extend(writer.ib.trades())
+        for trade in trades:
+            if (matched(trade) and trade.orderStatus.status in {"Cancelled", "Inactive", "ApiCancelled"}
+                    and not trade.fills and not trade.orderStatus.filled
+                    and any(item.errorCode == 201 for item in trade.log)):
+                return True
+        try:
+            orders = await asyncio.wait_for(ib.reqCompletedOrdersAsync(apiOnly=False), timeout=10)
+        except Exception:
+            logger.warning("平仓完成订单查询失败 entryPermId=%s", entry_perm_id)
+            return False
+        return self._connected and self.ib is ib and any(
+            matched(trade) and trade.orderStatus.status == "Rejected"
+            and not trade.fills and not trade.orderStatus.filled for trade in orders
+        )
 
     async def external_adoption_snapshot(self, tickers):
         """Read positions by account plus broker executions, without binding orders."""

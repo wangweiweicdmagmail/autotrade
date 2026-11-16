@@ -72,6 +72,15 @@ class MonitoringService:
         stats = {"cancelled": 0, "closed": 0, "pending": 0, "failed": 0, "skipped": 0}
         if not (self.context.gateway.enabled and self.context.gateway._connected):
             return stats
+        if config.EXTERNAL_MANUAL_GUARD_ENABLED:
+            self._external_alerts = []
+            gateway = getattr(self.context, "external_guard_gateway", self.context.gateway)
+            if gateway is None or not gateway._connected:
+                return stats
+            await self.context.order_mgr.enforce_external_entry_policy(
+                allow_market=self.context.system._is_trading_hours()
+            )
+            return stats
         # Broker positions and the lot ledger advance independently. Never
         # turn their difference into an order for a ticker owned by the tool.
         managed_tickers = {
@@ -311,14 +320,20 @@ class MonitoringService:
         return stats
 
     async def _external_cleanup_loop(self) -> None:
-        while True:
-            await asyncio.sleep(30.0)
-            try:
-                await self.context.monitoring._external_cleanup_once()
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.exception("外部订单清理异常: %s", e)
+        gateway = getattr(self.context, "external_guard_gateway", None)
+        if gateway is not None and gateway is not self.context.gateway:
+            if not await gateway.connect():
+                gateway._start_reconnect()
+        try:
+            while True:
+                try:
+                    await self.context.monitoring._external_cleanup_once()
+                except Exception as e:
+                    logger.exception("外部订单清理异常: %s", e)
+                await asyncio.sleep(5.0 if gateway is not None else 30.0)
+        finally:
+            if gateway is not None and gateway is not self.context.gateway:
+                await gateway.disconnect()
 
     async def _position_scan_loop(self) -> None:
         """持仓扫描（每分钟，双向）：持仓方向与 trend_state 确认值（ts_c，上一根
