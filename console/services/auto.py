@@ -1,7 +1,11 @@
 """Pine 模型接入与执行实例管理；不依赖 FastAPI 或 console.app。"""
 
 import math
+import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
+from domain.contracts import PriceObservation, finite_number
 from engine.pine_execution import PineExecutionEngine
 from engine.pine_models import PineModelRegistry
 
@@ -25,12 +29,14 @@ class AutoService:
         default_engine_provider=None,
         watchlist=(),
         default_risk=200,
+        allow_short=True,
         max_instances=5,
         emit=None,
         record_event=None,
     ):
         self.broker = broker
         self.collector = collector
+        self.allow_short = allow_short
         self.order_manager = order_manager
         self.registry = registry or PineModelRegistry.load()
         self.watchlist = watchlist
@@ -124,12 +130,44 @@ class AutoService:
     def instances(self):
         return [row for engine in self.engines() for row in engine.instances()]
 
+    def _candidate(self, model, symbol, data, output):
+        now = time.time()
+        clock = datetime.fromtimestamp(now, ZoneInfo("America/New_York"))
+        if clock.weekday() >= 5 or not 570 <= clock.hour * 60 + clock.minute < 960:
+            raise AutoServiceError(409, "仅在美东常规交易时段启动")
+        try:
+            obs = PriceObservation.from_market(symbol, model.market_bars(data), now)
+        except ValueError as error:
+            raise AutoServiceError(409, str(error)) from error
+        if (obs.time_basis != "collector_observed" or not 0 <= now - obs.observed_at <= 15
+                or not obs.bar_open_time or not obs.bar_open_time <= now < obs.bar_open_time + model.interval_seconds
+                or output.time != obs.bar_open_time):
+            raise AutoServiceError(409, "等待最新的一分钟行情与策略输出")
+        candidate = finite_number((data.get(model.realtime_key) or {}).get(model.startup_candidate_field))
+        vwap = data.get("vwap_1m") or {}
+        if vwap.get("time") != obs.bar_open_time or finite_number(vwap.get("speed")) is None:
+            raise AutoServiceError(409, "等待 EMA7 七分钟速度就绪")
+        if candidate not in (1, -1) or output.entry_price is None or output.entry_price <= 0:
+            raise AutoServiceError(409, "需要 EMA7 位于 VWAP 轨道外，且一分钟 ST 同向")
+        if candidate == -1 and not self.allow_short:
+            raise AutoServiceError(409, "当前配置禁止做空")
+        if output.direction != candidate:
+            raise AutoServiceError(409, "一分钟 ST 方向与 VWAP 回踩方向不一致")
+        if (output.stop_px is None or output.stop_px <= 0
+                or (output.entry_price - output.stop_px) * candidate <= 0):
+            raise AutoServiceError(409, "一分钟 ST 无法提供该方向的有效初始止损")
+        if (obs.price - output.entry_price) * candidate <= 0:
+            raise AutoServiceError(409, "价格已经触及外沿，请等待回到外侧后再启动")
+        return {"entry_price": output.entry_price, "stop_px": output.stop_px}
+
     def start(self, strategy, symbols, params, instance_id="default", *,
-              preview=False, confirmed_directions=None):
+              preview=False, confirmed_directions=None, entry_scope=None):
         try:
             model = self.registry.get(strategy)
         except ValueError as error:
             raise AutoServiceError(400, str(error)) from error
+        if model.startup_candidate_field and not symbols:
+            raise AutoServiceError(400, "请从候选列表选择一个标的")
         symbols = list(
             dict.fromkeys(
                 self.symbol(s) for s in (symbols or self.watchlist) if s.strip()
@@ -142,16 +180,25 @@ class AutoService:
         if not math.isfinite(risk) or risk <= 0:
             raise AutoServiceError(400, "首仓风险预算必须大于 0")
         market = self.collector.latest() or {}
+        outputs = {s: model.from_market(market.get(s) or {}) for s in symbols}
+        candidate = None
+        if model.startup_candidate_field:
+            if len(symbols) != 1 or symbols[0] not in self.watchlist:
+                raise AutoServiceError(400, "每次仅可启动一个股票池内的候选标的")
+            symbol = symbols[0]
+            candidate = self._candidate(model, symbol, market.get(symbol) or {}, outputs[symbol])
         missing = [
-            s for s in symbols if not model.from_market(market.get(s) or {}).entry_price
+            s for s, output in outputs.items()
+            if not (output.entry_price if model.profile.lock_start_direction else output.time)
         ]
         if missing:
             label = "EMA9 v7" if strategy == "ema9_pyramid" else model.name
             raise AutoServiceError(409, label + " 指标未就绪: " + ",".join(missing))
         directions = {
-            s: model.from_market(market.get(s) or {}).direction for s in symbols
+            s: output.direction if model.profile.lock_start_direction else 0
+            for s, output in outputs.items()
         }
-        if any(not direction for direction in directions.values()):
+        if model.profile.lock_start_direction and any(not direction for direction in directions.values()):
             raise AutoServiceError(
                 409,
                 "启动时方向不明确，无法锁定策略方向: "
@@ -160,15 +207,22 @@ class AutoService:
         if preview:
             qqq = "NASDAQ:QQQ"
             qqq_direction = model.from_market(market.get(qqq) or {}).direction
-            checked = {**directions, qqq: qqq_direction}
-            return {"model": model.name, "directions": checked, "symbols": symbols, "risk": risk}
+            checked = {qqq: qqq_direction, **directions}
+            return {"model": model.name, "directions": checked, "symbols": symbols, "risk": risk,
+                    **({"candidate": candidate} if candidate is not None else {}),
+                    **({"follow_signal_direction": True} if not model.profile.lock_start_direction else {})}
         if confirmed_directions is not None:
             # QQQ is informational unless it is itself a selected execution target.
             confirmed_targets = {symbol: confirmed_directions.get(symbol) for symbol in symbols}
             if confirmed_targets != directions:
                 raise AutoServiceError(409, "启动方向尚未确认或已变化，请重新检查并确认")
+        instances = self.instances()
+        if model.startup_candidate_field and any(
+            row["strategy"] == strategy and row["symbol"] in symbols and row["state"] != "DONE" for row in instances
+        ):
+            raise AutoServiceError(409, "该标的已有执行实例，请查看执行监控")
         engine = self.engine(strategy, instance_id)
-        active = sum(row["state"] != "DONE" for row in self.instances())
+        active = sum(row["state"] != "DONE" for row in instances)
         candidates = []
         for symbol in symbols:
             current = engine.get_instance(symbol)
@@ -177,7 +231,12 @@ class AutoService:
             elif active < self.max_instances:
                 candidates.append(symbol)
                 active += 1
-        started = engine.start(candidates, risk, directions)
+        if entry_scope is None:
+            started = engine.start(candidates, risk, directions)
+        else:
+            bar_time, direction = entry_scope
+            started = engine.start(candidates, risk, {s: direction for s in candidates},
+                                   entry_only_bar=bar_time)
         self.enabled = True
         self.strategy_name = strategy
         profile = engine.profile

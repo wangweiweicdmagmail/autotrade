@@ -1,5 +1,6 @@
 # 敏感凭据（TradingView sessionid，切勿提交）
 service/creds.json
+service/tv_market_proxy.local.json
 
 # LLM API key（交易 Agent，切勿提交）
 .env

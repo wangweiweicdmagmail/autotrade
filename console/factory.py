@@ -27,7 +27,6 @@ def create_app(services=None, *, paths=None):
         logging.getLogger("ib_async").setLevel(logging.WARNING)
         try:
             await context.lifecycle.on_startup()
-            await context.desktop._tv_view_startup_check()
             await context.news._news_startup()
             yield
         finally:

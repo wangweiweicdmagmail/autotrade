@@ -4,6 +4,7 @@ from fastapi import Depends
 from typing import List
 from typing import Optional
 from console.schemas import LimitStopOrderRequest, OpeningBreakoutOrderRequest, OpeningBreakoutPrepareRequest, UpdateTrailRequest
+from console.schemas import OpeningVwapPrepareRequest
 from console.dependencies import get_services, require_trader
 from fastapi import APIRouter, Query
 
@@ -64,6 +65,16 @@ async def api_prepare_opening_breakout(
     services=Depends(get_services),
 ) -> dict:
     return services.signals.prepare_opening_breakout(req, trader)
+
+
+@router.post("/api/lots/opening-vwap/prepare")
+async def api_prepare_opening_vwap(
+    req: OpeningVwapPrepareRequest,
+    trader: str = Depends(require_trader),
+    *,
+    services=Depends(get_services),
+) -> dict:
+    return services.opening_vwap.prepare(req, trader)
 
 
 @router.post("/api/lots/{lot_id}/trail")

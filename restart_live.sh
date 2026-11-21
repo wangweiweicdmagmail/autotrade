@@ -4,6 +4,7 @@
 # 流程：TWS 预检 → 杀旧 console/daemon → EXECUTION_ENABLED=1 启动
 #       → 轮询验证（API / TV 数据按股票池就绪 / IBKR 连接）→ 打印结论。
 # 用法：./restart_live.sh
+# 仅检查 Python（不重启）：./restart_live.sh --check-python
 # 退出码：0 = 全部就绪；1 = TV 数据未就绪；2 = IBKR 未连接（可登录 TWS 后等自动重连）
 # -----------------------------------------------
 set -u
@@ -11,6 +12,32 @@ cd "$(dirname "$0")"
 
 API="http://127.0.0.1:8000"
 LOG="logs/console-live.log"
+
+# Resolve and validate the interpreter before stopping a working console.
+# GUI/tool shells may resolve python3 to Homebrew while this project uses Conda.
+PYTHON_BIN="${AUTOTRADE_PYTHON:-}"
+if [[ -n "$PYTHON_BIN" ]]; then
+  if ! "$PYTHON_BIN" -c 'import uvicorn, fastapi, ib_async, websockets' >/dev/null 2>&1; then
+    echo "错误：AUTOTRADE_PYTHON 缺少项目依赖；未停止控制台。"
+    exit 1
+  fi
+else
+  for candidate in "$PWD/.venv/bin/python" python3.11 /opt/anaconda3/bin/python3.11 python3; do
+    if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c 'import uvicorn, fastapi, ib_async, websockets' >/dev/null 2>&1; then
+      PYTHON_BIN="$("$candidate" -c 'import sys; print(sys.executable)')"
+      break
+    fi
+  done
+  if [[ -z "$PYTHON_BIN" ]]; then
+    echo "错误：未找到已安装项目依赖的 Python；请设置 AUTOTRADE_PYTHON。未停止控制台。"
+    exit 1
+  fi
+fi
+if [[ "${1:-}" == "--check-python" ]]; then
+  echo "$PYTHON_BIN"
+  exit 0
+fi
+echo "使用 Python：$PYTHON_BIN"
 
 echo "== [1/4] TWS 预检 =="
 if nc -z 127.0.0.1 7496 2>/dev/null; then
@@ -37,11 +64,21 @@ fi
 EXECUTION_ENABLED=1 \
 EXTERNAL_MANUAL_GUARD_ENABLED="${EXTERNAL_MANUAL_GUARD_ENABLED:-1}" \
 EXTERNAL_MANUAL_GUARD_FA_SCOPE="${EXTERNAL_MANUAL_GUARD_FA_SCOPE:-$guard_fa_default}" \
-nohup python3 -m uvicorn console.app:app --host 0.0.0.0 --port 8000 >> "$LOG" 2>&1 &
-echo "  已启动 pid $!（日志 ${LOG}）"
+"$PYTHON_BIN" - "$LOG" <<'PY'
+import subprocess, sys
+
+# A separate session survives the launcher/tool process group exiting.
+with open(sys.argv[1], 'ab', buffering=0) as log:
+    process = subprocess.Popen(
+        [sys.executable, '-m', 'uvicorn', 'console.app:app', '--host', '0.0.0.0', '--port', '8000'],
+        stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+        start_new_session=True, close_fds=True,
+    )
+print(f'  已启动 pid {process.pid}（日志 {sys.argv[1]}）')
+PY
 
 echo "== [4/4] 就绪验证 =="
-python3 - <<'EOF'
+"$PYTHON_BIN" - <<'EOF'
 import json, sys, time, urllib.request
 
 t0 = time.time()
@@ -91,7 +128,11 @@ for symbol, info in unavailable.items():
     print(f"  ⚠️  {symbol} 24 小时行情不可用（服务端返回 {info.get('resolved') or '订阅错误'}）")
 
 # 阶段 3：IBKR 连接状态（只报告，不等待——重连循环会持续尝试）
-st = get("/api/status")
+try:
+    st = get("/api/status")
+except Exception as error:
+    print(f"  ⚠️  最终状态读取未确认：GET /api/status：{type(error).__name__}: {error}；控制台继续运行，请重新检查。")
+    sys.exit(2)
 conn = st.get("connected")
 print(f"  {'✅' if conn else '⚠️ '} IBKR {'已连接' if conn else '未连接'}"
       + (f"，净值 ${st.get('equity'):,.0f}" if conn and st.get('equity') else "（TWS 登录后自动重连）"))

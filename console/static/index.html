@@ -7,7 +7,9 @@
   <link rel="icon" href="data:," />
   <link rel="stylesheet" href="https://unpkg.com/element-plus@2.9.1/dist/index.css" />
   <link rel="stylesheet" href="https://unpkg.com/element-plus@2.9.1/theme-chalk/dark/css-vars.css" />
-  <link rel="stylesheet" href="/static/style.css?v=range-distribution-2" />
+  <link rel="stylesheet" href="/static/style.css?v=candidate-policy-live-v11" />
+  <link rel="stylesheet" href="/static/vwap-distribution.css?v=vwap-display-grace" />
+  <link rel="stylesheet" href="/static/market-rhythm.css?v=candidate-protection-live-v9" />
 </head>
 <body>
   <div id="app" v-cloak>
@@ -61,7 +63,12 @@
           <span class="stat-item">净值 <b>{{ fmtMoney(status.equity) }}</b></span>
           <span class="stat-item">日盈亏 <b :class="pnlClass(status.daily_pnl)">{{ fmtMoney(status.daily_pnl) }}</b></span>
           <span class="stat-item">风险 <b :class="totalRiskClass">${{ fmtMoney(status.total_risk_usd) }}/{{ fmtMoney(status.max_total_risk_usd) }}</b></span>
+          <span class="stat-item" title="保本后剩余风险归零，多空各自计算">多 / 空风险 <b>${{ fmtMoney(status.long_risk_usd) }} / ${{ fmtMoney(status.short_risk_usd) }}</b><small> 各限 ${{ fmtMoney(status.max_direction_risk_usd) }}</small></span>
           <span class="stat-item">仓位 <b>{{ status.total_position_pct == null ? '—' : status.total_position_pct + '%' }}</b></span>
+          <details v-for="watch in ipoOpenings.watches" :key="watch.symbol" class="ipo-opening-status connection-details" :class="{'ipo-trading':!!watch.event,'ipo-error':!!watch.reason}">
+            <summary>IPO {{ tickerOf(watch.symbol) }} · {{ watch.event ? '已开 · 首价 $'+watch.event.price.toFixed(2) : watch.phase === 'ended' ? '今日未见成交' : watch.phase === 'reconnecting' ? '重连中' : '等待首价' }}</summary>
+            <div><b>{{ watch.symbol }} · {{ watch.listing_date }} ET</b><p>{{ watch.reason || (watch.event ? '已记录首次观察到的有效成交，后续报价不重复播报。' : '监测真实成交价及正成交量，不等待K线收盘或指标预热。') }}</p><button type="button" @click="testIpoVoice">测试语音</button></div>
+          </details>
           <span v-if="status.broker_route" class="stat-item">配置路由 <b>{{ status.broker_route.fa_group || status.broker_route.account || '未提供' }}</b></span>
           <details class="connection-details"><summary>连接时序</summary><div class="connection-metrics">
           <span class="stat-item">TV <b>{{ clock(tvTime) }}</b></span>
@@ -70,16 +77,60 @@
           <span class="stat-item">最大 <b>{{ maxDelay }}s</b></span></div>
           </details>
           <el-button size="small" class="precheck-btn" @click="openPrecheck">盘前检查</el-button>
+          <el-button v-if="identity === 'ok' && traderName === 'master'" size="small" plain @click="openTvHostBinding">绑定TV图表</el-button>
+          <el-button v-if="identity === 'ok' && traderName !== 'master'" size="small"
+                     :type="tvExtensionState === 'ready' ? 'success' : 'warning'" plain
+                     @click="tvSetupVisible = true; checkTvExtension()">
+            {{ tvExtensionState === 'ready' ? '本机图表已连接' : '连接本机图表' }}
+          </el-button>
           <a class="architecture-entry" href="/static/architecture.html" target="_blank" rel="noopener">系统架构</a>
         </div>
       </div>
     </header>
 
+    <el-dialog v-model="tvHostBindingVisible" title="绑定当前控制台与TV图表" width="min(520px, 96vw)">
+      <p>选择专用Chrome中的TV图表。绑定后可保留两个独立窗口，股票切换与八格同步只操作这张图表。</p>
+      <el-select v-model="tvHostTarget" placeholder="请选择TV图表" style="width:100%">
+        <el-option v-for="chart in tvHostCharts" :key="chart.id" :label="chart.title" :value="chart.id"></el-option>
+      </el-select>
+      <p v-if="!tvHostCharts.length && !tvHostBindingBusy">没有找到TV图表，请先在专用Chrome中打开。</p>
+      <template #footer><el-button @click="tvHostBindingVisible=false">取消</el-button><el-button type="primary" :loading="tvHostBindingBusy" :disabled="!tvHostTarget" @click="bindTvHostChart">绑定这张图表</el-button></template>
+    </el-dialog>
+
+    <el-dialog v-model="tvSetupVisible" title="连接本机 TradingView" width="min(480px, 96vw)">
+      <p v-if="tvExtensionState === 'ready'">本机图表已连接。点击股票代码即可切换。</p>
+      <p v-else-if="tvExtensionState === 'checking'">正在检测本机扩展…</p>
+      <template v-else-if="tvExtensionState === 'unsupported'">
+        <p>请用电脑上的 Chrome 打开此控制台。</p>
+      </template>
+      <p v-else-if="tvExtensionState === 'update'">请<a :href="tvExtensionDownload" download="autotrade-tv.zip">下载新版扩展</a>，更新后刷新 AutoTrade。</p>
+      <template v-else>
+        <ol v-if="tvExtensionState === 'missing'" class="tv-setup-steps">
+          <li><a :href="tvExtensionDownload" download="autotrade-tv.zip">下载扩展</a>，然后解压下载的 ZIP。</li>
+          <li>
+            把下面的地址粘贴到 Chrome 地址栏并回车。开启「开发者模式」，点「加载已解压的扩展程序」，选中解压后的 <b>autotrade-tv</b> 文件夹。
+            <div class="tv-setup-address">
+              <input type="text" value="chrome://extensions" readonly aria-label="Chrome 扩展管理地址"
+                     title="点击复制" @click="copyTvChromeAddress" />
+              <span v-if="tvChromeAddressCopied" role="status">已复制</span>
+            </div>
+          </li>
+          <li>打开自己的 TradingView 图表，通过 Chrome 工具栏的拼图图标打开「AutoTrade TradingView 联动」，点「绑定当前图表」。</li>
+        </ol>
+        <p v-else>{{ tvExtensionReason || '扩展已安装。请在 AutoTrade 所在窗口打开 TradingView 图表，然后用扩展绑定。' }}</p>
+      </template>
+      <template #footer>
+        <el-button v-if="tvExtensionState !== 'ready'" :loading="tvExtensionChecking"
+                   @click="checkTvExtension">重新检测</el-button>
+        <el-button @click="tvSetupVisible = false">{{ tvExtensionState === 'ready' ? '完成' : '稍后设置' }}</el-button>
+      </template>
+    </el-dialog>
+
     <el-drawer v-model="settingsVisible" title="参数与通知 · 按作用范围管理" size="min(520px, 96vw)">
       <div class="settings-content">
         <h3>手动交易 · 本客户端</h3>
         <label>每笔风险预算（美元）<strong>{{ riskUsd || "—" }}</strong></label>
-        <label>手动订单最大仓位（占账户净值 %）<el-input-number v-model="maxPositionPct" :min="10" :max="200" :step="10" controls-position="right"></el-input-number></label>
+        <label>单只股票最大仓位 <b>{{ maxPositionPct }}%（账户净值）</b></label>
         <p>每笔风险预算由系统配置。最大仓位比例保存在当前客户端。</p>
         <h3>ATR 止损参数 · 全局设置</h3>
         <label>手动及相关历史流程 ATR 倍数<el-input-number v-model="atrMult" :min="0.2" :max="5" :step="0.1" controls-position="right" @focus="atrMultDirty = true" @blur="atrMultDirty = false" @change="saveAtrMult"></el-input-number></label>
@@ -96,18 +147,19 @@
       <div class="global-actions"><el-button :disabled="demoMode" type="warning" @click="stopAuto(false)">暂停全部实例新入场</el-button><el-button :disabled="demoMode" type="danger" plain @click="stopAuto(true)">退出全部自动执行交易组</el-button></div>
       <p v-if="demoMode" class="muted">请先退出实例界面演示，再进行全局交易控制。</p>
     </el-dialog>
-    <nav class="workspace-nav" aria-label="工作区">
+    <nav class="workspace-nav" :class="{ 'is-vwap-active': bottomTab === 'vwap1m', 'is-rhythm-active': bottomTab === 'rhythm' }" aria-label="工作区">
+      <button :aria-pressed="bottomTab === 'rhythm'" @click="selectWorkspace('execution', 'rhythm')">候选与订单</button>
+      <button :aria-pressed="bottomTab === 'vwap1m'" @click="selectWorkspace('execution', 'vwap1m')">VWAP 分布图</button>
+      <button :aria-pressed="bottomTab === 'openingBreakouts'" @click="selectWorkspace('execution', 'openingBreakouts')">区间分布图</button>
       <button :aria-pressed="bottomTab === 'instances'" @click="selectWorkspace('execution', 'instances')">执行监控</button>
-      <button :aria-pressed="bottomTab === 'orders'" @click="selectWorkspace('execution', 'orders')">订单批次</button>
       <button :aria-pressed="bottomTab === 'fvg'" @click="selectWorkspace('execution', 'fvg')">FVG 监控</button>
       <button :aria-pressed="bottomTab === 'screen'" @click="selectWorkspace('execution', 'screen')">选股</button>
       <button :aria-pressed="bottomTab === 'momentum'" @click="selectWorkspace('execution', 'momentum')">推进力</button>
-      <button :aria-pressed="bottomTab === 'openingBreakouts'" @click="selectWorkspace('execution', 'openingBreakouts')">区间分布图</button>
       <button :aria-pressed="bottomTab === 'backtest'" @click="selectWorkspace('validation', 'backtest')">回测验证</button>
       <button :aria-pressed="bottomTab === 'night'" @click="selectWorkspace('validation', 'night')">夜盘模拟</button>
       <el-dropdown trigger="click" @command="tab => selectWorkspace('research', tab)"><button :aria-pressed="workspaceGroup === 'research'">研究复盘{{ workspaceGroup === 'research' ? ' · ' + workspaceTabNames[bottomTab] : '' }} ▾</button><template #dropdown><el-dropdown-menu><el-dropdown-item v-for="tab in workspaceTabs.research" :key="tab" :command="tab">{{ workspaceTabNames[tab] }}</el-dropdown-item></el-dropdown-menu></template></el-dropdown>
       <el-dropdown trigger="click" @command="tab => selectWorkspace('operations', tab)"><button :aria-pressed="workspaceGroup === 'operations'">系统运维{{ workspaceGroup === 'operations' ? ' · ' + workspaceTabNames[bottomTab] : '' }} ▾</button><template #dropdown><el-dropdown-menu><el-dropdown-item v-for="tab in workspaceTabs.operations" :key="tab" :command="tab">{{ workspaceTabNames[tab] }}</el-dropdown-item></el-dropdown-menu></template></el-dropdown>
-      <button v-if="workspaceGroup === 'execution' && bottomTab !== 'instances'" class="workspace-expand" :aria-pressed="!workspaceExpanded" @click="toggleWorkspace">{{ workspaceExpanded ? '与执行实例分屏' : '辅助内容全屏' }}</button>
+
     </nav>
 
     <!-- 盘前检查单结果面板（绿灯/红灯/中性一眼扫完） -->
@@ -130,22 +182,6 @@
         暂无记录
         <el-button size="small" type="primary" :loading="precheckLoading" @click="runPrecheck">立即运行</el-button>
       </div>
-    </el-dialog>
-
-    <!-- TV 看盘面板（客户端专属：截图回传 master 的 TV 画面，含私有指标） -->
-    <el-dialog v-model="tvView.visible" :title="'TV 图表 · ' + tvView.symbol"
-               width="min(960px, 96vw)" @close="closeTvView">
-      <div class="tv-view-body">
-        <img v-if="tvView.image" :src="tvView.image" class="tv-view-img"
-             alt="TV 图表截图" />
-        <div v-else class="muted log-empty">截图加载中…</div>
-        <div v-if="tvView.error" class="tv-view-error">⚠️ {{ tvView.error }}</div>
-      </div>
-      <template #footer>
-        <span class="muted tv-view-foot">画面位 pane {{ tvView.pane }} · 每 10s 自动刷新</span>
-        <el-button size="small" type="primary" :loading="tvView.loading"
-                   @click="refreshTvView">立即刷新</el-button>
-      </template>
     </el-dialog>
 
     <!-- 告警横幅：活跃告警（数据陈旧/TWS断线/裸仓等），可逐条消除，服务端解除自动消失 -->
@@ -176,28 +212,52 @@
           <!-- 第一行：选股 + 现价 -->
           <div class="tile-head">
             <el-select v-model="slots[i].symbol" filterable placeholder="选择股票" class="tile-select" :ref="el => setSelectRef(el, i)" @keyup.enter="confirmSelect(i)">
-              <el-option v-for="sym in watchlist" :key="sym" :label="sym.split(':').pop()" :value="sym"></el-option>
+              <el-option v-for="sym in manualSymbols" :key="sym" :label="sym.split(':').pop()" :value="sym"></el-option>
             </el-select>
             <span class="price-value">{{ slot.close }}</span>
           </div>
 
-          <!-- tab：市价单（默认） / EMA快线 / 通道边沿 / 中点限价单 / 回踩限价单 -->
+          <!-- 当前仅开放轨道市价；其他手动入口保留代码，暂时隐藏。 -->
           <el-tabs v-model="slots[i].limitType" class="tile-tabs" stretch>
-            <el-tab-pane label="市价单" name="market"></el-tab-pane>
-            <el-tab-pane label="EMA快线" name="ema"></el-tab-pane>
-            <el-tab-pane label="通道边沿" name="channel"></el-tab-pane>
-            <el-tab-pane label="中点限价单" name="midpoint"></el-tab-pane>
-            <el-tab-pane label="回踩限价单" name="retest"></el-tab-pane>
+            <el-tab-pane v-if="false" label="市价单" name="market"></el-tab-pane>
+            <el-tab-pane label="轨道市价" name="rhythm_market"></el-tab-pane>
+            <el-tab-pane v-if="false" label="EMA快线" name="ema"></el-tab-pane>
+            <el-tab-pane v-if="false" label="通道边沿" name="channel"></el-tab-pane>
+            <el-tab-pane v-if="false" label="中点限价单" name="midpoint"></el-tab-pane>
+            <el-tab-pane v-if="false" label="回踩限价单" name="retest"></el-tab-pane>
           </el-tabs>
+
+          <div v-if="slot.limitType === 'market' && !status.candidate_entry_required" class="market-direction-control">
+            <div class="market-direction-heading">
+              <span class="indic-label">1 分钟 ST · {{ slot.stSide === 'long' ? '多头' : slot.stSide === 'short' ? '空头' : '等待数据' }}</span>
+              <el-switch :model-value="slot.marketDirectionMode === 'manual'" active-text="手动方向"
+                :disabled="placing || slots[i].directionConfirming || !slot.symbol"
+                :loading="slots[i].directionConfirming" @change="toggleMarketDirection(i, $event)"></el-switch>
+            </div>
+            <template v-if="slot.marketDirectionMode === 'manual'">
+              <el-radio-group :model-value="slot.side" :disabled="placing" class="market-side-choice" @change="setManualMarketSide(i, $event)">
+                <el-radio-button value="long">做多</el-radio-button>
+                <el-radio-button value="short">做空</el-radio-button>
+              </el-radio-group>
+              <span class="market-direction-warning">震荡行情 · 区间边缘入场，不追高追低</span>
+            </template>
+          </div>
+
+          <div v-if="!status.candidate_entry_required && slot.limitType === 'rhythm_market'" class="market-direction-control"><b>{{ slot.side === 'long' ? '趋势做多' : slot.side === 'short' ? '趋势做空' : '等待候选趋势' }}</b><small v-if="!slot.ready">{{ slot.blockReason || '候选或行情未就绪' }}</small></div>
+          <div class="market-direction-control"><label>初始止损 <el-select v-model="slots[i].stopMode" :disabled="placing" style="width:230px"><el-option label="5分钟 2×ATR（至少K线外）" value="atr_2"></el-option><el-option label="1分钟 VWAP 1σ" value="vwap_sigma" :disabled="!status.manual_stop_modes?.includes('vwap_sigma')"></el-option></el-select></label></div>
+          <section v-if="slot.limitType === 'rhythm_market'" class="candidate-order-settings" aria-label="候选预订单设置">
+            <div><el-switch v-model="slots[i].vwapOutsideOnly" :disabled="placing" active-text="VWAP 区间内不开仓"></el-switch><small>多头在上轨外，空头在下轨外</small></div>
+            <small>保本和跟踪止盈在“候选与订单”顶部统一设置。</small>
+          </section>
 
           <!-- 当前 tab 的限价 + 止损（止损行合并显示距离幅度百分比） -->
           <div class="tile-quote">
             <div class="quote-row">
-              <span class="indic-label">{{ slots[i].limitType === 'ema' ? 'EMA快线 限价' : (slots[i].limitType === 'channel' ? '通道边沿 限价' : (slots[i].limitType === 'retest' ? '回踩 限价' : (slots[i].limitType === 'market' ? '市价（约）' : '中点 限价'))) }}</span>
+              <span class="indic-label">{{ slots[i].limitType === 'ema' ? 'EMA快线 限价' : (slots[i].limitType === 'channel' ? '通道边沿 限价' : (slots[i].limitType === 'retest' ? '回踩 限价' : (['market','rhythm_market'].includes(slots[i].limitType) ? '市价（约）' : '中点 限价'))) }}</span>
               <b class="accent quote-val">{{ slot.limitPx ?? '—' }}</b>
             </div>
             <div class="quote-row">
-              <span class="indic-label">{{ slots[i].limitType === 'retest' ? '止损 上上根K线' : ('止损 ' + atrMult + '×ATR') }}</span>
+              <span class="indic-label">{{ slot.manualStopMode === 'vwap_sigma' ? '止损 1分钟VWAP 1σ' : status.candidate_entry_required || ['market','rhythm_market'].includes(slot.limitType) ? '止损 5分钟2×ATR / 当前K线外' : (slot.limitType === 'retest' ? '止损 上上根K线' : ('止损 ' + atrMult + '×ATR')) }}</span>
               <b class="stop quote-val"><span class="stop-pct-main">{{ slot.stopDistPct != null ? slot.stopDistPct + '%' : '—' }}</span><small class="stop-px-sub">{{ slot.stopPx ?? '' }}</small></b>
             </div>
           </div>
@@ -207,15 +267,19 @@
             <div class="calc-row">
               <div class="calc-item"><span class="calc-label">股数</span><b>{{ slot.qty }}</b></div>
               <div class="calc-item"><span class="calc-label">仓位占比</span><b class="risk">{{ slot.equityRatio }}%</b></div>
-            </div>
-            <div class="calc-row">
               <div class="calc-item"><span class="calc-label">实际风险</span><b class="risk-red">{{ fmtMoney(slot.risk) }}</b></div>
             </div>
           </div>
 
-          <!-- 下单按钮（多绿空红，震荡也放行，与服务端闸门一致） -->
-          <el-button :type="slot.side === 'long' ? 'success' : (slot.side === 'short' ? 'danger' : 'info')" class="tile-btn" :disabled="!slot.ready || !slot.qty || placing || hasAutoPosition(slot.symbol)" :title="hasAutoPosition(slot.symbol) ? '已有自动策略仓位，禁止手动加仓' : ''" @click="placeOrder(slot)">
-            {{ slot.side === 'long' ? '买入' : (slot.side === 'short' ? '卖出' : '震荡') }} {{ slot.qty }} 股 · {{ typeLabel(slots[i].limitType) }}
+          <section v-if="status.candidate_entry_required" class="entry-checks" aria-label="开仓条件检查">
+            <header><b>开仓条件</b><span>{{ manualEntryChecks(slot).filter(c => c.ok).length }}/{{ manualEntryChecks(slot).length }} 通过</span></header>
+            <ul><li v-for="check in manualEntryChecks(slot)" :key="check.key" :class="check.ok ? 'entry-check-pass' : 'entry-check-fail'" :title="check.label+'：'+check.detail" :aria-label="(check.ok?'通过':'未通过')+check.label+'：'+check.detail">
+              <b class="entry-check-mark" aria-hidden="true">{{ check.ok ? '✓' : '✗' }}</b><b class="entry-check-label">{{ check.label }}</b><span>{{ check.detail }}</span>
+            </li></ul>
+          </section>
+          <!-- Downstream policy rechecks these conditions before broker submission. -->
+          <el-button :type="slot.side === 'long' ? 'success' : (slot.side === 'short' ? 'danger' : 'info')" class="tile-btn" :disabled="!slot.ready || !slot.qty || placing || hasAutoPosition(slot.symbol) || manualEntryChecks(slot).some(c => !c.ok)" :title="hasAutoPosition(slot.symbol) ? '已有自动策略仓位，禁止手动加仓' : ''" @click="placeOrder(slot)">
+            {{ slot.minuteMarket && !slot.stSide ? '等待 1 分钟 ST' : (slot.side === 'long' ? '买入' : (slot.side === 'short' ? '卖出' : '震荡')) + ' ' + slot.qty + ' 股 · ' + typeLabel(slots[i].limitType) }}
           </el-button>
         </div>
       </section>
@@ -299,7 +363,7 @@
                   <span>方向/次数</span><span>状态/退出原因</span><span>股数</span><span>成交均价</span><span>止损</span><span>盈亏</span><span>操作</span>
                 </div>
                 <div v-for="o in autoLotRows(i)" :key="o.lot_id" class="auto-order-row">
-                  <span><b :class="o.side === 'long' ? 'pnl-pos' : 'pnl-neg'">{{ lotSideLabel(o) }}</b> 第{{ (o.signal_snapshot && o.signal_snapshot.entry_index) || 1 }}次<small class="order-kind">{{ o.limit_type === 'auto_ema9_pyramid' ? '自动' : '手动' }}</small><small class="auto-meta">{{ orderRiskText(o) }}</small></span>
+                  <span><b :class="o.side === 'long' ? 'pnl-pos' : 'pnl-neg'">{{ lotSideLabel(o) }}</b> 第{{ (o.signal_snapshot && o.signal_snapshot.entry_index) || 1 }}次<small class="order-kind">{{ String(o.limit_type || '').startsWith('auto_') ? '自动' : '手动' }}</small><small class="auto-meta">{{ orderRiskText(o) }}</small></span>
                   <span><el-tag size="small" :type="stateTag(o.state)">{{ orderState(o.state) }}</el-tag><small class="auto-meta" v-if="o.state === 'CLOSED' || o.state === 'CLOSING'">{{ lotExitReason(o) }}</small><small class="auto-meta">开 {{ lotOpenTime(o) }}</small><small class="auto-meta" v-if="o.state === 'CLOSED'">平 {{ orderTime(o.closed_at) }}</small></span>
                   <span>{{ o.filled_qty || o.qty }}</span>
                   <span>{{ (o.avg_fill || o.entry_px).toFixed(2) }}<small class="auto-meta">{{ entryOrderTypeText(o) }}</small></span>
@@ -318,21 +382,20 @@
           <div v-if="!autoView.instances.length" class="muted log-empty">输入一只股票并启动后，策略将全自动建仓、加仓和整组退出，无需人工确认</div>
         </div>
 
-        <!-- 底部面板高度拖拽手柄 -->
-        <div v-show="!workspaceExpanded && bottomTab !== 'instances'" class="panel-resizer" :class="{ resizing: panelResizing }"
-             title="拖动调整 Tab 面板高度" @pointerdown="startPanelResize"><span></span></div>
         <!-- 底部面板：选股 / 运行日志（tab 切换，与订单表格平分高度） -->
         <div v-show="bottomTab !== 'instances'" class="log-panel" :style="logPanelStyle">
           <el-tabs v-model="bottomTab" class="bottom-tabs" @tab-change="onBottomTabChange">
-            <!-- 订单批次（自动策略主区域的辅助执行视图） -->
-            <el-tab-pane class="workspace-pane pane-orders" v-if="workspaceGroup === 'execution'" label="订单批次" name="orders">
-              <div class="orders-tab-panel">
+            <el-tab-pane class="workspace-pane pane-rhythm" v-if="workspaceGroup === 'execution'" label="候选与订单" name="rhythm" lazy>
+              <market-rhythm ref="rhythmPanel" :active="bottomTab === 'rhythm'" :market="market" :now="now" :lots="lots" :positions-ready="lotsReady" :trader="traderName" :tv-sync-status="tvGridStatus+' · '+tvMarkerStatus" @select="selectRhythmStock" @manage="manageRhythmPosition" @grid="syncRhythmGrid" @open="openRhythmTrade" @frame="rhythmFrame=$event">
+              <template #protection-controls>
+                <div class="candidate-protection-toolbar" aria-label="候选持仓实时保护设置" title="作用于已有候选持仓及后续候选订单；排除入场分钟后计时，到期移至成本或立即市价退出；ST模式确认反向退出，其他策略不变">
+                  <div><el-switch :model-value="candidateProtection.timed_breakeven_enabled" :disabled="candidateProtectionSaving || demoMode || status.candidate_protection_live_version !== 1" active-text="持仓保本" @change="saveCandidateProtection('timed_breakeven_enabled',$event)"></el-switch><el-input-number :model-value="candidateProtection.breakeven_minutes" :disabled="candidateProtectionSaving || demoMode || !candidateProtection.timed_breakeven_enabled || status.candidate_protection_live_version !== 1" :min="1" :max="120" :step="1" step-strictly size="small" controls-position="right" @change="saveCandidateProtection('breakeven_minutes',$event)"></el-input-number><span>分钟</span></div>
+                  <div><el-switch :model-value="candidateProtection.trailing_enabled" :disabled="candidateProtectionSaving || demoMode || status.candidate_protection_live_version !== 1" active-text="跟踪止盈" @change="saveCandidateProtection('trailing_enabled',$event)"></el-switch><el-select :model-value="candidateProtection.trailing_source" :disabled="candidateProtectionSaving || demoMode || !candidateProtection.trailing_enabled || status.candidate_protection_live_version !== 1" size="small" @change="saveCandidateProtection('trailing_source',$event)"><el-option label="5分钟 EMA9" value="ema9_5m"></el-option><el-option label="1分钟 ST(10,3)" value="st_1m_10_3"></el-option></el-select></div>
+                </div>
+              </template>
+              <template #order-controls>
                 <div class="panel-title order-title">
                   <span>订单批次</span>
-                  <el-tag v-if="status?.tv_paper_sync?.enabled" size="small"
-                          :type="status.tv_paper_sync.state === '运行中' ? 'info' : 'warning'">
-                    TV 模拟同步 · {{ status.tv_paper_sync.state }}（{{ status.tv_paper_sync.linked }}）
-                  </el-tag>
                   <el-tag v-if="demoMode" type="warning" size="small">演示</el-tag>
                   <el-select v-model="orderSymbolFilter" size="small" clearable placeholder="全部标的" style="width:110px">
                     <el-option v-for="sym in watchlist" :key="sym" :label="sym.split(':').pop()" :value="sym"></el-option>
@@ -343,8 +406,11 @@
                     <el-option label="手动单" value="manual"></el-option>
                   </el-select>
                 </div>
-                <div v-if="status?.tv_paper_sync?.notices?.length" role="status">
-                  <div v-for="notice in status.tv_paper_sync.notices" :key="notice.symbol" class="auto-meta">
+              </template>
+              <div class="orders-tab-panel">
+
+                <div v-if="tvPaperOrderNotices.length" role="status">
+                  <div v-for="notice in tvPaperOrderNotices" :key="notice.symbol" class="auto-meta">
                     {{ tickerOf(notice.symbol) }} · {{ notice.message }}
                     <template v-if="notice.paper_stop != null">
                       · 批次 {{ notice.lot_id }} · 实盘 {{ notice.live_stop }} → 建议 {{ notice.paper_stop }}
@@ -352,34 +418,22 @@
                   </div>
                 </div>
                 <el-table :data="sortedLots" size="small" style="width:100%" :row-class-name="lotRowClass"
-                          class="tv-link-table" @row-click="row => row.symbol && tvShow(row.symbol)">
-                  <el-table-column label="标的 / 归属" width="175" fixed="left">
+                          class="tv-link-table order-batch-table" @row-click="row => row.symbol && tvShow(row.symbol)">
+                  <el-table-column label="标的 / 归属" width="104" fixed="left">
                     <template #default="{ row }"><span class="lot-symbol">{{ tickerOf(row.symbol) }}</span><small class="auto-meta">{{ row.signal_snapshot && row.signal_snapshot.strategy_id ? autoModelName(row.signal_snapshot.strategy_id) + ' · ' + (row.signal_snapshot.strategy_instance_id || 'default') : row.external_managed ? 'IBKR 接管' : '手动 / 历史订单' }}</small></template>
                   </el-table-column>
-                  <el-table-column label="开仓方向" width="105" fixed="left">
-                    <template #default="{ row }"><b :class="row.side === 'long' ? 'pnl-pos' : row.side === 'short' ? 'pnl-neg' : 'muted'">{{ lotSideLabel(row) }}</b><small class="auto-meta">{{ lotEntryAction(row) }}</small></template>
-                  </el-table-column>
-                  <el-table-column label="交易员" width="70">
-                    <template #default="{ row }"><span :class="traderClass(row.trader)">{{ row.trader || '—' }}</span></template>
-                  </el-table-column>
-                  <el-table-column label="状态" width="130">
+                  <el-table-column label="方向 / 状态" width="88">
                     <template #default="{ row }">
-                      <el-tag :type="stateTag(row.state)" size="small">{{ orderState(row.state) }}</el-tag>
+                      <div class="lot-stacked-cell">
+                        <div class="lot-side-line"><b :class="row.side === 'long' ? 'pnl-pos' : row.side === 'short' ? 'pnl-neg' : 'muted'">{{ lotSideLabel(row) }}</b></div>
+                        <el-tag :type="stateTag(row.state)" size="small">{{ orderState(row.state) }}</el-tag>
+                      </div>
                     </template>
                   </el-table-column>
-                  <el-table-column label="开仓时间 · 美东" min-width="160"><template #default="{ row }">{{ lotOpenTime(row) }}</template></el-table-column>
-                  <el-table-column label="平仓时间 · 美东" min-width="160"><template #default="{ row }">{{ row.state === 'CLOSED' ? orderTime(row.closed_at) : '—' }}</template></el-table-column>
-                  <el-table-column label="平仓原因" min-width="185"><template #default="{ row }"><b>{{ lotExitReason(row) }}</b></template></el-table-column>
-                  <el-table-column label="股数" width="75">
-                    <template #default="{ row }">{{ row.state === 'PENDING' ? row.qty : row.filled_qty }}</template>
+                  <el-table-column label="股数 / 占比" width="80">
+                    <template #default="{ row }"><div class="lot-stacked-cell"><span class="lot-quantity">{{ row.state === 'PENDING' ? row.qty : row.filled_qty }} 股</span><b class="lot-pct">{{ posPct(row) }}</b></div></template>
                   </el-table-column>
-                  <el-table-column label="成交/参考价" width="110">
-                    <template #default="{ row }"><span class="lot-price">{{ row.avg_fill > 0 ? row.avg_fill.toFixed(2) : row.entry_px.toFixed(2) }}</span><small class="auto-meta">{{ entryOrderTypeText(row) }}</small></template>
-                  </el-table-column>
-                  <el-table-column prop="stop_px" label="订单止损" width="155">
-                    <template #default="{ row }"><span class="lot-price">{{ row.stop_px > 0 ? row.stop_px.toFixed(2) : '—' }}</span><small class="auto-meta">{{ protectionText(row) }}</small></template>
-                  </el-table-column>
-                  <el-table-column label="盈亏" width="110">
+                  <el-table-column label="盈亏" width="78">
                     <template #default="{ row }">
                       <template v-if="row.state === 'CLOSED' || row.state === 'ACTIVE' || row.state === 'CLOSING'">
                         <b class="lot-pnl" :class="pnlClass(lotPnl(row))">{{ fmt2(lotPnl(row)) }}</b>
@@ -389,30 +443,42 @@
                       <span v-else class="muted">—</span>
                     </template>
                   </el-table-column>
-                  <el-table-column label="仓位占比" width="90">
-                    <template #default="{ row }"><b class="lot-pct">{{ posPct(row) }}</b></template>
+                  <el-table-column label="开仓 / 止损" width="128">
+                    <template #default="{ row }">
+                      <div class="lot-stacked-cell lot-price-pair">
+                        <div class="lot-price-line" :title="(row.avg_fill > 0 ? '成交均价' : '参考价') + ' · ' + entryOrderTypeText(row)"><span class="lot-price-label">开仓</span><span class="lot-price lot-entry-price">{{ row.avg_fill > 0 ? row.avg_fill.toFixed(2) : row.entry_px.toFixed(2) }}</span></div>
+                        <div class="lot-price-line" :title="protectionText(row)"><span class="lot-price-label">止损</span><span class="lot-price lot-stop-price">{{ row.stop_px > 0 ? row.stop_px.toFixed(2) : '—' }}</span></div>
+                      </div>
+                    </template>
                   </el-table-column>
-                  <el-table-column label="平仓价" width="90">
-                    <template #default="{ row }">{{ row.state === 'CLOSED' && row.exit_px > 0 ? row.exit_px.toFixed(2) : '—' }}</template>
-                  </el-table-column>
-                  <el-table-column prop="reason" label="备注" min-width="120" show-overflow-tooltip></el-table-column>
-                  <el-table-column label="操作" width="228" fixed="right">
+                  <el-table-column label="操作" width="168">
                     <template #default="{ row }">
                       <span v-if="row.external_managed && row.state === 'ACTIVE'" class="muted">在 TWS 管理</span>
                       <div v-else class="order-primary-actions" @click.stop>
                         <el-button v-if="row.state === 'ACTIVE'" size="small" type="success" plain :disabled="demoMode || row.breakeven_reached" @click="breakevenLot(row)">保本</el-button>
                         <el-button v-if="row.state === 'ACTIVE'" size="small" type="danger" plain :disabled="demoMode" @click="closeLot(row)">平仓</el-button>
+                        <el-button v-if="row.state === 'ACTIVE'" size="small" type="danger" plain :disabled="demoMode || row.filled_qty <= 1" @click="closeHalf(row)">平掉一半</el-button>
                         <el-button v-if="row.state === 'PENDING' || (status.dry_run && row.state === 'ACTIVE')" size="small" type="warning" plain :disabled="demoMode" @click="cancelLot(row)">撤单</el-button>
-                        <el-dropdown v-if="row.state === 'ACTIVE'" trigger="click"><el-button size="small">更多 ▾</el-button><template #dropdown><el-dropdown-menu>
-                          <el-dropdown-item :disabled="demoMode || row.filled_qty <= 1" @click="closeHalf(row)">平掉一半</el-dropdown-item>
-                          <el-dropdown-item :disabled="demoMode" v-if="!String(row.limit_type || '').startsWith('auto_') && !(row.signal_snapshot && (row.signal_snapshot.pyramid_seed || row.signal_snapshot.strategy_id))" @click="adoptManualLot(row)">交由所选执行实例接管</el-dropdown-item>
+                        <el-dropdown v-if="row.state === 'ACTIVE' && !String(row.limit_type || '').startsWith('auto_') && !(row.signal_snapshot && (row.signal_snapshot.pyramid_seed || row.signal_snapshot.strategy_id))" trigger="click"><el-button size="small">更多 ▾</el-button><template #dropdown><el-dropdown-menu>
+                          <el-dropdown-item :disabled="demoMode" @click="adoptManualLot(row)">交由所选执行实例接管</el-dropdown-item>
                         </el-dropdown-menu></template></el-dropdown>
                         <span v-if="!['ACTIVE', 'PENDING'].includes(row.state)" class="muted">{{ row.state === 'CLOSING' ? '等待退出回报' : '已结束' }}</span>
                       </div>
                     </template>
                   </el-table-column>
+                  <el-table-column label="开仓时间 · 美东" min-width="115"><template #default="{ row }">{{ lotOpenTime(row) }}</template></el-table-column>
+                  <el-table-column label="平仓时间 · 美东" min-width="115"><template #default="{ row }">{{ row.state === 'CLOSED' ? orderTime(row.closed_at) : '—' }}</template></el-table-column>
+                  <el-table-column label="平仓原因" min-width="120"><template #default="{ row }"><b>{{ lotExitReason(row) }}</b></template></el-table-column>
+                  <el-table-column label="平仓价" width="72">
+                    <template #default="{ row }">{{ row.state === 'CLOSED' && row.exit_px > 0 ? row.exit_px.toFixed(2) : '—' }}</template>
+                  </el-table-column>
+                  <el-table-column label="交易员" width="64">
+                    <template #default="{ row }"><span :class="traderClass(row.trader)">{{ row.trader || '—' }}</span></template>
+                  </el-table-column>
+                  <el-table-column prop="reason" label="备注" min-width="100" show-overflow-tooltip></el-table-column>
                 </el-table>
               </div>
+              </market-rhythm>
             </el-tab-pane>
             <!-- FVG 监控 tab -->
             <el-tab-pane class="workspace-pane pane-fvg" v-if="workspaceGroup === 'execution'" label="FVG 监控" name="fvg">
@@ -612,9 +678,6 @@
                                title="美东 09:45 后，5 分钟收盘价和现价均须突破开盘小区间的同向边界；缺数据不入选"
                                @change="v => savePmFilter('screen_opening_range_filter', v)">小区间过滤</el-checkbox>
                   <span v-if="screenOpeningRangeFilter" class="muted">仅显示收盘确认且仍在区间外的标的</span>
-                  <span class="muted" v-if="status.tv_view && status.tv_view.panes > 0"
-                        title="master TV 宫格画面位：客户端每人一格看截图">
-                    TV 画面位 {{ status.tv_view.slots }}</span>
                   <span>排序（高→低）</span>
                   <el-select v-model="screenSort" size="small" style="width:150px">
                     <el-option label="EMA7 短期强度" value="slope"></el-option>
@@ -707,61 +770,129 @@
             </el-tab-pane>
             <el-tab-pane class="workspace-pane pane-range" v-if="workspaceGroup === 'execution'" label="区间分布图" name="openingBreakouts" lazy>
               <div class="range-distribution">
+                <div class="range-lock-panel" :class="{ 'is-ready': rangeTargetReady(rangeSelectedRow) }">
+                  <div class="range-lock-heading">
+                    <span class="range-lock-label">目标锁定</span>
+                    <strong v-if="rangeSelectedRow">{{ rangeSelectedRow.ticker }} · {{ rangeSelectedRow.minor === 0 ? '多头' : rangeSelectedRow.minor === 2 ? '空头' : '区间内' }}</strong>
+                    <strong v-else>等待选择目标</strong>
+                    <span class="range-lock-state">{{ rangeTargetReady(rangeSelectedRow) ? '● 目标就绪' : rangeSelectedSymbol ? '○ 锁定失效 / 等待突破' : '○ 点击目标锁定' }}</span>
+                    <span class="muted">就绪 {{ rangeReadyTargets.length }} / {{ rangeDistribution.rows.length }}</span>
+                  </div>
+                  <div class="range-lock-actions">
+                    <el-button type="primary" :loading="rangeActionBusy && placing"
+                               :disabled="rangeActionBusy || placing || autoBusy || !!rangeGoldenBlock"
+                               :title="rangeGoldenBlock || '信号确认后的下一根 K 线内可手动市价开仓'"
+                               @click="rangeGoldenOrder">gold signal</el-button>
+                    <el-button type="success" :loading="rangeActionBusy && autoBusy"
+                               :disabled="rangeActionBusy || placing || autoBusy || !!rangeAutoBlock"
+                               :title="rangeAutoBlock || '启动当前目标的 EMA7 v2 实例，等待策略信号入场'"
+                               @click="rangeStartAuto">自动策略</el-button>
+                    <span class="range-lock-model">EMA7 v2 · 启动后等待回踩信号</span>
+                  </div>
+                  <div v-if="rangeSelectedRow" class="range-lock-metrics">
+                    <span>现价 <b>{{ fmt2(rangeSelectedRow.close) }}</b></span>
+                    <span>EMA7 位置 <b>{{ rangeSelectedRow.normalizedPosition.toFixed(2) }}</b></span>
+                    <span v-if="rangeGoldenSignal">gold signal {{ rangeGoldenSignal.side === 'long' ? '做多' : '做空' }} · 手动入场至美东 {{ hmET(rangeGoldenSignal.time + 300) }} · 初始止损 {{ fmt2(rangeGoldenSignal.stop_px) }}</span>
+                    <span>风险预算 ${{ fmt2(riskUsd) }}</span>
+                  </div>
+                  <div class="range-ready-targets" aria-label="就绪目标列表">
+                    <button v-for="row in rangeReadyTargets" :key="row.symbol" type="button"
+                            :aria-pressed="rangeSelectedSymbol === row.symbol" @click="selectRangeStock(row)">
+                      <span class="range-ready-dot">●</span> {{ row.ticker }} {{ row.minor === 0 ? '↑' : '↓' }} {{ row.distance.toFixed(1) }}
+                    </button>
+                    <span v-if="!rangeReadyTargets.length" class="muted">等待 EMA7 突破小区间，或等待实时行情恢复</span>
+                  </div>
+                  <p v-if="rangeSelectedSymbol && (rangeGoldenBlock || rangeAutoBlock)" class="range-action-hint">
+                    <span v-if="rangeGoldenBlock">gold signal · {{ rangeGoldenBlock }}</span>
+                    <span v-if="rangeAutoBlock">自动策略 · {{ rangeAutoBlock }}</span>
+                  </p>
+                </div>
                 <div class="range-header">
-                  <strong>收盘位置与均线速度</strong>
-                  <span class="muted">已绘制 {{ rangeDistribution.rows.length }} 个标的</span>
-                  <span v-if="rangeDistribution.forming" class="muted">虚线圆圈 · 小区间形成中</span>
+                  <strong>EMA7 重心推进距离 × 均线速度</strong>
+                  <span class="muted">已绘制 {{ rangeDistribution.visibleRows.length }} 个标的</span>
+                  <span v-if="rangeDistribution.forming" class="muted">虚线圆圈 · 小区间形成中，暂用盘前高低点</span>
+                </div>
+                <div class="range-view-switch" role="group" aria-label="区间分布图视图">
+                  <button type="button" :aria-pressed="rangeFocus === null" @click="rangeFocus = null">三分图</button>
+                  <button v-for="group in rangeDistribution.groups" :key="group.major" type="button"
+                          :aria-pressed="rangeFocus === group.major" @click="rangeFocus = group.major">
+                    {{ group.name }} · {{ group.count }}
+                  </button>
                 </div>
                 <div class="range-legend">
-                  <span class="range-up">● 区间外 · 阳线</span>
-                  <span class="range-flat">● 小区间内</span>
-                  <span class="range-down">● 区间外 · 阴线</span>
-                  <span class="range-doji">● 区间外 · 平线</span>
+                  <span class="range-up">● EMA7 区间外 · 阳线</span>
+                  <span class="range-flat">● EMA7 小区间内</span>
+                  <span class="range-ready-legend">◉ 慢闪 · 目标就绪</span>
+                  <span class="range-down">● EMA7 区间外 · 阴线</span>
+                  <span class="range-doji">● EMA7 区间外 · 平线</span>
                 </div>
-                <div class="range-chart" aria-label="股票收盘区间与均线速度分布图">
-                  <div class="range-axis">
-                    <strong>收盘价位置</strong>
-                    <div class="range-directions"><span>← 下跌更快</span><span>上涨更快 →</span></div>
-                  </div>
-                  <template v-for="(group, index) in rangeDistribution.groups" :key="group.name">
-                    <div v-if="index" class="range-boundary" :class="index === 1 ? 'range-up' : 'range-down'">
-                      <span>{{ index === 1 ? '昨日高点' : '昨日低点' }}</span><i aria-hidden="true"></i>
-                    </div>
-                    <div class="range-band">
-                      <strong class="range-major">{{ group.name }}</strong>
-                      <template v-for="(lane, laneIndex) in group.lanes" :key="lane.label">
-                        <span class="range-minor">{{ lane.label }}</span>
-                        <div class="range-lane" :class="{ 'range-neutral-lane': laneIndex === 1 }"
-                             :style="{ '--range-layers': lane.layers }">
-                          <button v-for="row in lane.rows" :key="row.symbol" type="button"
-                                  class="range-stock" :class="['range-' + row.tone, { 'range-forming': row.forming }]"
-                                  :style="{ left: rangePosition(row.speed), '--range-layer': row.layer || 0 }"
-                                  :aria-pressed="rangeSelectedSymbol === row.symbol"
-                                  :title="row.ticker + ' · ' + row.candle + ' · 速度 ' + row.speed.toFixed(2)"
-                                  @click="selectRangeStock(row)">{{ row.ticker }}</button>
-                        </div>
+                <p class="range-formula muted">纵轴 =（EMA7 − 小区间中点）÷ 小区间半高 · 上沿 +1 / 下沿 −1 · 超出边界后每 1 单位为半个小区间</p>
+                <div class="range-chart" v-range-width="(width, height) => { rangePlotWidth = width; rangePlotHeight = height; }">
+                  <svg class="range-scatter" :viewBox="'0 0 ' + rangeDistribution.bounds.width + ' ' + rangeDistribution.bounds.height"
+                       role="group" aria-label="EMA7 归一化位置与均线速度分布图">
+                    <g v-for="group in rangeDistribution.visibleGroups" :key="group.major">
+                      <rect :x="group.frameX + 1" :y="group.frameY + 1"
+                            :width="group.frameWidth - 2" :height="group.frameHeight - 2"
+                            rx="6" class="range-panel-background" />
+                      <g :class="'range-' + group.tone" class="range-panel-title">
+                        <text :x="group.frameX + 12" :y="group.titleY">{{ group.name }} · {{ group.count }} 只</text>
+                        <line :x1="group.frameX + 12" :x2="group.frameX + group.frameWidth - 12"
+                              :y1="group.titleY + 9" :y2="group.titleY + 9" />
+                      </g>
+                      <rect :x="group.left" :y="group.upperY" :width="group.right - group.left"
+                            :height="group.lowerY - group.upperY" class="range-neutral-zone" />
+                      <g v-for="tick in group.yTicks" :key="tick.value">
+                        <line :x1="group.left" :x2="group.right" :y1="tick.y" :y2="tick.y"
+                              :class="['range-grid-line', { 'range-zone-edge': Math.abs(tick.value) === 1, 'range-center-line': tick.value === 0 }]" />
+                        <text v-if="tick.showLabel" :x="group.left - 9" :y="tick.y + 4" text-anchor="end" class="range-axis-label">{{ tick.value > 0 ? '+' : '' }}{{ tick.value }}</text>
+                      </g>
+                      <g v-for="tick in group.xTicks" :key="'x' + tick.value">
+                        <line :x1="tick.x" :x2="tick.x" :y1="group.top" :y2="group.bottom"
+                              :class="['range-grid-line', { 'range-center-line': tick.value === 0 }]" />
+                        <text :x="tick.x" :y="group.bottom + 20" text-anchor="middle" class="range-axis-label">{{ tick.value > 0 ? '+' : '' }}{{ tick.value }}</text>
+                      </g>
+                      <text :x="(group.left + group.right) / 2" :y="group.bottom + 42" text-anchor="middle" class="range-chart-title">← 下跌 · 均线速度 · 上涨 →</text>
+                    </g>
+                    <g v-for="line in rangeReferenceLines" :key="line.label" :class="'range-' + line.tone" class="range-reference">
+                      <line :x1="line.left" :x2="line.right" :y1="line.y" :y2="line.y" />
+                      <text :x="line.right" :y="line.y - 6" text-anchor="end">{{ rangeSelectedRow.ticker }} {{ line.label }} {{ line.position.toFixed(2) }}</text>
+                    </g>
+                    <text v-if="rangeFocus !== null && !rangeDistribution.visibleRows.length"
+                          :x="rangeDistribution.bounds.width / 2" :y="rangeDistribution.bounds.height / 2"
+                          text-anchor="middle" class="range-chart-title">本分区暂无标的</text>
+                    <g v-for="row in rangeDistribution.visibleRows" :key="row.symbol" role="button" tabindex="0"
+                       class="range-stock" :class="['range-' + row.tone, { 'range-forming': row.forming, 'range-ready': rangeTargetReady(row) }]"
+                       :aria-pressed="rangeSelectedSymbol === row.symbol"
+                       :aria-label="row.ticker + ' · ' + row.zone + ' · EMA7 位置 ' + row.normalizedPosition.toFixed(2) + ' · 速度 ' + row.speed.toFixed(2)"
+                       @click="selectRangeStock(row)" @keydown.enter="selectRangeStock(row)" @keydown.space.prevent="selectRangeStock(row)">
+                      <title>{{ row.ticker }} · EMA7 {{ fmt2(row.ema7) }} · 位置 {{ row.normalizedPosition.toFixed(2) }} · 突破后距离 {{ row.distance.toFixed(2) }} · 速度 {{ row.speed.toFixed(2) }} · {{ row.candle }}</title>
+                      <line v-if="row.displaced" :x1="row.anchorX" :y1="row.anchorY" :x2="row.x" :y2="row.y" class="range-anchor-line" />
+                      <circle v-if="rangeTargetReady(row)" :cx="row.x" :cy="row.y" r="23" class="range-ready-halo" />
+                      <path v-if="rangeSelectedSymbol === row.symbol" :transform="'translate(' + row.x + ',' + row.y + ')'"
+                            d="M-25 -12v-13h13 M12 -25h13v13 M25 12v13H12 M-12 25h-13v-13" class="range-lock-reticle" />
+                      <circle :cx="row.x" :cy="row.y" r="19" class="range-stock-circle" />
+                      <circle v-if="row.ticker === 'QQQ'" :cx="row.x" :cy="row.y" r="21" class="range-qqq-border" />
+                      <text :x="row.x" :y="row.y + 4" text-anchor="middle" class="range-stock-label">{{ row.ticker }}</text>
+                    </g>
+                    <g class="range-anchor-layer" aria-hidden="true">
+                      <template v-for="row in rangeDistribution.visibleRows" :key="row.symbol">
+                        <circle v-if="row.displaced" :cx="row.anchorX" :cy="row.anchorY" r="4.5"
+                                class="range-stock range-anchor-dot" :class="'range-' + row.tone" />
                       </template>
-                    </div>
-                  </template>
-                  <div class="range-axis">
-                    <span></span>
-                    <div class="range-scale" v-range-width="width => rangePlotWidth = width">
-                      <span :style="{ left: rangePosition(-rangeDistribution.limit) }">−{{ rangeDistribution.limit }}</span>
-                      <span class="range-scale-zero">0</span>
-                      <span :style="{ left: rangePosition(rangeDistribution.limit) }">+{{ rangeDistribution.limit }}</span>
-                      <strong>均线速度（ATR 归一化）</strong>
-                    </div>
-                  </div>
+                    </g>
+                  </svg>
                 </div>
+                <p class="range-formula muted">先按现价相对昨高、昨低归区。<template v-if="rangeFocus === null">左上为昨高上方，左下为昨低下方，右侧为昨日区间内。</template>各区共用速度范围和 EMA7 位置刻度，灰带为 −1～+1，避让细线连接真实坐标。</p>
                 <div v-if="rangeSelectedRow" class="range-selection" aria-live="polite">
-                  <strong>{{ rangeSelectedRow.ticker }}</strong>
+                  <strong>{{ rangeSelectedRow.ticker }} · {{ rangeSelectedRow.zone }}</strong>
                   <span>{{ hmET(rangeSelectedRow.time) }} 美东 · {{ rangeSelectedRow.confirmed ? '已收盘' : '当前 K 线' }}</span>
-                  <span>{{ rangeSelectedRow.candle }} · 速度 {{ rangeSelectedRow.speed.toFixed(2) }} · 收盘值 {{ fmt2(rangeSelectedRow.close) }}</span>
-                  <span>{{ rangeSelectedRow.forming ? '小区间形成中' : '小区间' }} {{ fmt2(rangeSelectedRow.lower) }}–{{ fmt2(rangeSelectedRow.upper) }}</span>
-                  <span>昨低 {{ fmt2(rangeSelectedRow.prior.low) }} · 昨高 {{ fmt2(rangeSelectedRow.prior.high) }}（{{ rangeSelectedRow.prior.date }}）</span>
+                  <span>EMA7 {{ fmt2(rangeSelectedRow.ema7) }} · {{ ['高于上沿', '位于区间内', '低于下沿'][rangeSelectedRow.minor] }} · 位置 {{ rangeSelectedRow.normalizedPosition.toFixed(2) }} · 突破后推进 {{ rangeSelectedRow.distance.toFixed(2) }} 单位</span>
+                  <span>{{ rangeSelectedRow.candle }} · 速度 {{ rangeSelectedRow.speed.toFixed(2) }} · 现价 {{ fmt2(rangeSelectedRow.close) }}</span>
+                  <span>{{ rangeSelectedRow.forming ? '临时区间（盘前高低点）' : '小区间' }} {{ fmt2(rangeSelectedRow.lower) }}–{{ fmt2(rangeSelectedRow.upper) }}</span>
+                  <span v-if="rangeSelectedRow.prior">昨低 {{ fmt2(rangeSelectedRow.prior.low) }} · 昨高 {{ fmt2(rangeSelectedRow.prior.high) }}（{{ rangeSelectedRow.prior.date }}）</span>
                   <span v-if="rangeSelectedRow.target">目标 {{ rangeSelectedRow.target.label }} {{ fmt2(rangeSelectedRow.target.price) }}</span>
                 </div>
-                <p v-if="!rangeDistribution.rows.length" class="muted">等待昨高昨低、盘前区间、开盘前三根 K 线和 Pine 斜率就绪。</p>
+                <p v-if="!rangeDistribution.rows.length" class="muted">等待昨高昨低、有效小区间及时间对齐的 Pine EMA7、均线速度。</p>
                 <details v-if="rangeDistribution.pending.length" class="range-details">
                   <summary>待补齐区间或行情的标的（{{ rangeDistribution.pending.length }}）</summary>
                   <p class="muted">{{ rangeDistribution.pending.join('、') }}</p>
@@ -803,7 +934,74 @@
                 </details>
               </div>
             </el-tab-pane>
-            <!-- 影子回测 tab -->
+            <el-tab-pane class="workspace-pane pane-vwap" v-if="workspaceGroup === 'execution'" label="VWAP 分布图" name="vwap1m" lazy>
+              <vwap-distribution :frame="vwapDistributionFrame" :progress="vwapDistributionProgress"
+                                 @select="selectVwapStock"></vwap-distribution>
+              <div class="vwap-candidates">
+              <section class="opening-vwap-signals" aria-label="VWAP 外沿回踩候选">
+                <header class="opening-vwap-heading"><h3>VWAP 外沿回踩候选</h3></header>
+                <div v-if="!vwapPullbackCandidates.length" class="muted">暂无 EMA7 在轨道外且一分钟 ST 同向的候选</div>
+                <div v-else class="opening-vwap-cards">
+                  <article v-for="row in vwapPullbackCandidates" :key="row.symbol" class="opening-vwap-card">
+                    <button type="button" class="opening-vwap-pick" @click="tvShow(row.symbol)">
+                      <strong>{{ tickerOf(row.symbol) }}</strong>
+                      <span :class="row.direction === 1 ? 'pnl-pos' : 'pnl-neg'">{{ row.direction === 1 ? '多 · 上轨' : '空 · 下轨' }}</span>
+                    </button>
+                    <div class="opening-vwap-levels">外沿 {{ row.edge.toFixed(2) }} · ST 止损 {{ row.stop?.toFixed(2) ?? '—' }}</div>
+                    <div class="opening-vwap-status" :class="row.direction === 1 ? 'pnl-pos' : 'pnl-neg'">位置 {{ row.position > 0 ? '+' : '' }}{{ row.position.toFixed(2) }}σ · 速度 {{ row.speed > 0 ? '+' : '' }}{{ row.speed.toFixed(2) }}</div>
+                    <el-button size="small" type="primary"
+                               :disabled="demoMode || autoBusy || row.active || !row.ready || status.market_stale"
+                               @click="startAuto({symbols: [row.symbol], strategy: 'vwap_outer_pullback', instance_id: 'default', direction: row.direction})">
+                      {{ row.active ? '已启动' : row.ready ? '启动策略' : '止损位置无效' }}
+                    </el-button>
+                  </article>
+                </div>
+              </section>
+              <section v-if="showOpeningVwapCandidates" class="opening-vwap-signals" aria-label="开盘 VWAP 候选">
+                <header class="opening-vwap-heading">
+                  <h3>开盘 VWAP 候选</h3>
+                  <el-popover v-if="openingVwapChart" placement="top-end" trigger="click" :width="320"
+                              popper-style="max-width:calc(100vw - 24px)">
+                    <template #reference><el-button text size="small">信号 K 线</el-button></template>
+                    <figure class="opening-vwap-chart">
+                      <figcaption>{{ tickerOf(openingVwapChart.row.symbol) }} · {{ hmET(openingVwapChart.row.close_at) }} 收盘</figcaption>
+                      <p v-if="openingVwapChart.row.detail">{{ openingVwapChart.row.detail }}</p>
+                      <svg viewBox="0 0 318 108" role="img" aria-label="信号前三根一分钟 K 线与参考线">
+                        <path :d="'M14 ' + openingVwapChart.bandY + 'H221'" stroke="#74a6e6" stroke-dasharray="4 3" />
+                        <text x="229" :y="openingVwapChart.bandY + 4" fill="#9cc8ff">VWAP 外轨</text>
+                        <path :d="'M14 ' + openingVwapChart.stopY + 'H221'" stroke="#d1a257" stroke-dasharray="4 3" />
+                        <text x="229" :y="openingVwapChart.stopY + 4" fill="#d1a257">初始止损</text>
+                        <g v-for="bar in openingVwapChart.bars" :key="bar.time">
+                          <line :x1="bar.x" :x2="bar.x" :y1="bar.high" :y2="bar.low" :stroke="bar.color" />
+                          <rect :x="bar.x - 8" :y="bar.top" width="16" :height="bar.height" :fill="bar.color" />
+                          <text :x="bar.x" y="103" text-anchor="middle" fill="#bdc9db">{{ hmET(bar.time) }}</text>
+                        </g>
+                      </svg>
+                    </figure>
+                  </el-popover>
+                </header>
+                <div v-if="!openingVwapSignals.length" class="muted">暂无开盘候选</div>
+                <div v-else class="opening-vwap-cards">
+                  <article v-for="row in openingVwapSignals" :key="row.id" class="opening-vwap-card">
+                    <button type="button" class="opening-vwap-pick" @click="selectOpeningVwap(row)"
+                            :aria-pressed="openingVwapSelected === row.id">
+                      <strong>{{ tickerOf(row.symbol) }}</strong>
+                      <span :class="row.side === 'long' ? 'pnl-pos' : 'pnl-neg'">{{ row.side === 'long' ? '多' : '空' }}</span>
+                      <span :title="hmET(row.close_at) + ' 收盘'">{{ hmET(row.close_at) }}</span>
+                    </button>
+                    <div class="opening-vwap-levels">参考 {{ row.entry_px.toFixed(2) }} · 止损 {{ row.stop_px.toFixed(2) }}</div>
+                    <div class="opening-vwap-status muted" :title="row.detail || ''">实体 {{ row.body_pct.toFixed(2) }}% · {{ openingVwapStatus(row) }}</div>
+                    <el-button v-if="row.can_cancel" size="small" :loading="!!openingVwapBusy[row.id]"
+                               :disabled="demoMode" @click="prepareOpeningVwap(row, true)">撤销预约</el-button>
+                    <el-button v-else size="small" type="primary" :loading="!!openingVwapBusy[row.id]"
+                               :disabled="demoMode || row.status !== 'preview' || status.market_stale"
+                               @click="prepareOpeningVwap(row)">启动策略</el-button>
+                  </article>
+                </div>
+              </section>
+              </div>
+            </el-tab-pane>
+
             <el-tab-pane class="workspace-pane pane-shadow" v-if="workspaceGroup === 'research'" label="影子" name="shadow">
               <div class="perf-panel">
                 <div class="perf-group">
@@ -998,7 +1196,7 @@
                 <div class="section-heading"><h3>夜盘模拟测试</h3><a href="/static/architecture.html#night-test" target="_blank" rel="noopener">使用说明 ↗</a><el-tag type="warning">独立模拟 · 5M · 美东时间</el-tag><a href="/api/night-test/report" download="night-paper-test.json" v-if="night.run_id">导出测试报告 JSON</a></div>
                 <p class="muted">先连接数据核对 TV 的标的、24h 时段、复权和指标参数，再人工启动模拟。预载历史仅供查看，不产生订单；指标使用注册脚本默认输入。</p>
                 <div class="shadow-bt-form">
-                  <label>策略模型 <el-select v-model="nightForm.strategy" style="width:190px" :disabled="night.running"><el-option v-for="model in autoModels" :key="model.id" :label="model.name" :value="model.id" ></el-option></el-select></label>
+                  <label>策略模型 <el-select v-model="nightForm.strategy" style="width:190px" :disabled="night.running"><el-option v-for="model in autoModels.filter(model => !model.local_only)" :key="model.id" :label="model.name" :value="model.id" ></el-option></el-select></label>
                   <label>标的 <el-input v-model="nightForm.symbol" style="width:180px" :disabled="night.running" placeholder="NASDAQ:NVDA" ></el-input></label>
                   <label>数据时段 <el-select v-model="nightForm.session" style="width:150px" :disabled="night.running"><el-option label="24小时（含夜盘）" value="24h"></el-option><el-option label="盘前盘后" value="extended"></el-option><el-option label="常规时段" value="regular"></el-option></el-select></label>
                   <el-button :loading="nightBusy" :disabled="night.running" @click="nightAction('connect')">连接 / 重连数据</el-button>
@@ -1046,7 +1244,7 @@
                 <div class="wb-heading"><b>策略与执行验证</b><span class="muted">人工选择启动时机，核对策略输出、执行决策和最终结果</span></div>
                 <details class="wb-settings" :open="!wb"><summary>回测参数 · 展开修改后重新运行</summary>
                 <fieldset class="wb-form" :disabled="wbLoading">
-                  <label>策略模型<el-select v-model="wbModel" size="small" :disabled="wbLoading"><el-option v-for="m in autoModels" :key="m.id" :label="m.name" :value="m.id"></el-option></el-select></label>
+                  <label>策略模型<el-select v-model="wbModel" size="small" :disabled="wbLoading"><el-option v-for="m in autoModels.filter(model => !model.local_only)" :key="m.id" :label="m.name" :value="m.id"></el-option></el-select></label>
                   <label>标的<el-input v-model="wbSymbol" size="small" :disabled="wbLoading" placeholder="如 NVDA"></el-input></label>
                   <label>交易日 · 美东<el-date-picker v-model="wbDay" size="small" :disabled="wbLoading" type="date" value-format="YYYY-MM-DD" placeholder="默认最近已收盘交易日"></el-date-picker></label>
                   <label>人工启动时间 · 美东<el-select v-model="wbStartTime" size="small" filterable :disabled="wbLoading" aria-label="执行实例人工启动时间（美东）"><el-option v-for="hm in wbStartTimes" :key="hm" :label="hm + ' ET'" :value="hm"></el-option></el-select></label>
@@ -1511,34 +1709,53 @@
       </div>
     </main>
 
-    <footer class="opening-feed" aria-label="小区间突破消息流">
+    <footer class="opening-feed" :class="{ 'is-collapsed': openingFeedCollapsed }" aria-label="入场信号消息流">
       <div class="opening-feed-head">
-        <strong>小区间突破</strong>
-        <span class="muted">{{ openingBreakouts.length ? openingBreakouts.length + ' 条 · 美东K线开盘时间' : (openingBreakoutCoverage?.pending.length ? '等待行情和指标补齐' : '今日暂无信号') }}</span>
-        <el-button link size="small" v-if="openingBreakouts.length" @click="scrollOpeningFeedToLatest">回到最新</el-button>
+        <strong>入场信号</strong>
+        <span class="muted" v-if="entrySignalGroups.length">突破 {{ openingBreakouts.length }} · gold signal {{ goldenFeedRows.length }} · 美东 K 线开盘时间</span>
+        <span class="muted" v-else>{{ openingBreakoutCoverage?.pending.length ? '等待行情和指标补齐' : '暂无信号' }}</span>
+        <span v-if="openingFeedCollapsed && entrySignalGroups.length" class="muted">最新 {{ hmET(Math.max(...entrySignalGroups.map(group => group.time))) }}</span>
+        <el-button link size="small" v-if="entrySignalGroups.length && !openingFeedCollapsed" @click="scrollOpeningFeedToLatest">回到最新</el-button>
+        <el-button link size="small" :aria-expanded="!openingFeedCollapsed" aria-controls="entry-signal-stream" :aria-label="openingFeedCollapsed ? '展开入场信号' : '收起入场信号'" @click="toggleOpeningFeed">{{ openingFeedCollapsed ? '展开 ▴' : '收起 ▾' }}</el-button>
       </div>
-      <div v-if="openingBreakouts.length" ref="openingFeed" class="opening-feed-scroll"
+      <div v-if="entrySignalGroups.length" v-show="!openingFeedCollapsed" id="entry-signal-stream" ref="openingFeed" class="opening-feed-scroll"
            :class="{ dragging: openingFeedDrag }"
            @pointerdown="startOpeningFeedDrag" @pointermove="moveOpeningFeedDrag"
            @pointerup="endOpeningFeedDrag" @pointercancel="endOpeningFeedDrag"
            @lostpointercapture="endOpeningFeedDrag"
-           tabindex="0" role="region" aria-label="按收盘时间横向浏览突破信号">
-        <section v-for="group in openingBreakoutGroups" :key="group.time" class="opening-feed-group">
+           tabindex="0" role="region" aria-label="按美东 K 线时间横向浏览入场信号">
+        <section v-for="group in entrySignalGroups" :key="group.time" class="opening-feed-group">
           <div class="opening-feed-time">{{ hmET(group.time) }}</div>
           <div class="opening-feed-cards">
-            <article v-for="row in group.rows" :key="row.id" class="opening-feed-card" :class="row.side">
-              <div class="opening-feed-symbol">
-                <el-button link type="primary" @click="pickScreen(row)">{{ row.ticker }}</el-button>
-                <strong :class="row.side === 'long' ? 'pnl-pos' : 'pnl-neg'">{{ row.side === 'long' ? '上破' : '下破' }}</strong>
-              </div>
-              <span class="muted" :title="row.status_detail">{{ openingBreakoutStatus(row) }}</span>
-              <span>实体 {{ row.body_ema_ratio == null ? (row.body_ema10 === 0 ? '基线为 0' : '—') : row.body_ema_ratio.toFixed(2) + ' 倍实体EMA10' }}</span>
-              <span class="muted">实体 {{ row.body_atr == null ? '—' : row.body_atr.toFixed(2) + ' ATR' }}</span>
-              <span class="muted">止损 {{ row.stop_px == null ? '—' : row.stop_px.toFixed(2) }}</span>
-              <el-button size="small" :type="row.side === 'long' ? 'success' : 'danger'"
-                         :disabled="openingBreakoutEntryDisabled(row)"
-                         @click="placeOpeningBreakout(row)">{{ openingBreakoutActionLabel(row) }}</el-button>
-            </article>
+            <template v-for="{ kind, row } in group.rows" :key="kind + ':' + row.id">
+              <article v-if="kind === 'opening'" class="opening-feed-card" :class="row.side">
+                <div class="opening-feed-symbol">
+                  <el-button link type="primary" @click="pickScreen(row)">{{ row.ticker }}</el-button>
+                  <strong :class="row.side === 'long' ? 'pnl-pos' : 'pnl-neg'">{{ row.side === 'long' ? '上破' : '下破' }}</strong>
+                </div>
+                <span class="signal-kind">小区间突破</span>
+                <span class="muted" :title="row.status_detail">{{ openingBreakoutStatus(row) }}</span>
+                <span>实体 {{ row.body_ema_ratio == null ? (row.body_ema10 === 0 ? '基线为 0' : '—') : row.body_ema_ratio.toFixed(2) + ' 倍实体EMA10' }}</span>
+                <span class="muted">实体 {{ row.body_atr == null ? '—' : row.body_atr.toFixed(2) + ' ATR' }}</span>
+                <span class="muted">止损 {{ row.stop_px == null ? '—' : row.stop_px.toFixed(2) }}</span>
+                <el-button size="small" :type="row.side === 'long' ? 'success' : 'danger'"
+                           :disabled="openingBreakoutEntryDisabled(row)"
+                           @click="placeOpeningBreakout(row)">{{ openingBreakoutActionLabel(row) }}</el-button>
+              </article>
+              <article v-else class="opening-feed-card golden-signal-card" :class="row.side">
+                <div class="opening-feed-symbol">
+                  <el-button link type="primary" @click="pickScreen(row)">{{ row.ticker }}</el-button>
+                  <strong :class="row.side === 'long' ? 'pnl-pos' : 'pnl-neg'">{{ row.side === 'long' ? '做多' : '做空' }}</strong>
+                </div>
+                <span class="signal-kind">gold signal</span>
+                <span>{{ row.touched ? '已触线' : '未触线' }} · {{ now >= row.time + 300 ? '已结束' : '可操作至 ' + hmET(row.time + 300) }}</span>
+                <span>回撤价 {{ fmt2(row.entry) }} · 止损 {{ fmt2(row.stop_px) }}</span>
+                <el-button size="small" :type="row.side === 'long' ? 'success' : 'danger'"
+                           :disabled="goldenEntryDisabled(row)" @click="placeGoldenEntry(row)">
+                  {{ goldenSubmitted[row.id] ? '已提交' : now >= row.time + 300 ? '已过期' : '手动开仓' }}
+                </el-button>
+              </article>
+            </template>
           </div>
         </section>
       </div>
@@ -1638,7 +1855,9 @@
 
   <script src="https://unpkg.com/vue@3.5.13/dist/vue.global.prod.js"></script>
   <script src="https://unpkg.com/element-plus@2.9.1/dist/index.full.min.js"></script>
-  <script src="/static/range-distribution.js?v=2"></script>
-  <script src="/static/app.js?v=auto-direction-reference"></script>
+  <script src="/static/range-distribution.js?v=13"></script>
+  <script src="/static/vwap-distribution.js?v=vwap-display-grace"></script>
+<script src="/static/market-rhythm.js?v=candidate-protection-live-v9"></script>
+  <script src="/static/app.js?v=candidate-policy-live-v9"></script>
 </body>
 </html>

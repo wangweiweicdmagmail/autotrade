@@ -1,5 +1,11 @@
 /* autotrade 交易控制台前端逻辑（Vue3 + Element Plus，两宫格） */
 const { createApp } = Vue;
+const TV_EXTENSION_PRESENCE = 'chrome-extension://ehppgccaimaoccmhnncamnkpcknfmhge/presence.json';
+const TV_EXTENSION_DOWNLOAD = '/api/tv/extension.zip';
+const TD_ENTRY_THRESHOLD = 1;
+const openingVwapClock = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/New_York', weekday: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+});
 
 // 一次性提醒去重的持久化（存 localStorage）：刷新页面后保本/自动策略事件/
 // 自动平仓/未快速突破等「只播一次」的提醒不再重播
@@ -31,10 +37,12 @@ function calcPosition(equity, riskUsd, limitPx, stopPx, maxPositionPct, maxOrder
 }
 
 createApp({
+  components: { ...(typeof VwapDistribution === "undefined" ? {} : { VwapDistribution }),
+    ...(typeof MarketRhythm === "undefined" ? {} : { MarketRhythm }) },
   directives: {
     rangeWidth: {
       mounted(element, binding) {
-        const observer = new ResizeObserver(([entry]) => binding.value(entry.contentRect.width));
+        const observer = new ResizeObserver(([entry]) => binding.value(entry.contentRect.width, entry.contentRect.height));
         observer.observe(element);
         element.rangeWidthObserver = observer;
       },
@@ -45,14 +53,20 @@ createApp({
   },
   data() {
     return {
-      status: { dry_run: true, connected: false, halted: false, equity: null, daily_pnl: null, market_age: null, market_transport_age: null, market_bar_age: null, market_stale: false, market_stale_reason: '', market_running: true, allow_short: true, total_risk_usd: 0, max_total_risk_usd: 0, total_position_pct: null, tv_view: null },
+      status: { dry_run: true, connected: false, halted: false, equity: null, daily_pnl: null, market_age: null, market_transport_age: null, market_bar_age: null, market_stale: false, market_stale_reason: '', market_running: true, allow_short: true, total_risk_usd: 0, max_total_risk_usd: 0, total_position_pct: null },
       market: {},
+      vwapDistributionFrame: null,
+      vwapDistributionProgress: null,
+      vwapDistributionSourceFrame: null,
+      vwapDisplayWait: null,
+      openingVwapSignals: [],
+      openingVwapBusy: {},
+      openingVwapSelected: '',
       lots: [],
+      lotsReady: false,
       orderSymbolFilter: '',
       orderKindFilter: 'all',
-      maxPositionPct: (() => {   // 最大仓位比例（%，localStorage 持久化）
-        try { const v = parseFloat(localStorage.getItem('max_position_pct')); return isFinite(v) && v > 0 ? v : 100; } catch (e) { return 100; }
-      })(),
+      maxPositionPct: 140, // 单笔定量及单只股票合计上限；快照同步服务端配置
       atrMult: 1.0,        // 全局止损 ATR 倍数（快照 status.stop_atr_mult 为准，全客户端同步）
       atrMultDirty: false, // 止损倍数输入框编辑中标记（编辑时不被快照覆盖）
       pyramidAutoBreakeven: true,
@@ -71,22 +85,40 @@ createApp({
       now: Date.now() / 1000,   // 前端实时时钟（每秒更新，驱动时钟走秒）
       selectRefs: {},           // el-select 实例引用（读内部 query）
       logs: [],                 // 运行日志（后端环形缓冲区）
-      bottomTab: 'instances',  // 默认将完整内容区留给执行实例列表
+      bottomTab: 'rhythm',
+      rhythmFrame: null,
+      entryCandidates: {ready:false,reason:'等待候选榜单',rows:[]},
+      tvGridStatus: '等待TV双窗口席位齐备',
+      tvGridLastKey: '',
+      tvGridLayoutKeys: {},
+      tvGridFailedKey: '',
+      tvGridRetryAt: 0,
+      tvGridRetries: 0,
+      tvGridInFlight: false,
+      tvGridPending: null,
+      tvEntryMarkers: [],
+      tvMarkersAttemptKey: '',
+      tvMarkersRetryAt: 0,
+      tvMarkersRetries: 0,
+      tvMarkersBusy: false,
+      tvMarkerStatus: '等待实盘成交',
+      ipoOpenings: {watches:[],events:[],error:''},
+      notifiedIpoOpenings: Object.assign({},loadNotified('notified_ipo_openings')),
       workspaceGroup: 'execution',
-      workspaceExpanded: false,
+      workspaceExpanded: true,
       workspaceLayouts: {},
       settingsVisible: false,
       globalControlsVisible: false,
       executionParamsOpen: false,
       workspaceTabs: {
-        execution: ['instances', 'orders', 'fvg', 'screen', 'momentum', 'openingBreakouts'], validation: ['backtest', 'night'],
+        execution: ['rhythm', 'vwap1m', 'openingBreakouts', 'instances', 'fvg', 'screen', 'momentum'], validation: ['backtest', 'night'],
         research: ['reports', 'news', 'shadow', 'returns', 'perf'],
         operations: ['log', 'events', 'copy'],
       },
       workspaceNames: { execution: '执行监控', validation: '回测验证', research: '研究复盘', operations: '系统运维' },
       workspaceTabNames: { instances: '执行监控', orders: '订单批次', fvg: 'FVG 监控', backtest: '回测验证', night: '夜盘模拟',
         screen: '选股', momentum: '推进力', reports: '盘前报告', news: '盘前新闻', shadow: '影子', returns: '收益对比', perf: '绩效',
-        openingBreakouts: '区间分布图', log: '运行日志', events: '事件', copy: '跟单管理' },
+        openingBreakouts: '区间分布图', vwap1m: 'VWAP 分布图', rhythm: '候选与订单', log: '运行日志', events: '事件', copy: '跟单管理' },
       bottomPanelHeight: (() => {
         try { const v = parseInt(localStorage.getItem('bottom_panel_height'), 10); return v >= 180 && v <= 800 ? v : 420; } catch (e) { return 420; }
       })(),
@@ -111,6 +143,7 @@ createApp({
       externalAlerts: [],         // 外部订单/持仓告警（IBKR 手动单，告警模式）
       autoCloseNotices: [],       // 自动平仓记录（语音/通知）
       autoNotices: [],            // 金字塔建仓/加仓/平仓事件（语音/通知）
+      prioritySpeechCount: 0,
       autoModel: 'ema9_pyramid',
       autoInstanceId: 'default',
       autoModels: [{ id: 'ema9_pyramid', name: 'EMA9-ST-ATR', execution_profile: 'ema9_legacy_pyramid' }],
@@ -118,10 +151,12 @@ createApp({
       fvgReverseNotices: [],      // 反向 FVG 自动平仓记录（语音/通知）
       lastScanAlert: {},          // 已提醒过的持仓扫描（按 scanned_at 去重）
       lastBreakeven: loadNotified('notified_breakeven'),   // 已播报过的保本（持久化，刷新不重播）
+      lastTimedExit: loadNotified('notified_candidate_timed_exit'),
       slowBreakAlerts: [],        // 未快速突破提醒（开仓超时未保本）
       lastSlowBreak: loadNotified('notified_slowbreak'),   // 已播报过的未快速突破（持久化）
       lastStopAlert: {},          // 已提醒过的止损单缺失（按 checked_at 去重）
       lastExternalAlert: {},      // 已提醒过的外部订单/持仓（kind:ticker 去重，60s 节流）
+      lastExternalEntryResult: loadNotified('notified_external_entry_results'),
       lastAutoCloseNotice: loadNotified('notified_autoclose'),  // 已播报过的自动平仓（持久化）
       lastAutoNotice: loadNotified('notified_pyramid'),     // 已播报过的金字塔事件（持久化）
       autoNoticesInitDone: false, // 首屏只建基线，不补播服务端历史事件
@@ -169,10 +204,18 @@ createApp({
       reportWasRunning: false,     // 生成中→完成 跳变检测（完成即刷新列表+提示）
       srcInput: '',                // 视频源输入框（YouTube 链接）
       srcList: [],                 // 视频源列表（/api/report/sources）
-      // TV 看盘面板（客户端截图回传：每人一格，10s 自动刷新；master 不弹）
-      tvView: { visible: false, symbol: '', image: '', pane: null,
-                loading: false, error: '' },
-      tvViewTimer: null,           // 自动刷新定时器句柄
+      tvSwitchRequest: 0,
+      tvExtensionState: 'checking',
+      tvExtensionReason: '',
+      tvExtensionChecking: false,
+      tvSetupVisible: false,
+      tvHostBindingVisible: false,
+      tvHostCharts: [],
+      tvHostTarget: '',
+      tvHostBindingBusy: false,
+      tvSetupPrompted: false,
+      tvChromeAddressCopied: false,
+      tvExtensionDownload: TV_EXTENSION_DOWNLOAD,
       // 悬浮交易台折叠状态（localStorage 持久化，小屏省空间）
       deckCollapsed: (() => { try { return localStorage.getItem('deck_collapsed') === '1'; } catch (e) { return false; } })(),
       fvgFreshIds: {},             // 会话内新到事件 id -> 到达时间（新鲜行高亮用）
@@ -180,11 +223,18 @@ createApp({
       lastFvgDataTime: null,       // 上一次数据时钟（bar 收盘滴答用，首次仅建基线）
       breakoutSignals: [],         // 盘前突破信号（后端快照，今日已确认）
       openingBreakouts: [],
+      goldenSubmitted: {},
+      goldenFeedHistory: {},
       rangeSelectedSymbol: '',
+      rangeFocus: null,
+      rangeActionBusy: false,
       rangePlotWidth: 0,
+      rangePlotHeight: 560,
       openingBreakoutCoverage: null,
       openingBreakoutsInitialized: false,
       openingFeedDrag: null,
+      openingFeedCollapsed: (() => { try { return localStorage.getItem('opening_feed_collapsed') === '1'; } catch (_) { return false; } })(),
+      openingFeedPreferenceSet: (() => { try { return localStorage.getItem('opening_feed_collapsed') != null; } catch (_) { return false; } })(),
       breakoutSeenIds: {},         // 已通报过的突破信号（按 id 去重）
       breakoutInitDone: false,     // 突破信号首屏基线标记
       auto: { enabled: false, strategy: '', instances: [], proposals: [] },
@@ -234,8 +284,11 @@ createApp({
       btResult: null,
       btError: '',
       slots: [
-        { symbol: '', limitType: 'market' },   // 唯一宫格：默认选股第一名，市价单（方向按钮按趋势多空都开）
+        { symbol: '', limitType: 'rhythm_market', stopMode:'atr_2', manualDirection: null, directionConfirming: false,
+          vwapOutsideOnly:true },
       ],
+      candidateProtection:{version:1,timed_breakeven_enabled:true,breakeven_minutes:5,trailing_enabled:false,trailing_source:'ema9_5m'},
+      candidateProtectionSaving:false,
       placing: false,
       ws: null,
       systemClosing: false,
@@ -259,12 +312,100 @@ createApp({
   },
 
   computed: {
+    showOpeningVwapCandidates() {
+      const et = Object.fromEntries(openingVwapClock.formatToParts(this.now * 1000)
+        .map(({ type, value }) => [type, value]));
+      const minute = Number(et.hour) * 60 + Number(et.minute);
+      return et.weekday !== 'Sat' && et.weekday !== 'Sun' && minute >= 570 && minute < 585;
+    },
+    vwapPullbackCandidates() {
+      const active = new Set((this.auto?.instances || [])
+        .filter(row => row.strategy === 'vwap_outer_pullback' && row.state !== 'DONE')
+        .map(row => row.symbol));
+      return (this.vwapDistributionFrame?.rows || [])
+        .filter(row => Number.isFinite(row.position) && Math.abs(row.position) > 1 && row.st_direction === Math.sign(row.position) &&
+          Number.isFinite(row.speed))
+        .map(row => {
+          const direction = Math.sign(row.position);
+          const edge = direction === 1 ? row.upper : row.lower;
+          const stop = row.st_price;
+          const ready = Number.isFinite(edge) && Number.isFinite(stop) && stop > 0 &&
+            (edge - stop) * direction > 0;
+          return { ...row, direction, edge, stop, ready, active: active.has(row.symbol) };
+        })
+        .sort((a, b) => b.position - a.position || a.symbol.localeCompare(b.symbol));
+    },
+    openingVwapChart() {
+      const row = this.openingVwapSignals.find(signal => signal.id === this.openingVwapSelected);
+      if (!row || row.candles?.length !== 3) return null;
+      const upper = Math.max(row.vwap_band, ...row.candles.map(bar => bar.high));
+      const lower = Math.min(row.vwap_band, ...row.candles.map(bar => bar.low));
+      const y = price => 10 + (upper - price) / Math.max(upper - lower, 0.01) * 74;
+      return {
+        row, bandY: y(row.vwap_band), stopY: y(row.stop_px),
+        bars: row.candles.map((bar, index) => ({
+          time: bar.time, x: 45 + index * 73,
+          high: y(bar.high), low: y(bar.low), top: y(Math.max(bar.open, bar.close)),
+          height: Math.max(2, Math.abs(y(bar.open) - y(bar.close))),
+          color: bar.close > bar.open ? '#45be8a' : '#f57384',
+        })),
+      };
+    },
     rangeDistribution() {
       const symbols = new Set([...this.watchlist, ...Object.keys(this.status.market_session?.symbols || {})]);
-      return RangeDistribution.build(this.market, symbols, this.rangePlotWidth);
+      return RangeDistribution.build(this.market, symbols, this.rangePlotWidth, this.rangePlotHeight, this.rangeFocus);
     },
     rangeSelectedRow() {
       return this.rangeDistribution.rows.find(row => row.symbol === this.rangeSelectedSymbol);
+    },
+    rangeReferenceLines() {
+      return RangeDistribution.referenceLines(this.rangeSelectedRow, this.rangeDistribution);
+    },
+    rangeReadyTargets() {
+      return this.rangeDistribution.rows.filter(row => this.rangeTargetReady(row))
+        .sort((a, b) => b.distance - a.distance || Math.abs(b.speed) - Math.abs(a.speed));
+    },
+    rangeGoldenSignal() {
+      return this.goldenSignalRows.find(row => row.symbol === this.rangeSelectedSymbol);
+    },
+    rangeTargetBlock() {
+      if (this.demoMode) return '演示模式';
+      if (!this.rangeSelectedRow) return '点击闪烁目标锁定股票';
+      if (!this.rangeTargetReady(this.rangeSelectedRow)) return '目标未就绪或行情已过期';
+      if (this.status.halted) return '账户风控已暂停';
+      if (!this.status.dry_run && !this.status.connected) return 'IBKR 未连接';
+      return '';
+    },
+    rangeGoldenBlock() {
+      if (!this.rangeSelectedSymbol) return '点击图中的股票选择目标';
+      return this.goldenEntryBlock(this.rangeGoldenSignal);
+    },
+    rangeAutoBlock() {
+      if (this.rangeTargetBlock) return this.rangeTargetBlock;
+      if (!this.autoModels.some(model => model.id === 'ema7_autotrade_v2')) return 'EMA7 v2 模型未加载';
+      const row = this.rangeSelectedRow;
+      const model = this.market[row.symbol]?.e7v2;
+      if (model?.time !== row.time || !(model.entry_price > 0)) return 'EMA7 v2 实时指标未就绪';
+      if (model.direction !== (row.minor === 0 ? 1 : -1)) return 'EMA7 v2 方向与突破方向不一致';
+      return '';
+    },
+    goldenSignalRows() {
+      const rows = [];
+      for (const [symbol, data] of Object.entries(this.market)) {
+        const time = data.bar?.time;
+        if (!(time <= this.now && this.now < time + 300)) continue;
+        const row = this.goldenFeedRow(symbol, data.golden, time);
+        if (row) rows.push(row);
+      }
+      return rows.sort((a, b) => Number(b.touched) - Number(a.touched) || a.ticker.localeCompare(b.ticker));
+    },
+    goldenFeedRows() {
+      const day = this.goldenFeedDay(this.now);
+      const active = this.goldenSignalRows;
+      const activeIds = new Set(active.map(row => row.id));
+      const expired = Object.values(this.goldenFeedHistory).filter(row =>
+        row.day === day && row.time + 300 <= this.now && !activeIds.has(row.id));
+      return [...active, ...expired];
     },
     openingBreakoutGroups() {
       const groups = new Map();
@@ -277,6 +418,21 @@ createApp({
         time, rows: rows.sort((a, b) => (b.body_atr ?? -1) - (a.body_atr ?? -1)),
       }))
         .sort((a, b) => b.time - a.time);
+    },
+    entrySignalGroups() {
+      const groups = new Map();
+      for (const row of this.goldenFeedRows) {
+        if (!groups.has(row.time)) groups.set(row.time, []);
+        groups.get(row.time).push({ kind: 'golden', row });
+      }
+      for (const group of this.openingBreakoutGroups) {
+        if (!groups.has(group.time)) groups.set(group.time, []);
+        groups.get(group.time).push(...group.rows.map(row => ({ kind: 'opening', row })));
+      }
+      return Array.from(groups, ([time, rows]) => ({ time, rows })).sort((a, b) => b.time - a.time);
+    },
+    latestEntrySignalTime() {
+      return this.entrySignalGroups[0]?.time ?? 0;
     },
     visibleMomentumRows() {
       if (!this.momentumBreakoutsOnly) return this.momentum;
@@ -293,6 +449,7 @@ createApp({
       });
     },
     riskUsd() { return this.status.risk_per_trade_usd || 0; },
+    manualSymbols() { return this.status.candidate_entry_required ? (this.entryCandidates.rows||[]).map(r=>r.symbol) : this.watchlist; },
     nightChart() {
       const rows = (this.night.bars || []).slice(-90);
       const fields = new Map((this.night.history_outputs || []).map(row => [row.time, row]));
@@ -333,8 +490,7 @@ createApp({
     },
     logPanelStyle() {
       if (this.bottomTab === 'instances') return { display: 'none' };
-      if (this.workspaceExpanded) return { flex: '1 1 auto', minHeight: '240px' };
-      return { height: `min(${this.bottomPanelHeight}px, 35vh)`, flex: `0 1 min(${this.bottomPanelHeight}px, 35vh)`, minHeight: '140px' };
+      return { flex: '1 1 auto', minHeight: '240px' };
     },
     selectedAutoModel() { return this.autoModels.find(m => m.id === this.autoModel) || {}; },
     executionOverview() {
@@ -389,6 +545,13 @@ createApp({
       // 单格交易台（v2026-10-23 起一格，方向按钮按趋势多空都开）
       return this.slots.map((slot) => this.calcSlot(slot));
     },
+    manualTradeContexts() {
+      return this.slots.map(slot => `${slot.symbol}|${slot.limitType}`);
+    },
+    tvPaperOrderNotices() {
+      const notices = this.status?.tv_paper_sync?.notices ?? [];
+      return notices.filter(notice => notice.message !== '上次 TV 操作结果待核对，暂停自动重发');
+    },
     // 订单批次生命周期排序：挂单/持仓在前、已完结在后（按平仓时间倒序）；
     // 生效中组内再按「本客户端交易员优先 → 创建时间」排序（自己的批次一眼可见）
     sortedLots() {
@@ -397,7 +560,7 @@ createApp({
       const own = (l) => (this.traderName && norm(l.trader) === this.traderName) ? 0 : 1;
       const sourceLots = this.demoMode ? this.demoOrderLots : this.lots;
       const rows = sourceLots.filter(l => {
-        if (this.orderSymbolFilter && l.symbol !== this.orderSymbolFilter) return false;
+        if (this.orderSymbolFilter && !this.sameOrderSymbol(l.symbol,this.orderSymbolFilter)) return false;
         const pyramid = l.limit_type === 'auto_ema9_pyramid'
           || (l.signal_snapshot && l.signal_snapshot.pyramid_seed);
         if (this.orderKindFilter === 'pyramid' && !pyramid) return false;
@@ -591,7 +754,36 @@ createApp({
 
   // 参数持久化：单笔资金/最大仓位/FVG 时间窗口改动即写 localStorage（各浏览器独立）
   watch: {
-    maxPositionPct(v) { try { localStorage.setItem('max_position_pct', String(v)); } catch (e) { /* 忽略 */ } },
+    manualTradeContexts: {
+      flush: 'sync',
+      handler(contexts, previous = []) {
+        contexts.forEach((context, i) => {
+          if (context !== previous[i]) {
+            this.slots[i].manualDirection = null;
+            this.slots[i].directionRevision = (this.slots[i].directionRevision || 0) + 1;
+          }
+        });
+      },
+    },
+    latestEntrySignalTime(time, previousTime) {
+      if (time <= previousTime) return;
+      this.openingFeedDrag = null;
+      this.$nextTick(this.scrollOpeningFeedToLatest);
+    },
+    goldenSignalRows(rows, previous) {
+      if (this.demoMode || this.status.market_stale) return;
+      this.rememberGoldenFeedRows(rows);
+      const seen = new Map(previous.map(row => [row.id, row.touched]));
+      const fresh = rows.filter(row => !seen.has(row.id) || (row.touched && !seen.get(row.id)));
+      if (!fresh.length) return;
+      if (fresh.some(row => row.time === this.latestEntrySignalTime && !seen.has(row.id))) {
+        this.openingFeedDrag = null;
+        this.$nextTick(this.scrollOpeningFeedToLatest);
+      }
+      const summary = fresh.slice(0, 3).map(row =>
+        row.ticker + (row.side === 'long' ? ' 多' : ' 空') + (row.touched ? '已触线' : '待回撤'));
+      this.$message.info('gold signal · ' + summary.join('、') + (fresh.length > 3 ? ' 等 ' + fresh.length + ' 条' : ''));
+    },
     fvgWindow(v) { try { localStorage.setItem('fvg_window', String(v)); } catch (e) { /* 忽略 */ } },
     deckCollapsed(v) { try { localStorage.setItem('deck_collapsed', v ? '1' : '0'); } catch (e) { /* 忽略 */ } },
     demoMode(v) { try { localStorage.setItem('demo_mode', v ? '1' : '0'); } catch (e) { /* 忽略 */ } },
@@ -607,7 +799,12 @@ createApp({
     setInterval(() => { if (this.bottomTab === 'night') this.fetchNightStatus(); }, 2000);
     // 先确认本客户端身份（master 以服务端判定为准，不在前端猜 IP），未确认前每 5s 轮询
     this.checkIdentity();
-    setInterval(() => this.checkIdentity(), 5000);
+    setInterval(() => {
+      this.checkIdentity();
+      this.checkTvExtension();
+    }, 5000);
+    window.addEventListener('autotrade:tv-bridge-ready', () => this.checkTvExtension());
+    window.addEventListener('focus', () => this.checkTvExtension());
     this.connectWS();
     // 点击悬浮交易台以外任意位置 → 自动收起（Element Plus 下拉/弹窗渲染在 body，
     // 不属于 .deck，必须排除，否则选股点选项/确认框按钮会误收起）
@@ -674,21 +871,22 @@ createApp({
       finally { this.nightBusy = false; }
     },
     selectWorkspace(group, tab) {
+      if(group==='execution'&&tab==='orders'&&this.workspaceTabs.execution.includes('rhythm'))tab='rhythm';
       if (this.workspaceTabs && !this.workspaceTabs[group]) return;
       if (tab && !this.workspaceTabs[group].includes(tab)) return;
       this.saveWorkspaceLayout();
       this.workspaceGroup = group;
-      const saved = this.workspaceLayouts[group] || {};
+      const saved = {...(this.workspaceLayouts[group] || {})};
+      if(group==='execution'&&saved.tab==='orders'&&this.workspaceTabs.execution.includes('rhythm'))saved.tab='rhythm';
       this.bottomTab = tab || (this.workspaceTabs[group].includes(saved.tab) && saved.tab) || this.workspaceTabs[group][0];
-      this.workspaceExpanded = this.bottomTab === 'instances' ? false : tab ? true : (saved.expanded ?? true);
+      this.workspaceExpanded = this.bottomTab !== 'instances';
       if (saved.height >= 180) this.bottomPanelHeight = saved.height;
       this.onBottomTabChange(this.bottomTab);
     },
     saveWorkspaceLayout() {
-      this.workspaceLayouts[this.workspaceGroup] = { tab: this.bottomTab, expanded: this.workspaceExpanded, height: this.bottomPanelHeight };
+      this.workspaceLayouts[this.workspaceGroup] = { tab: this.bottomTab, height: this.bottomPanelHeight };
       try { localStorage.setItem('workspace_layouts', JSON.stringify(this.workspaceLayouts)); } catch (_) { /* presentation only */ }
     },
-    toggleWorkspace() { this.workspaceExpanded = !this.workspaceExpanded; this.saveWorkspaceLayout(); },
     profileName(profile) { return { single_entry: '单次建仓', ema9_legacy_pyramid: 'EMA9-ST-ATR 金字塔兼容' }[profile] || profile || '未提供'; },
     instanceTitle(i) { return `${this.autoModelName(i.strategy)} / ${i.strategy_instance_id || 'default'} / ${i.symbol}`; },
     instanceHasPosition(i) {
@@ -765,6 +963,7 @@ createApp({
     },
 
     onBottomTabChange(name) {
+      if (!this.openingFeedPreferenceSet) this.openingFeedCollapsed = name === 'rhythm';
       if (this.workspaceLayouts) this.saveWorkspaceLayout();
       if (name === 'shadow') this.loadStrategyShadow();
       if (name === 'returns' && !this.returnsData && !this.returnsLoading) {
@@ -1033,6 +1232,7 @@ createApp({
         } else if (d.role === 'trader' && d.approved) {
           this.traderName = d.name;
           this.identity = 'ok';
+          this.checkTvExtension();
         } else if (d.role === 'trader' && d.expired) {
           // token 超过有效期：清除本地凭证，回到登记流程（提示过期原因）
           this.identityNotice = '登录已过期（超过 ' + (d.ttl_hours || 10) + ' 小时有效期），请重新登记';
@@ -1142,6 +1342,7 @@ createApp({
         auto_order_placed: '策略建仓', auto_filled: '策略成交',
         auto_order_failed: '策略下单失败', auto_expired: '埋单过期',
         auto_breakeven: '移动保本', breakout_first_bar_protection: '突破首根K线保护', breakout_close_protection: '突破五分钟保护', auto_trail: 'ST跟踪',
+        candidate_order_protection:'候选订单保护',candidate_order_protection_failed:'候选订单保护待重试',
         auto_reverse_close: '反向平仓', auto_done: '实例结束',
         auto_adopted: '收养人工仓',
         auto_entry_proposed: '开仓候选', auto_entry_approved: '确认开仓候选',
@@ -1280,32 +1481,44 @@ createApp({
     },
 
     // 策略：启动 / 停止 / 开仓候选决策
-    async startAuto() {
+    async startAuto(target = null) {
       if (this.autoBusy) return;
       if (this.demoMode) {
         this.$message.info('演示模式不会启动真实策略');
         return;
       }
       this.autoBusy = true;
+      let symbols = [];
       try {
-        const symbols = this.autoSymbols.split(',').map(s => s.trim()).filter(Boolean);
-        const request = { strategy: this.autoModel, instance_id: this.autoInstanceId, symbols };
+        if (target?.validate && !target.validate()) return;
+        symbols = Array.isArray(target?.symbols) ? target.symbols
+          : this.autoSymbols.split(',').map(s => s.trim()).filter(Boolean);
+        const request = {
+          strategy: target?.strategy || this.autoModel,
+          instance_id: target?.instance_id || this.autoInstanceId, symbols,
+        };
         const preview = await fetch('/api/auto/start/preview', {
           method: 'POST', headers: this.tradeHeaders(true), body: JSON.stringify(request),
         });
         this.checkWrite403(preview);
         const check = await preview.json();
         if (!preview.ok) throw new Error(typeof check.detail === 'string' ? check.detail : '方向检查失败');
+        if (target?.direction && symbols.some(symbol => check.directions[symbol] !== target.direction)) {
+          throw new Error('策略方向与锁定目标不一致，请重新核对');
+        }
         const directionText = value => ({ 1: '多', [-1]: '空' }[value] || '未就绪');
-        const targets = check.symbols.map(s => `${s} ${directionText(check.directions[s])}`).join('、');
+        const targets = check.symbols.map(s => `${s} ${check.follow_signal_direction ? '按信号方向' : directionText(check.directions[s])}`).join('、');
         try {
+          const candidate = check.candidate;
+          const levels = candidate ? `当前外沿 ${candidate.entry_price.toFixed(2)}，ST 止损 ${candidate.stop_px.toFixed(2)}。触线时按最新值重新核对。` : '';
           await this.$confirm(
-            `策略模型 ${check.model}，实例 ${request.instance_id}，首仓预算 $${check.risk}。QQQ 当前方向：${directionText(check.directions['NASDAQ:QQQ'])}（仅供参考）。标的方向：${targets}。确认启动？`,
+            `策略模型 ${check.model}，实例 ${request.instance_id}，首仓预算 $${check.risk}。QQQ 当前方向：${directionText(check.directions['NASDAQ:QQQ'])}（仅供参考）。标的方向：${targets}。${levels}确认启动？`,
             '启动执行实例 · 二次确认', {
               type: 'warning', confirmButtonText: '确认启动', cancelButtonText: '取消',
               closeOnClickModal: false, autofocus: false,
             });
         } catch { return; }
+        if (target?.validate && !target.validate()) return;
         const r = await fetch('/api/auto/start', {
           method: 'POST', headers: this.tradeHeaders(true),
           body: JSON.stringify({ ...request, symbols: check.symbols, confirmed_directions: check.directions }),
@@ -1314,9 +1527,12 @@ createApp({
         const d = await r.json();
         if (!r.ok) throw new Error(typeof d.detail === 'string' ? d.detail : '启动失败');
         const reasons = Object.entries(d.skipped_reasons || {}).map(([s, reason]) => `${s.split(':').pop()}：${reason}`);
+        if (d.skipped.length) this.speakStrategyFailure('策略启动失败', d.skipped);
         if (reasons.length) this.$message.warning(reasons.join('；'));
-        else this.$message.success(`已启动 ${d.started.length} 个实例${d.skipped.length ? '，跳过 ' + d.skipped.length : ''}`);
+        else if (d.skipped.length) this.$message.warning(`已启动 ${d.started.length} 个实例，跳过 ${d.skipped.length} 个标的`);
+        else this.$message.success(`已启动 ${d.started.length} 个实例`);
       } catch (e) {
+        this.speakStrategyFailure('策略启动失败', symbols);
         this.$message.error(e.message || String(e));
       } finally {
         this.autoBusy = false;
@@ -1650,6 +1866,72 @@ createApp({
         { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false });
     },
 
+    vwapDisplayFallback(update, market, observedAt) {
+      const progress = update?.progress;
+      const time = progress?.time, total = progress?.total;
+      if (!Number.isSafeInteger(time) || time <= 0 || !Number.isSafeInteger(total) || total <= 0
+          || !Number.isFinite(observedAt) || progress.ready >= total) {
+        this.vwapDisplayWait = null;
+        return null;
+      }
+      if (!this.vwapDisplayWait || this.vwapDisplayWait.time !== time || observedAt < this.vwapDisplayWait.since) {
+        this.vwapDisplayWait = {time, since: observedAt};
+      }
+      if (observedAt - this.vwapDisplayWait.since < 5 || time < (this.vwapDistributionFrame?.time ?? 0)) return null;
+      const source = this.vwapDistributionSourceFrame;
+      const sessions = this.status.market_session?.symbols || {};
+      const expected = source?.rows?.length === total
+        ? source.rows.map(row => row.symbol)
+        : Object.keys(sessions).filter(symbol => typeof sessions[symbol]?.requested === 'string'
+          && sessions[symbol].requested !== 'default');
+      if (expected.length !== total || new Set(expected).size !== total) return null;
+      expected.sort();
+      const rows = [], delayed = [], auxiliary = [];
+      for (const symbol of expected) {
+        const row = market[symbol]?.vwap_1m;
+        if (row?.time !== time || ![-1, 1].includes(row.st_direction)
+            || !['position', 'vwap', 'upper', 'lower', 'ema'].every(key => Number.isFinite(row[key]))) {
+          delayed.push(symbol);
+          continue;
+        }
+        rows.push({...row, symbol});
+        if (!Number.isFinite(row.speed)) auxiliary.push(symbol);
+      }
+      if (rows.length < Math.ceil(total * 0.9)) return null;
+      // 这是显示层的容错画面；原始完整批次和交易行情保持各自的时间与版本。
+      const key = JSON.stringify([time, rows, delayed, auxiliary]);
+      if (this.vwapDistributionFrame?.display_key === key) return this.vwapDistributionFrame;
+      return {time, revision: 0, rows, display_only: true, display_expected: total,
+        display_delayed: delayed, display_auxiliary_waiting: auxiliary,
+        display_updated_at: observedAt * 1000, display_key: key};
+    },
+
+    acceptVwapDistribution(update, market = {}, observedAt = Date.now() / 1000) {
+      const frame = update?.frame;
+      const previous = this.vwapDistributionSourceFrame
+        || (this.vwapDistributionFrame?.display_only ? null : this.vwapDistributionFrame);
+      const revision = frame?.revision === undefined ? 0 : frame.revision;
+      const rows = frame?.rows;
+      const total = update?.progress?.total;
+      const complete = Array.isArray(rows) && rows.length > 0
+        && rows.every(row => typeof row?.symbol === 'string' && row.symbol && row.time === frame.time)
+        && new Set(rows.map(row => row.symbol)).size === rows.length
+        && (!(total > 0) || rows.length === total);
+      const valid = Number.isSafeInteger(frame?.time) && frame.time > 0
+        && Number.isSafeInteger(revision) && revision >= 0 && complete;
+      const newer = valid && (!previous || frame.time > previous.time
+        || (frame.time === previous.time && revision > (previous.revision ?? 0)));
+      if (newer) this.vwapDistributionSourceFrame = frame;
+      const current = this.vwapDistributionFrame;
+      const source = this.vwapDistributionSourceFrame;
+      const candidate = this.vwapDisplayFallback(update, market, observedAt)
+        || (newer || !current?.display_only || source?.time > current.time ? source : null);
+      const changed = candidate && candidate !== current && (!current || candidate.time >= current.time);
+      if (changed) this.vwapDistributionFrame = candidate;
+      this.vwapDistributionProgress = update?.progress ?? null;
+      return !!changed;
+    },
+
     connectWS() {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
       const ws = new WebSocket(`${proto}://${location.host}/ws`);
@@ -1658,6 +1940,11 @@ createApp({
         const msg = JSON.parse(ev.data);
         if (msg.type === 'snapshot') {
           this.status = msg.status;
+          if(Number.isFinite(msg.status?.max_symbol_position_pct)&&msg.status.max_symbol_position_pct>0)
+            this.maxPositionPct=msg.status.max_symbol_position_pct;
+          this.entryCandidates = msg.entry_candidates || {ready:false,reason:'等待候选榜单',rows:[]};
+          if(!this.candidateProtectionSaving&&msg.status?.candidate_order_protection)
+            this.candidateProtection={...msg.status.candidate_order_protection};
           // 止损 ATR 倍数跟快照走（全客户端同步）；编辑中（dirty）不覆盖输入框
           if (!this.atrMultDirty && msg.status && msg.status.stop_atr_mult != null) {
             this.atrMult = msg.status.stop_atr_mult;
@@ -1682,7 +1969,14 @@ createApp({
           this.alerts = msg.alerts || [];   // 活跃告警（横幅 + 声音）
           this.checkAlerts();
           this.lots = msg.lots || [];
+          this.lotsReady = true;
+          this.tvEntryMarkers = msg.tv_entry_markers || [];
+          this.syncTvEntryMarkers();
           this.market = msg.market || {};
+          this.checkIpoOpenings(msg.ipo_openings, msg.ts);
+          this.acceptVwapDistribution(msg.vwap_distribution, this.market, msg.ts);
+          this.openingVwapSignals = msg.vwap_opening_signals || [];
+          if (!this.demoMode && !this.status.market_stale) this.rememberConfirmedGoldenFeedRows();
           this.logs = msg.logs || [];
           this.momentum = msg.momentum || { long: [], short: [], ready_count: 0 };
           this.screen = msg.screen || { long: [], short: [] };
@@ -1718,6 +2012,7 @@ createApp({
           this.checkFvgWarnings();
           this.checkFvgTick();
           this.checkBreakoutSignals();
+          this.checkExternalEntryResults(msg.external_entry_results || [], msg.ts);
           const d = msg.status.bar_update_delay;
           if (d != null && d > this.maxDelay) this.maxDelay = d;
         }
@@ -1753,16 +2048,63 @@ createApp({
       }
     },
 
+    checkIpoOpenings(update, now=Date.now()/1000) {
+      if(!update||!Array.isArray(update.watches)||!Array.isArray(update.events))return;
+      this.ipoOpenings=update;
+      if(this.demoMode||!Number.isFinite(now))return;
+      const day=new Intl.DateTimeFormat('en-CA',{timeZone:'America/New_York',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(now*1000));
+      let changed=false;
+      for(const event of update.events) {
+        if(typeof event?.id!=='string'||!event.id||event.listing_date!==day
+          ||!Number.isFinite(event.price)||event.price<=0||!Number.isFinite(event.detected_at)
+          ||now<event.detected_at||now-event.detected_at>120||!Number.isFinite(event.announce_until)||now>event.announce_until
+          ||!update.watches.some(w=>w.symbol===event.symbol&&w.listing_date===event.listing_date)
+          ||this.notifiedIpoOpenings[event.id])continue;
+        // Another console tab may already have announced while this tab was open.
+        const saved=loadNotified('notified_ipo_openings')||{};
+        if(saved[event.id]){this.notifiedIpoOpenings[event.id]=saved[event.id];continue;}
+        this.notifiedIpoOpenings[event.id]=event.detected_at;changed=true;
+        const ticker=this.tickerOf(event.symbol),price=event.price.toFixed(event.price<1?4:2);
+        this.speak(`新股 ${ticker.split('').join(' ')} 已开始交易。首次收到成交价格 ${price} 美元。`,{queue:true,priority:true});
+        this.$notify({title:'IPO 开交易',message:`${ticker} 已收到首个有效成交价 $${price}，美东 ${this.hmET(event.observed_at)}；这是数据源首次观察价。`,type:'success',duration:0});
+      }
+      if(changed){
+        this.notifiedIpoOpenings=Object.fromEntries(Object.entries(this.notifiedIpoOpenings).sort((a,b)=>b[1]-a[1]).slice(0,100));
+        saveNotified('notified_ipo_openings',this.notifiedIpoOpenings);
+      }
+    },
+    testIpoVoice() {
+      this.speak('新股开交易语音提醒已就绪，等待真实成交价格。',{queue:true,priority:true});
+      this.$message.success('已加入语音队列，请确认浏览器与系统音量');
+    },
+
     // 语音播报（Web Speech API）
-    speak(text) {
+    speak(text, { queue = false, priority = false } = {}) {
+      let release;
       try {
         if (!('speechSynthesis' in window)) return;
+        const speech = window.speechSynthesis;
         const u = new SpeechSynthesisUtterance(text);
         u.lang = 'zh-CN';
         u.rate = 1.1;
-        window.speechSynthesis.cancel();
-        window.speechSynthesis.speak(u);
-      } catch (e) { /* 忽略语音失败 */ }
+        if (!queue && !this.prioritySpeechCount) speech.cancel();
+        if (priority) {
+          this.prioritySpeechCount += 1;
+          release = () => {
+            if (!release) return;
+            release = undefined;
+            this.prioritySpeechCount -= 1;
+          };
+          u.onend = u.onerror = release;
+        }
+        speech.speak(u);
+      } catch (e) { release?.(); }
+    },
+
+    speakStrategyFailure(action, symbols) {
+      const tickers = symbols.map(symbol => this.tickerOf(symbol).split('').join(' ')).filter(Boolean);
+      const target = tickers.length === 1 ? tickers[0] : tickers.length > 1 ? `${tickers.length} 个标的` : '';
+      this.speak([target, `${action}，请检查`].filter(Boolean).join(' '), { priority: true });
     },
 
     // ST 确认转向只播报和通知，平仓仍由用户点击已有仓位操作。
@@ -1818,6 +2160,28 @@ createApp({
       }
     },
 
+    checkExternalEntryResults(results, now) {
+      if (!results.length) return;
+      const storageKey = 'notified_external_entry_results';
+      const seen = { ...this.lastExternalEntryResult, ...loadNotified(storageKey) };
+      const spoken = [];
+      for (const result of results) {
+        if (!result.id || !result.symbol || seen[result.id]
+            || !(result.ts > now - 60 && result.ts <= now)) continue;
+        const ticker = result.symbol.split('').join(' ');
+        if (result.kind === 'cancelled') spoken.push(`${ticker} 外部挂单已自动撤销`);
+        else if (result.kind === 'closed') spoken.push(`${ticker} 外部持仓已自动平仓，成交 ${result.qty} 股`);
+        else continue;
+        seen[result.id] = result.ts;
+      }
+      if (!spoken.length) return;
+      this.lastExternalEntryResult = Object.fromEntries(
+        Object.entries(seen).filter(([, ts]) => ts > now - 60),
+      );
+      saveNotified(storageKey, this.lastExternalEntryResult);
+      this.speak(spoken.join('。'), { queue: true });
+    },
+
     // 自动平仓播报（提交与成交分开表达，避免把 CLOSING 当成已成交；持久化刷新不重播）
     checkAutoCloseNotice() {
       let dirty = false;
@@ -1837,7 +2201,7 @@ createApp({
       if (dirty) saveNotified('notified_autoclose', this.lastAutoCloseNotice);
     },
 
-    // 金字塔策略关键节点：提交与实际成交分开播报，首屏不补播历史事件
+    // 策略执行通知：提交与成交分开播报，首屏不补播历史事件。
     checkAutoNotices() {
       let dirty = false;
       const fresh = [];
@@ -1850,6 +2214,7 @@ createApp({
       this.autoNoticesInitDone = true;
       fresh.sort((a, b) => (a.ts || 0) - (b.ts || 0));
       const spoken = [];
+      const failures = [];
       for (const n of fresh) {
         const ticker = (n.symbol || '').split(':').pop();
         const spelled = ticker.split('').join(' ');
@@ -1896,9 +2261,10 @@ createApp({
         } else {
           continue;
         }
-        spoken.push(text);
+        (type === 'error' ? failures : spoken).push(text);
         this.$notify({ title, message, type, duration, position: 'bottom-right' });
       }
+      if (failures.length) this.speak(failures.join('。'), { priority: true });
       if (spoken.length) this.speak(spoken.join('，'));
       if (dirty) saveNotified('notified_pyramid', this.lastAutoNotice);
     },
@@ -2041,12 +2407,7 @@ createApp({
     },
     updateOpeningBreakouts(rows) {
       const previous = new Map(this.openingBreakouts.map(row => [row.id, row.status]));
-      const previousTime = this.openingBreakoutGroups[0]?.time ?? 0;
       this.openingBreakouts = rows;
-      if ((this.openingBreakoutGroups[0]?.time ?? 0) > previousTime) {
-        this.openingFeedDrag = null;
-        this.$nextTick(this.scrollOpeningFeedToLatest);
-      }
       if (!this.openingBreakoutsInitialized) {
         this.openingBreakoutsInitialized = true;
         return;
@@ -2058,12 +2419,20 @@ createApp({
         return ['submitted', 'submission_failed'].includes(row.status) && before !== row.status;
       });
       if (!fresh.length) return;
+      const failed = fresh.filter(row => row.status === 'submission_failed');
+      if (failed.length) this.speakStrategyFailure('开盘小区间突破下单失败', failed.map(row => row.ticker));
       const summaries = fresh.map(row => `${row.ticker} ${row.side === 'long' ? '上破' : '下破'} ${this.openingBreakoutStatus(row)}`);
       this.$notify({
         title: '开盘小区间突破',
         message: summaries.slice(0, 5).join(' · ') + (fresh.length > 5 ? ` · 共 ${fresh.length} 个，查看小区间突破页` : ''),
         type: 'info', duration: 8000, position: 'bottom-right',
       });
+    },
+    toggleOpeningFeed() {
+      this.openingFeedCollapsed = !this.openingFeedCollapsed;
+      this.openingFeedPreferenceSet = true;
+      try { localStorage.setItem('opening_feed_collapsed', this.openingFeedCollapsed ? '1' : '0'); } catch (_) { /* presentation only */ }
+      if (!this.openingFeedCollapsed) this.$nextTick(() => this.scrollOpeningFeedToLatest());
     },
     scrollOpeningFeedToLatest() {
       const feed = this.$refs.openingFeed;
@@ -2364,21 +2733,33 @@ createApp({
     // 保本检测：止损移到成本时语音播报（false→true 去重，持久化刷新不重播）
     checkBreakeven() {
       let dirty = false;
+      let exitDirty = false;
       for (const l of this.lots) {
+        if(l.state==='CLOSED'&&l.exit_reason==='candidate_timed_breakeven_stop'&&!this.lastTimedExit[l.lot_id]){
+          const ticker=(l.symbol||'').split(':').pop();
+          const minutes=l.signal_snapshot?.candidate_order_protection?.breakeven_minutes_applied;
+          this.speak(`${ticker.split('').join(' ')} 持仓${minutes}分钟，已按保本规则平仓`);
+          this.$notify({title:'定时保本退出',message:`${ticker} 到期时价格已越过成本，已按规则平仓，实际盈亏见订单批次`,type:'warning',duration:10000,position:'bottom-right'});
+          this.lastTimedExit[l.lot_id]=true;exitDirty=true;
+        }
         if (l.breakeven_reached && !this.lastBreakeven[l.lot_id]) {
           dirty = true;
           const ticker = (l.symbol || '').split(':').pop();
           const spelled = ticker.split('').join(' ');
-          this.speak(`${spelled} 已保本，止损移到成本`);
+          const protection=l.signal_snapshot?.candidate_order_protection;
+          const timed=protection?.breakeven_trigger==='timed_breakeven'&&protection.timed_breakeven_done;
+          const minutes=protection?.breakeven_minutes_applied;
+          this.speak(timed?`${spelled} 持仓${minutes}分钟，已自动保本`:`${spelled} 已保本，止损已至成本或更有利`);
           this.$notify({
-            title: '保本',
-            message: `${ticker} 已保本（止损移到入场成本），剩余风险为 0`,
+            title: timed?'定时自动保本':'保本',
+            message: `${ticker} ${timed?'持仓'+minutes+'分钟，已自动保本':'已保本'}（止损已至成本或更有利），剩余风险为 0`,
             type: 'success', duration: 10000, position: 'bottom-right',
           });
         }
         this.lastBreakeven[l.lot_id] = !!l.breakeven_reached;
       }
       if (dirty) saveNotified('notified_breakeven', this.lastBreakeven);
+      if (exitDirty) saveNotified('notified_candidate_timed_exit',this.lastTimedExit);
     },
 
     // 未快速突破提醒：开仓超时未保本 → 语音播报「是否减仓」
@@ -2411,7 +2792,7 @@ createApp({
       const sel = this.selectRefs[i];
       const q = (sel && sel.query ? String(sel.query) : '').trim().toUpperCase();
       if (!q) return;
-      const matches = this.watchlist.filter((sym) => {
+      const matches = this.manualSymbols.filter((sym) => {
         const t = sym.split(':').pop().toUpperCase();
         return t.startsWith(q) || t.includes(q);
       });
@@ -2421,91 +2802,350 @@ createApp({
     },
 
     // 点选横截面选股结果：单格交易台直接填入选中标的（方向由按钮按趋势自适应）；
-    // 同时 CDP 联动本机 TV 桌面端第一个 pane 切到该标的（失败静默降级）
+    // 所有单标的切图保留同窗口 TV 的固定第六格，失败时显示原因。
     pickScreen(r) {
       this.slots[0].symbol = r.symbol;
       this.$message.success(`已选中 ${r.ticker}`);
       this.tvShow(r.symbol);
     },
 
-    selectRangeStock(row) {
-      this.rangeSelectedSymbol = row.symbol;
-      this.pickScreen(row);
-    },
-    rangePosition(speed) {
-      return RangeDistribution.position(speed, this.rangeDistribution.limit);
+    selectVwapStock(symbol) {
+      if (!symbol) return;
+      this.pickScreen({ symbol, ticker: this.tickerOf(symbol) });
     },
 
-    // CDP 联动看盘：POST /api/tv/view。master → 只切 TV pane 0（无截图）；
-    // 客户端 → 分配专属 pane 切标的 + 截图回传，弹图表面板（10s 自动刷新）
-    async tvShow(symbol) {
-      // 冷启动（浏览器未开）要等 Chrome 启动 + TV 页加载，最长约 1 分钟：
-      // 超过 1s 未返回就弹进度提示（不自动消失），拿到结果后关闭
-      let waiting = null;
-      const timer = setTimeout(() => {
-        if (this.$notify) {
-          waiting = this.$notify({
-            title: 'TV 图表联动',
-            message: '浏览器未打开，正在启动并加载 TradingView，请稍候…',
-            type: 'info', duration: 0,
-          });
-        }
-      }, 1000);
+    selectRhythmStock(symbol) {
+      if (symbol) this.slots[0].symbol=symbol;
+    },
+
+    manageRhythmPosition(symbol) {
+      if(!symbol)return;
+      this.slots[0].symbol=symbol;this.orderSymbolFilter=symbol;this.orderKindFilter='all';this.deckCollapsed=true;
+    },
+
+    sameOrderSymbol(a,b) {
+      if(a===b)return true;
+      const stock=s=>typeof s==='string'&&(!s.includes(':')||['NASDAQ','NYSE','AMEX','BATS'].includes(s.split(':')[0]));
+      return stock(a)&&stock(b)&&a.split(':').pop()===b.split(':').pop();
+    },
+
+    async syncTvEntryMarkers(force=false) {
+      if(this.identity!=='ok'||document.visibilityState==='hidden'||this.tvGridInFlight||this.tvMarkersBusy)return;
+      const entries=this.tvEntryMarkers||[],key=JSON.stringify(entries);
+      if(!force&&key===this.tvMarkersAttemptKey&&(this.tvMarkersRetries>=4||Date.now()<this.tvMarkersRetryAt))return;
+      if(force||key!==this.tvMarkersAttemptKey){this.tvMarkersRetries=0;this.tvMarkersRetryAt=0;}
+      this.tvMarkersAttemptKey=key;this.tvMarkersBusy=true;
       try {
-        const d = await this.tvViewRequest(symbol);
-        if (waiting) waiting.close();
-        if (d && d.ok && !d.master && d.image) {
-          this.openTvView(symbol, d);          // 客户端：弹图表面板
-        } else if (d && !d.ok && d.reason && this.$notify) {
-          // 失败时把原因报出来（画面位已满/浏览器未可控等），否则用户以为没反应
-          this.$notify({ title: 'TV 图表未切换', message: d.reason,
-                         type: 'warning', duration: 5000 });
+        let result;
+        if(this.traderName==='master') {
+          if(!this.status.tv_entry_markers)throw Error('成交标记需重启控制台加载');
+          const token=Array.from(window.crypto.getRandomValues(new Uint8Array(16)),b=>b.toString(16).padStart(2,'0')).join('');
+          const dataset=document.documentElement.dataset;dataset.autotradeTvViewToken=token;
+          try{
+            const response=await fetch('/api/tv/entry-markers',{method:'POST',headers:this.tradeHeaders(true),body:JSON.stringify({source_token:token})});
+            result=await response.json();if(!response.ok)throw Error('成交标记请求失败');
+          }finally{if(dataset.autotradeTvViewToken===token)delete dataset.autotradeTvViewToken;}
+        }else {
+          const results=[];
+          for(const layout of ['candidates','focus'])results.push(await this.requestTvBridge({id:'marks-'+layout+'-'+Date.now(),type:'mark-entries',entries,layout},10000));
+          result={ok:results.every(r=>r?.ok),marked:results.reduce((n,r)=>n+(r?.marked||0),0),reason:results.find(r=>!r?.ok)?.reason};
         }
-        // master：只切 pane 0，无截图不弹窗（原有行为）
-      } catch (e) {
-        if (waiting) waiting.close();
-        /* 静默降级：不影响选股/下单 */
+        if(!result?.ok)throw Error(result?.reason||result?.failures?.[0]?.reason||'原生成交标记未确认');
+        this.tvMarkerStatus=entries.length?'已显示'+result.marked+'组成本/止损线':'当前空仓';
+        this.tvMarkersRetryAt=Infinity;
+      }catch(error){
+        this.tvMarkerStatus=error.message||'仓位线段暂不可用';
+        this.tvMarkersRetries++;this.tvMarkersRetryAt=Date.now()+Math.min(15000,2**this.tvMarkersRetries*1000);
+      }
+      finally{
+        this.tvMarkersBusy=false;
+        const pending=this.tvGridPending;this.tvGridPending=null;
+        if(pending)this.syncRhythmGrid(pending);
+        else if(JSON.stringify(this.tvEntryMarkers||[])!==key)this.syncTvEntryMarkers();
+      }
+    },
+
+    async syncRhythmGrid({symbols=[],focusSymbols=[],force=false}) {
+      if(this.identity!=='ok'||this.bottomTab!=='rhythm'||document.visibilityState==='hidden')return;
+      const jobs=[{layout:'candidates',symbols,cells:8,label:'八格'},
+        {layout:'focus',symbols:focusSymbols,cells:6,label:'六格'}]
+        .filter(job=>Array.isArray(job.symbols)&&job.symbols.length===job.cells&&job.symbols.every(Boolean));
+      if(!jobs.length)return;
+      const key=jobs.map(j=>j.layout+':'+j.symbols.join(',')).join('|');
+      if(this.tvGridInFlight||this.tvMarkersBusy){this.tvGridPending={symbols:[...symbols],focusSymbols:[...focusSymbols],force};return;}
+      if(!force&&key===this.tvGridLastKey)return;
+      if(!force&&key===this.tvGridFailedKey&&(this.tvGridRetries>=6||Date.now()<this.tvGridRetryAt))return;
+      if(force||key!==this.tvGridFailedKey){this.tvGridRetries=0;this.tvGridRetryAt=0;}
+      this.tvGridInFlight=true;this.tvGridStatus='正在逐格核对TV双窗口';
+      this.tvGridLastKey=''; // A partial switch also invalidates the previous arrangement.
+      const messages=[];let failed=false,token='';
+      const dataset=document.documentElement.dataset;
+      try {
+        if(this.traderName==='master') {
+          token=Array.from(window.crypto.getRandomValues(new Uint8Array(16)),b=>b.toString(16).padStart(2,'0')).join('');
+          dataset.autotradeTvViewToken=token;
+        }
+        for(const job of jobs) {
+          const layoutKey=job.symbols.join(',');
+          if(!force&&this.tvGridLayoutKeys[job.layout]===layoutKey){messages.push(job.label+'已确认');continue;}
+          // A failed or unknown result invalidates only the layout actually touched.
+          delete this.tvGridLayoutKeys[job.layout];
+          try {
+            let result;
+            if(this.traderName==='master') {
+              if(!this.status.tv_grid_same_window||this.status.tv_grid_layouts?.[job.layout]!==job.cells)
+                throw Error('需重启控制台加载TV双窗口联动');
+              const response=await fetch('/api/tv/grid',{method:'POST',headers:this.tradeHeaders(true),
+                body:JSON.stringify({symbols:job.symbols,layout:job.layout,source_token:token})});
+              const data=await response.json();result=response.ok?data:{ok:false,reason:typeof data.detail==='string'?data.detail:'联动失败'};
+            }else result=await this.requestTvBridge({id:'grid-'+job.layout+'-'+Date.now(),type:'switch-grid',symbols:job.symbols,layout:job.layout},9000);
+            if(!result?.ok||result.panes?.length!==job.cells||!result.panes.every(p=>p.ok)) {
+              if(result?.upgrade){this.tvExtensionState='update';this.tvSetupVisible=true;}
+              throw Error(result?.reason||job.label+'尚未全部确认');
+            }
+            this.tvGridLayoutKeys[job.layout]=layoutKey;
+            messages.push(job.label+'已确认');
+          }catch(error){failed=true;messages.push(job.label+'：'+(error.message||'联动失败，点同步重试'));}
+        }
+        this.tvGridStatus=messages.join(' · ');
+        if(failed){this.tvGridFailedKey=key;this.tvGridRetries++;this.tvGridRetryAt=Date.now()+Math.min(30000,2**this.tvGridRetries*1000);}
+        else{this.tvGridLastKey=key;this.tvGridFailedKey='';this.tvGridRetries=0;}
+      }finally{
+        if(token&&dataset.autotradeTvViewToken===token)delete dataset.autotradeTvViewToken;
+        this.tvGridInFlight=false;const pending=this.tvGridPending;this.tvGridPending=null;
+        if(pending&&this.bottomTab==='rhythm')this.syncRhythmGrid(pending);else this.syncTvEntryMarkers(true);
+      }
+    },
+
+    openRhythmTrade({symbol,frame}) {
+      if (!symbol) return;
+      this.rhythmFrame=frame;
+      this.slots[0].symbol=symbol;
+      this.slots[0].limitType='rhythm_market';
+      this.slots[0].manualDirection=null;
+      this.deckCollapsed=false;
+    },
+
+    selectRangeStock(row) {
+      this.rangeSelectedSymbol = row.symbol;
+      if (this.rangeFocus !== null) this.rangeFocus = row.major;
+      this.pickScreen(row);
+    },
+    rangeTargetReady(row) {
+      if (!row?.ready || !this.status.market_running || this.status.market_stale) return false;
+      const observedAt = this.market[row.symbol]?.price_observed_at;
+      return Number.isFinite(observedAt) && observedAt > 0 && observedAt <= this.now
+        && this.now - observedAt <= 45 && row.time <= this.now && this.now < row.time + 300;
+    },
+    rangeTargetMatches(symbol, direction) {
+      const row = this.rangeSelectedRow;
+      if (row?.symbol === symbol && this.rangeTargetReady(row)
+          && (row.minor === 0 ? 1 : -1) === direction) return true;
+      this.$message.warning('锁定目标或就绪状态已变化，请重新确认');
+      return false;
+    },
+    async rangeGoldenOrder() {
+      if (this.rangeActionBusy || this.placing || this.autoBusy) return;
+      if (this.rangeGoldenBlock) return this.$message.warning(this.rangeGoldenBlock);
+      const row = this.rangeGoldenSignal;
+      this.rangeActionBusy = true;
+      try {
+        await this.placeGoldenEntry(row, {
+          validateSelection: () => this.rangeSelectedSymbol === row.symbol,
+        });
+      } finally { this.rangeActionBusy = false; }
+    },
+    async rangeStartAuto() {
+      if (this.rangeActionBusy || this.placing || this.autoBusy) return;
+      if (this.rangeAutoBlock) return this.$message.warning(this.rangeAutoBlock);
+      const row = this.rangeSelectedRow;
+      const direction = row.minor === 0 ? 1 : -1;
+      this.rangeActionBusy = true;
+      try {
+        await this.startAuto({
+          strategy: 'ema7_autotrade_v2', instance_id: 'default', symbols: [row.symbol], direction,
+          validate: () => this.rangeTargetMatches(row.symbol, direction),
+        });
+      } finally { this.rangeActionBusy = false; }
+    },
+
+    openingVwapStatus(row) {
+      return {
+        preview: '预选', armed: '已预约', confirmed: '已收盘', submitting: '提交中',
+        submitted: '已提交', invalid: '收盘不符合', expired: '已超时',
+        rejected: '未下单', unknown: '提交待对账',
+      }[row.status] || row.status;
+    },
+    selectOpeningVwap(row) {
+      this.openingVwapSelected = row.id;
+      this.tvShow(row.symbol);
+    },
+    async prepareOpeningVwap(row, cancel = false) {
+      if (this.demoMode || this.openingVwapBusy[row.id]) return;
+      this.openingVwapBusy[row.id] = true;
+      try {
+        const response = await fetch('/api/lots/opening-vwap/prepare', {
+          method: 'POST', headers: this.tradeHeaders(true),
+          body: JSON.stringify({ signal_id: row.id, side: row.side, cancel }),
+        });
+        this.checkWrite403(response);
+        const result = await response.json();
+        if (!response.ok) throw new Error(typeof result.detail === 'string' ? result.detail : '预约操作失败');
+        this.$message.success(cancel ? '已撤销预约' : '已预约，等待收盘确认');
+      } catch (error) {
+        this.$message.error(error.message || String(error));
       } finally {
-        clearTimeout(timer);
+        delete this.openingVwapBusy[row.id];
       }
     },
-    async tvViewRequest(symbol) {
-      const r = await fetch('/api/tv/view', {
-        method: 'POST', headers: this.tradeHeaders(true),
-        body: JSON.stringify({ symbol }),
-      });
-      return await r.json().catch(() => ({}));
-    },
-    openTvView(symbol, d) {
-      this.tvView.visible = true;
-      this.tvView.symbol = symbol;
-      this.tvView.image = 'data:image/jpeg;base64,' + d.image;
-      this.tvView.pane = d.pane;
-      this.tvView.error = '';
-      this.stopTvViewRefresh();
-      this.tvViewTimer = setInterval(() => this.refreshTvView(), 10000);
-    },
-    async refreshTvView() {
-      if (!this.tvView.visible || this.tvView.loading) return;
-      this.tvView.loading = true;
+    async tvShow(symbol) {
+      if (!symbol || this.identity !== 'ok') return;
+      const request = ++this.tvSwitchRequest;
+      let result;
       try {
-        const d = await this.tvViewRequest(this.tvView.symbol);
-        if (d && d.ok && d.image) {
-          this.tvView.image = 'data:image/jpeg;base64,' + d.image;
-          this.tvView.error = '';
-        } else if (d && !d.ok) {
-          this.tvView.error = d.reason || '刷新失败';
+        if (this.traderName === 'master') {
+          if (!this.status?.tv_view_same_window || this.status.tv_single_chart_cell !== 6) {
+            this.$message.warning('第六格图表联动需重启控制台加载');
+            return;
+          }
+          const sourceToken = Array.from(window.crypto.getRandomValues(new Uint8Array(16)),
+            byte => byte.toString(16).padStart(2, '0')).join('');
+          const dataset = document.documentElement.dataset;
+          dataset.autotradeTvViewToken = sourceToken;
+          try {
+            const response = await fetch('/api/tv/view', {
+              method: 'POST', headers: this.tradeHeaders(true),
+              body: JSON.stringify({ symbol, source_token: sourceToken }),
+            });
+            const data = await response.json();
+            result = response.ok ? data : { reason: typeof data.detail === 'string' ? data.detail : '图表联动请求失败' };
+          } finally {
+            if (dataset.autotradeTvViewToken === sourceToken) delete dataset.autotradeTvViewToken;
+          }
+        } else {
+          result = await this.switchLocalTvChart(symbol, String(request));
         }
-      } catch (e) { /* 网络抖动静默，下拍再试 */ } finally {
-        this.tvView.loading = false;
+      } catch {
+        result = { reason: '图表联动暂不可用，请重试。' };
+      }
+      if (request !== this.tvSwitchRequest) return;
+      if (!result?.ok) {
+        if (result?.upgrade) {
+          this.tvExtensionState = 'update';
+          this.tvExtensionReason = result.reason;
+          this.tvSetupVisible = true;
+        } else if (this.traderName !== 'master' && this.tvExtensionState !== 'ready') {
+          this.tvSetupVisible = true;
+          this.checkTvExtension();
+        } else {
+          this.$message.warning(result?.reason || 'TradingView 图表未确认切换。');
+        }
+      } else if (this.traderName !== 'master') {
+        this.$message.success(`本机 TradingView 第六格已切换到 ${result.shown}`);
+      }
+      if(result?.ok)this.syncTvEntryMarkers(true);
+    },
+    async openTvHostBinding() {
+      this.tvHostBindingVisible=true;this.tvHostBindingBusy=true;
+      try {
+        const response=await fetch('/api/tv/charts',{headers:this.tradeHeaders()});
+        const data=await response.json();if(!response.ok)throw Error(data.detail||'图表读取失败');
+        this.tvHostCharts=data.charts||[];
+        this.tvHostTarget=this.tvHostCharts.length===1?this.tvHostCharts[0].id:'';
+      }catch(error){this.$message.error(error.message||'请重启控制台加载图表绑定功能');}
+      finally{this.tvHostBindingBusy=false;}
+    },
+    async bindTvHostChart() {
+      if(!this.tvHostTarget||this.tvHostBindingBusy)return;
+      this.tvHostBindingBusy=true;
+      const token=Array.from(window.crypto.getRandomValues(new Uint8Array(16)),b=>b.toString(16).padStart(2,'0')).join('');
+      const dataset=document.documentElement.dataset;dataset.autotradeTvViewToken=token;
+      try {
+        const response=await fetch('/api/tv/bind',{method:'POST',headers:this.tradeHeaders(true),
+          body:JSON.stringify({target_id:this.tvHostTarget,source_token:token})});
+        const result=await response.json();if(!response.ok||!result.ok)throw Error(result.reason||result.detail||'绑定失败');
+        this.tvHostBindingVisible=false;this.tvGridFailedKey='';this.tvGridLastKey='';this.tvGridLayoutKeys={};
+        this.$message.success('已绑定当前控制台与TV图表，可保留两个窗口');
+        this.$refs.rhythmPanel?.publishGrid(true);
+      }catch(error){this.$message.error(error.message||'图表绑定失败');}
+      finally{if(dataset.autotradeTvViewToken===token)delete dataset.autotradeTvViewToken;this.tvHostBindingBusy=false;}
+    },
+    switchLocalTvChart(symbol, id) {
+      return this.requestTvBridge({ id, type: 'switch-symbol', symbol }, 9000);
+    },
+    requestTvBridge(detail, waitMs) {
+      const bridge = document.documentElement.dataset.autotradeTvBridge;
+      if (bridge && bridge !== '8') return { ok:false,installed:true,upgrade:true,reason:'请更新本机 Chrome 联动扩展到 0.8.0 并刷新 AutoTrade，启用TV八格与六格联动。' };
+      if (bridge !== '8') {
+        return { reason: '请在本机 Chrome 扩展中绑定 TradingView 图表，然后刷新此页面。' };
+      }
+      return new Promise(resolve => {
+        const finish = result => {
+          clearTimeout(timeout);
+          window.removeEventListener('autotrade:local-tv-result', receive);
+          resolve(result);
+        };
+        const receive = event => {
+          if (event.detail?.id === detail.id) finish(event.detail);
+        };
+        const timeout = setTimeout(() => finish({ reason: '本机 TradingView 图表响应超时。' }), waitMs);
+        window.addEventListener('autotrade:local-tv-result', receive);
+        window.dispatchEvent(new CustomEvent('autotrade:local-tv-request', { detail }));
+      });
+    },
+    async checkTvExtension() {
+      if (this.identity !== 'ok' || this.traderName === 'master' || this.tvExtensionChecking) return;
+      this.tvExtensionChecking = true;
+      try {
+        const previous = this.tvExtensionState;
+        const status = await this.requestTvBridge({ id: 'status', type: 'chart-status' }, 1200);
+        this.tvExtensionReason = status.reason || '';
+        let installed = status.installed === true;
+        if (!installed && window.chrome) {
+          try {
+            const response = await fetch(TV_EXTENSION_PRESENCE, { cache: 'no-store', credentials: 'omit' });
+            installed = response.ok && (await response.json()).product === 'autotrade-tv';
+          } catch { /* Chrome blocks the probe if the extension is unavailable. */ }
+        }
+        this.tvExtensionState = status.ready ? 'ready' : status.upgrade ? 'update'
+          : installed ? 'bind'
+            : window.chrome ? 'missing' : 'unsupported';
+        if (this.tvExtensionState === 'ready') {
+          if (previous !== 'ready') this.tvSetupVisible = false;
+          return;
+        }
+        if (this.tvSetupPrompted) return;
+        this.tvSetupPrompted = true;
+        this.tvSetupVisible = true;
+        if (this.tvExtensionState === 'missing') this.downloadTvExtensionOnce();
+      } finally {
+        this.tvExtensionChecking = false;
       }
     },
-    stopTvViewRefresh() {
-      if (this.tvViewTimer) { clearInterval(this.tvViewTimer); this.tvViewTimer = null; }
+    downloadTvExtensionOnce() {
+      const key = 'autotrade_tv_extension_download_requested';
+      try {
+        if (localStorage.getItem(key)) return;
+        localStorage.setItem(key, '1');
+      } catch { /* Try once per page if browser storage is unavailable. */ }
+      const link = document.createElement('a');
+      link.href = TV_EXTENSION_DOWNLOAD;
+      link.download = 'autotrade-tv.zip';
+      document.body.append(link);
+      link.click();
+      link.remove();
     },
-    closeTvView() {
-      this.tvView.visible = false;
-      this.stopTvViewRefresh();
+    async copyTvChromeAddress(event) {
+      const address = 'chrome://extensions';
+      const input = event.currentTarget;
+      try {
+        await navigator.clipboard.writeText(address);
+      } catch {
+        input.select();
+        this.tvChromeAddressCopied = document.execCommand?.('copy') === true;
+        return;
+      }
+      this.tvChromeAddressCopied = true;
     },
 
     // 智能止损距离（与服务端 _smart_stop_dist 同口径）：优先读 smart_stop 指标
@@ -2537,19 +3177,236 @@ createApp({
       if (et < '09:30' || et >= '09:40') return null;
       const age = now.getTime() / 1000 - bar.time;
       const value = side === 'long' ? bar.low : side === 'short' ? bar.high : null;
-      return { price: age >= 0 && age < 300 && bar.low > 0 && bar.high >= bar.low
-        && Number.isFinite(value) ? +value.toFixed(2) : null };
+      if (!(age >= 0 && age < 300 && bar.low > 0 && bar.high >= bar.low && Number.isFinite(value))) {
+        return { price: null };
+      }
+      return { price: +value.toFixed(2) };
     },
 
-    calcSlot(slot) {
+    marketStopOutsideBar(bar, side, atr, allowMissingAtr, now, reference = bar.close) {
+      const age = now.getTime() / 1000 - bar.time;
+      if (!side || !(age >= 0 && age < 300) ||
+          ![bar.low, bar.close, bar.high].every(Number.isFinite) ||
+          !(0 < bar.low && bar.low <= bar.close && bar.close <= bar.high)) return null;
+      const long = side === 'long';
+      const extreme = long ? bar.low : bar.high;
+      let outside = +extreme.toFixed(2);
+      if (long ? outside >= extreme : outside <= extreme) {
+        outside = +(outside + (long ? -0.01 : 0.01)).toFixed(2);
+      }
+      if (!Number.isFinite(atr) || atr <= 0) return allowMissingAtr ? outside : null;
+      const candidate = +(reference + (long ? -2 : 2) * atr).toFixed(2);
+      return long ? Math.min(candidate, outside) : Math.max(candidate, outside);
+    },
+
+    manualStopPrice(data,side,reference,mode,now,sigma) {
+      if(mode==='vwap_sigma') {
+        if(!Number.isFinite(reference)||reference<=0||!Number.isFinite(sigma)||sigma<=0||!side
+          ||this.marketStopOutsideBar(data?.bar||{},side,null,true,now)===null)return null;
+        const stop=+(reference+(side==='long'?-1:1)*sigma).toFixed(2);
+        return stop>0&&(side==='long'?stop<reference:stop>reference)?stop:null;
+      }
+      const bar=data?.bar||{},atr=(data?.ts_c||data?.ts||{}).atr;
+      return this.marketStopOutsideBar(bar,side,atr,this.openingManualStop(bar,side,now)!==null,now,reference);
+    },
+
+    async toggleMarketDirection(i, enabled) {
+      const slot = this.slots[i];
+      if (!slot || this.placing || slot.directionConfirming) return;
+      if (!enabled) { slot.manualDirection = null; return; }
+      if (!slot.symbol || slot.limitType !== 'market') return;
+      const symbol = slot.symbol;
+      const revision = slot.directionRevision || 0;
+      slot.directionConfirming = true;
+      try {
+        await this.$confirm(
+          `${this.tickerOf(symbol)}：确认按震荡行情在区间边缘入场，不要追高追低。开启后可手动选择做多或做空，方向可以与 1 分钟 ST 不一致。`,
+          '震荡行情 · 手动方向确认',
+          { type: 'warning', confirmButtonText: '确认做震荡行情', cancelButtonText: '取消' });
+        if (slot.symbol !== symbol || slot.limitType !== 'market'
+            || (slot.directionRevision || 0) !== revision) return;
+        slot.manualDirection = { symbol, side: this.calcSlot(slot).side || 'long' };
+      } catch { /* 取消时保持 ST 自动方向。 */ }
+      finally { slot.directionConfirming = false; }
+    },
+
+    setManualMarketSide(i, side) {
+      const slot = this.slots[i];
+      if (this.placing || !slot || slot.limitType !== 'market'
+          || slot.manualDirection?.symbol !== slot.symbol || !['long', 'short'].includes(side)) return;
+      slot.manualDirection.side = side;
+    },
+
+    ema9EntryState(symbol,side,now=Date.now()/1000) {
+      const data=this.market[symbol]||{},bar=data.bar||{},ts=data.ts||{};
+      const price=bar.close,ema=ts.ema_9,stamp=bar.time,observed=data.price_observed_at;
+      const ready=Number.isFinite(stamp)&&stamp%300===0&&stamp<=now&&now<stamp+300
+        &&Number.isFinite(observed)&&stamp<=observed&&observed<=now&&now-observed<=45
+        &&Number.isFinite(price)&&price>0&&Number.isFinite(ema)&&ema>0&&(ts.time==null||ts.time===stamp);
+      const ok=!!(ready&&(side==='long'?price>ema:side==='short'?price<ema:false));
+      const format=v=>Number.isFinite(v)?String(+v.toFixed(5)):'—';
+      return {ready,ok,price,ema,reason:ok?'':!ready?'等待新鲜且同根的五分钟EMA9与价格':
+        '当前价 '+format(price)+'，五分钟EMA9 '+format(ema)+'，'+(side==='long'?'做多要求价格 > EMA9':'做空要求价格 < EMA9')};
+    },
+
+    candidateAdmissionReason(symbol, side = null) {
+      if(!this.status.candidate_entry_required)return '';
+      const snapshot=this.entryCandidates,row=(snapshot.rows||[]).find(r=>r.symbol===symbol);
+      if(!snapshot.ready)return snapshot.reason||'等待候选榜单';
+      if(!row)return '不在当前有效前十候选中';
+      if(side&&row.side!==side)return '候选趋势方向已变化，请重新确认';
+      const now=Date.now()/1000;
+      if(!Number.isFinite(snapshot.as_of)||now<snapshot.as_of||now-snapshot.as_of>120)
+        return '候选榜单确认数据已过期';
+      if(row.bar_time+60!==snapshot.as_of||row.confirmed_at!==snapshot.as_of)
+        return '候选TD确认时刻未对齐';
+      if(snapshot.td_threshold!==TD_ENTRY_THRESHOLD)return '请重启控制台加载TD开仓检查';
+      const td=row.td_count,sign=row.side==='long'?1:row.side==='short'?-1:0;
+      if(!Number.isSafeInteger(td)||!row.td_ready)return '等待当前分钟TD收盘确认数据';
+      if(!sign||sign*td<TD_ENTRY_THRESHOLD)return '当前TD '+(td>0?'+':'')+td+'，'+(sign===1?'做多要求TD ≥ '+TD_ENTRY_THRESHOLD:'做空要求TD ≤ −'+TD_ENTRY_THRESHOLD);
+      if(snapshot.ema9_period!==9||snapshot.ema9_interval_seconds!==300)return '请重启控制台加载五分钟EMA9过滤';
+      return this.ema9EntryState(symbol,side||row.side,now).reason;
+    },
+
+    candidateOrderOptions(slot) {
+      return {...this.candidateProtection,vwap_outside_only:slot.vwapOutsideOnly!==false};
+    },
+
+    async saveCandidateProtection(key,value) {
+      if(this.candidateProtectionSaving||this.demoMode)return;
+      if(this.status.candidate_protection_live_version!==1)return this.$message.warning('请重启控制台加载实时保护设置');
+      const defaults={version:1,timed_breakeven_enabled:true,breakeven_minutes:5,trailing_enabled:false,trailing_source:'ema9_5m'};
+      const next={...(this.candidateProtection.version===1?this.candidateProtection:defaults),[key]:value};
+      if(!Number.isInteger(next.breakeven_minutes)||next.breakeven_minutes<1||next.breakeven_minutes>120)
+        return this.$message.warning('保本时间须为1–120分钟的整数');
+      this.candidateProtectionSaving=true;
+      try{
+        const r=await fetch('/api/settings',{method:'POST',headers:this.tradeHeaders(true),body:JSON.stringify({candidate_order_protection:next})});
+        this.checkWrite403(r);const data=await r.json();
+        if(!r.ok)throw Error(typeof data.detail==='string'?data.detail:'保护设置保存失败');
+        if(data.candidate_order_protection?.version!==1)throw Error('后端未确认实时保护设置，请重启控制台');
+        this.candidateProtection={...data.candidate_order_protection};
+        this.$message.success('已应用于当前候选持仓和后续候选订单');
+      }catch(e){this.$message.error(e.message||String(e));}
+      finally{this.candidateProtectionSaving=false;}
+    },
+
+    candidateVwapState(slot) {
+      const now=Date.now()/1000,candidate=(this.entryCandidates.rows||[]).find(r=>r.symbol===slot.symbol);
+      const point=this.rhythmFrame?.tracks?.find(t=>t.symbol===slot.symbol)?.points?.at(-1);
+      const mid=candidate?.vwap??point?.[2],sigma=candidate?.sigma??point?.[3];
+      const confirmed=candidate?.confirmed_at??(point?.[0]+60);
+      const data=this.market[slot.symbol]||{},price=data.bar?.close,observed=data.price_observed_at;
+      const ready=[mid,sigma,confirmed,price,observed].every(Number.isFinite)&&mid>sigma&&sigma>0&&price>0
+        &&0<=now-confirmed&&now-confirmed<=120&&0<=now-observed&&now-observed<=45;
+      const allowed=!!(ready&&(slot.side==='long'?price>mid+sigma:slot.side==='short'?price<mid-sigma:false));
+      return {ok:allowed,detail:!ready?'等待确认VWAP轨道和新鲜报价':
+        '现价 '+(+price.toFixed(4))+' · 下轨 '+(+(mid-sigma).toFixed(4))+' / 上轨 '+(+(mid+sigma).toFixed(4))+
+        ' · '+(slot.side==='long'?'做多须高于上轨':'做空须低于下轨')};
+    },
+
+    candidateStState(slot) {
+      const data=this.market[slot.symbol]||{},st=data.candidate_st_1m_c,now=Date.now()/1000;
+      const ready=st?.version===1&&st.atr_period===10&&st.multiplier===3&&st.interval_seconds===60
+        &&st.session==='regular'&&[-1,1].includes(st.direction)&&Number.isFinite(st.price)&&st.price>0
+        &&Number.isInteger(st.time)&&st.time%60===0&&0<=now-(st.time+60)&&now-(st.time+60)<105
+        &&data.market_1m?.bar_c?.time===st.time;
+      const ok=!!(ready&&st.direction===(slot.side==='long'?1:-1));
+      return {ok,detail:!ready?'等待一分钟ST（10，3）收盘确认':
+        'ST'+(st.direction===1?'多头':'空头')+' · '+(slot.side==='long'?'做多':'做空')+(ok?'同向':'，不允许反向开仓')};
+    },
+
+    manualEntryChecks(slot) {
+      if(!this.status.candidate_entry_required)return [];
+      const snapshot=this.entryCandidates,candidate=(snapshot.rows||[]).find(r=>r.symbol===slot.symbol);
+      const side=slot.side||candidate?.side,sign=side==='long'?1:side==='short'?-1:0,now=Date.now()/1000;
+      const data=this.market[slot.symbol]||{},ema=this.ema9EntryState(slot.symbol,side,now);
+      const format=v=>Number.isFinite(v)?String(+v.toFixed(5)):'—';
+      const confirmed=!!(snapshot.ready&&Number.isFinite(snapshot.as_of)&&0<=now-snapshot.as_of&&now-snapshot.as_of<=120
+        &&candidate?.bar_time+60===snapshot.as_of&&candidate?.confirmed_at===snapshot.as_of);
+      const td=candidate?.td_count,tdReady=snapshot.td_threshold===TD_ENTRY_THRESHOLD&&confirmed
+        &&candidate?.td_ready&&Number.isSafeInteger(td);
+      const emaVersion=snapshot.ema9_period===9&&snapshot.ema9_interval_seconds===300;
+      const price=slot.limitPx??data.bar?.close,stop=slot.stopPx;
+      const stopOK=Number.isFinite(price)&&price>0&&Number.isFinite(stop)&&stop>0&&!!sign&&(side==='long'?stop<price:stop>price);
+      const pos=stopOK&&this.equity>0&&this.riskUsd>0?calcPosition(this.equity,this.riskUsd,price,stop,this.maxPositionPct,this.status.max_order_qty||0):{qty:0,risk:0};
+      const total=this.status.total_risk_usd,direction=side==='long'?this.status.long_risk_usd:this.status.short_risk_usd;
+      const totalLimit=this.status.max_total_risk_usd,directionLimit=this.status.max_direction_risk_usd;
+      const riskKnown=[total,direction,totalLimit,directionLimit].every(Number.isFinite)&&!!sign&&pos.qty>0;
+      const riskOK=riskKnown&&pos.risk<=this.riskUsd+1e-8&&(totalLimit===0||total+pos.risk<=totalLimit+1e-8)
+        &&(directionLimit===0||direction+pos.risk<=directionLimit+1e-8);
+      const repeated=this.lots.some(l=>this.sameOrderSymbol(l.symbol,slot.symbol)
+        &&(['ACTIVE','PENDING','CLOSING'].includes(l.state)||l.entry_submission_pending));
+      const options=slot.candidateOrder,vwap=options?.vwap_outside_only?this.candidateVwapState(slot):null;
+      const policyReady=!options||(this.status.candidate_order_policy_version===1&&this.status.candidate_protection_live_version===1
+        &&Number.isInteger(options.breakeven_minutes)&&options.breakeven_minutes>=1&&options.breakeven_minutes<=120
+        &&['ema9_5m','st_1m_10_3'].includes(options.trailing_source));
+      return [
+        {key:'candidate',label:'前十候选',ok:!!candidate,detail:candidate?'当前第 '+candidate.rank+' 名':'不在有效候选榜'},
+        {key:'direction',label:'趋势同向',ok:!!sign&&candidate?.side===side,detail:sign?(side==='long'?'做多':'做空')+' · 候选'+(candidate?.side==='long'?'多头':candidate?.side==='short'?'空头':'方向未就绪'):'等待方向'},
+        {key:'td',label:'一分钟收盘TD',ok:!!(tdReady&&sign*td>=TD_ENTRY_THRESHOLD),detail:tdReady?'TD '+(td>0?'+':'')+td+' · '+(sign===1?'要求 ≥ 1':'要求 ≤ −1'):'等待有效收盘TD / 新规则'},
+        {key:'ema9',label:'五分钟EMA9',ok:emaVersion&&ema.ok,detail:!emaVersion?'等待后端加载过滤规则':!ema.ready?ema.reason:
+          '现价 '+format(ema.price)+' / EMA9 '+format(ema.ema)+' · 要求'+(side==='long'?'高于':'低于')},
+        {key:'vwap',label:'VWAP区间过滤',ok:!vwap||vwap.ok,detail:vwap?vwap.detail:'本笔已关闭区间过滤'},
+        {key:'policy',label:'候选订单设置',ok:policyReady,detail:policyReady?'使用页面顶部的实时保护设置':'请重启控制台或检查保本分钟数（1–120）'},
+        ...(options?.trailing_enabled&&options.trailing_source==='st_1m_10_3'?
+          [{key:'trailing_st',label:'跟踪ST方向',...(()=>{const st=this.candidateStState(slot);return {ok:st.ok,detail:st.detail};})()}]:[]),
+        {key:'data',label:'行情时效',ok:confirmed&&ema.ready&&this.status.market_running!==false&&!this.status.market_stale,
+          detail:this.status.market_running===false?'行情采集已停止':this.status.market_stale?'行情已陈旧':confirmed&&ema.ready?'确认≤120秒 · 报价≤45秒':snapshot.reason||'等待新鲜且对齐的数据'},
+        {key:'stop',label:'保护止损',ok:stopOK,detail:stopOK?(slot.manualStopMode==='vwap_sigma'?'1σ':'2×ATR / K线外')+' · '+format(stop):'等待方向正确的有效止损'},
+        {key:'risk',label:'预估风险预算',ok:!!riskOK,detail:riskKnown?'本笔$'+pos.risk+' · 总$'+format(total+pos.risk)+'/'+(totalLimit||'不限')+' · 同向$'+format(direction+pos.risk)+'/'+(directionLimit||'不限'):'等待数量、账户和风险数据'},
+        {key:'position',label:'数量与重复建仓',ok:pos.qty>0&&!repeated,detail:repeated?'已有未结束批次，禁止手动加仓':pos.qty>0?pos.qty+'股 · 最大'+this.maxPositionPct+'%仓位':'等待有效风险定量'},
+        {key:'account',label:'交易通道',ok:!!(this.status.connected||this.status.dry_run)&&!this.status.halted,
+          detail:this.status.halted?'账户风控已暂停':this.status.dry_run?'模拟执行':this.status.connected?'TWS已连接':'等待TWS连接'},
+      ];
+    },
+
+    calcSlot(slot, sideOverride = null) {
       const data = this.market[slot.symbol];
+      const restricted=!!this.status.candidate_entry_required;
+      const candidate=(this.entryCandidates.rows||[]).find(r=>r.symbol===slot.symbol);
+      const stopMode=slot.stopMode||'atr_2';
+      const minuteMarket = !restricted && slot.limitType === 'market' && this.status.manual_market_st_interval_seconds === 60;
+      const manualSide = !restricted && slot.limitType === 'market' && slot.manualDirection?.symbol === slot.symbol
+        && ['long', 'short'].includes(slot.manualDirection.side) ? slot.manualDirection.side : null;
+      const marketDirectionMode = restricted?'candidate':manualSide ? 'manual' : 'st';
       const empty = {
-        symbol: slot.symbol, limitType: slot.limitType,
+        symbol: slot.symbol, limitType: slot.limitType,manualStopMode:stopMode,
+        candidateOrder:slot.limitType==='rhythm_market'?this.candidateOrderOptions(slot):null,
+        tdCount:Number.isSafeInteger(candidate?.td_count)?candidate.td_count:null,
+        minuteMarket, marketDirectionMode, stSide: null,
         side: null, close: null, limitPx: null, stopPx: null,
         qty: 0, amount: 0, risk: 0, equityRatio: 0, ready: false, chg: 0,
         trendState: null, divergence: null, stopDist: null, atr: null,
         fvgDir: null, fvgText: '—',
       };
+      if(stopMode==='vwap_sigma'&&!this.status.manual_stop_modes?.includes('vwap_sigma'))
+        return {...empty,blockReason:'请重启控制台加载1σ手动止损'};
+      if (slot.limitType === 'rhythm_market') {
+        const now=new Date();
+        const track=this.rhythmFrame?.tracks?.find(t=>t.symbol===slot.symbol);
+        const sigma=candidate?.sigma??track?.points?.at(-1)?.[3];
+        const plan=rhythmTradePreview(restricted?this.entryCandidates:this.rhythmFrame,slot.symbol,data,now.getTime()/1000,(side,atr)=>
+          this.manualStopPrice(data,side,data?.bar?.close,stopMode,now,sigma));
+        if(restricted&&(!this.entryCandidates.ready||!candidate||candidate.side!==plan.side)) {
+          plan.ready=false;plan.blockReason=this.entryCandidates.reason||'不在当前候选榜单或趋势方向已变化';
+        }
+        const admissionReason=this.candidateAdmissionReason(slot.symbol,plan.side);
+        if(admissionReason){plan.ready=false;plan.blockReason=admissionReason;}
+        if(this.status.candidate_order_policy_version!==1||this.status.candidate_protection_live_version!==1){plan.ready=false;plan.blockReason='请重启控制台加载候选订单设置';}
+        if(!Number.isInteger(empty.candidateOrder.breakeven_minutes)||empty.candidateOrder.breakeven_minutes<1||empty.candidateOrder.breakeven_minutes>120){plan.ready=false;plan.blockReason='保本时间须为1–120分钟的整数';}
+        if(empty.candidateOrder.vwap_outside_only){
+          const outside=this.candidateVwapState({...empty,...plan});
+          if(!outside.ok){plan.ready=false;plan.blockReason='VWAP区间过滤：'+outside.detail;}
+        }
+        if(empty.candidateOrder.trailing_enabled&&empty.candidateOrder.trailing_source==='st_1m_10_3'){
+          const st=this.candidateStState({...empty,...plan});if(!st.ok){plan.ready=false;plan.blockReason='ST跟踪入场：'+st.detail;}
+        }
+        const pos=plan.ready?calcPosition(this.equity,this.riskUsd,plan.limitPx,plan.stopPx,this.maxPositionPct,this.status.max_order_qty||0):{qty:0,amount:0,risk:0};
+        return {...empty,...plan,...pos,marketDirectionMode:restricted?'candidate':'rhythm',
+          equityRatio:this.equity>0?+(pos.amount/this.equity*100).toFixed(1):0,
+          stopDistPct:plan.limitPx&&plan.stopPx?+(Math.abs(plan.limitPx-plan.stopPx)/plan.limitPx*100).toFixed(2):null};
+      }
       if (!data) return empty;
       // EMA/通道用实时值显示；中点单/市价单 ATR 使用已收盘确认值（与服务端一致）；
       // 回踩单限价/止损取上上根已收盘 bar（bar_c2）极值
@@ -2560,10 +3417,22 @@ createApp({
       const barC2 = data.bar_c2 || {};
 
       const close = bar.close != null ? +bar.close.toFixed(2) : null;
-      const atrSource = (slot.limitType === 'midpoint' || slot.limitType === 'market') ? tsC : ts;
+      const atrSource = (restricted || slot.limitType === 'midpoint' || slot.limitType === 'market') ? tsC : ts;
       const atr = atrSource.atr > 0 ? atrSource.atr : null;
       const trendState = ts.trend_state != null ? ts.trend_state : null;
-      const side = ts.direction === 1 ? 'long' : (ts.direction === -1 ? 'short' : null);
+      const now = new Date();
+      const minute = data.market_1m?.bar?.time;
+      const minuteAge = now.getTime() / 1000 - minute;
+      const confirmedMinute = data.market_1m?.bar_c?.time;
+      const confirmedSt = data.vwap_pullback_c;
+      const minuteSt = confirmedMinute === minute - 60 && confirmedSt?.time === confirmedMinute
+        && [1, -1].includes(confirmedSt.direction) ? confirmedSt
+          : (data.vwap_pullback?.time === minute ? data.vwap_pullback : null);
+      const direction = minuteMarket
+        ? (minuteAge >= 0 && minuteAge < 60 ? minuteSt?.direction : null)
+        : ts.direction;
+      const stSide = direction === 1 ? 'long' : (direction === -1 ? 'short' : null);
+      const side = restricted ? candidate?.side : sideOverride || manualSide || stSide;
 
       let limitPx;
       if (slot.limitType === 'retest') {
@@ -2585,9 +3454,11 @@ createApp({
       // 其余类型 = 智能止损（与服务端 _smart_stop_dist 同公式）：逻辑止损点
       // （最近三根 K 线极值，多=最低点/空=最高点，含当前 bar），钳制在
       // 1×ATR ~ atrMult×ATR（atrMult = 全局上限倍数，快照同步）
-      const opening = this.openingManualStop(bar, side);
+      const opening = this.openingManualStop(bar, side, now);
       let stopPx;
-      if (opening) {
+      if (slot.limitType === 'market') {
+        stopPx = this.marketStopOutsideBar(bar, side, atr, opening !== null, now);
+      } else if (opening) {
         stopPx = opening.price;
       } else if (slot.limitType === 'retest') {
         const v = side === 'long' ? barC2.low : (side === 'short' ? barC2.high : null);
@@ -2599,8 +3470,11 @@ createApp({
           : null;
       }
 
-      // 震荡（trendState=0）也放行：与服务端闸门一致，方向由 ST direction 决定
+      if(restricted||stopMode==='vwap_sigma')stopPx=this.manualStopPrice(data,side,limitPx,stopMode,now,candidate?.sigma);
+      // Production manual entries use the confirmed candidate direction.
       const ready = !!(side && limitPx && limitPx > 0 && stopPx && stopPx > 0
+        &&(!restricted||!this.candidateAdmissionReason(slot.symbol,side))
+        && (!minuteMarket || stSide)
         && (!opening || (side === 'long' ? stopPx < limitPx : stopPx > limitPx)));
       const pos = ready ? calcPosition(this.equity, this.riskUsd, limitPx, stopPx, this.maxPositionPct, this.status.max_order_qty || 0) : { qty: 0, amount: 0, risk: 0 };
       // 资金占比 = 占用金额 / 净值（%）
@@ -2635,7 +3509,10 @@ createApp({
       return {
         symbol: slot.symbol,       // 下单需要
         limitType: slot.limitType, // 下单需要
-        side, close, limitPx, stopPx, atr,
+        minuteMarket, marketDirectionMode, stSide,
+        side, close, limitPx, stopPx, atr,manualStopMode:stopMode,
+        tdCount:Number.isSafeInteger(candidate?.td_count)?candidate.td_count:null,
+        blockReason:restricted?this.candidateAdmissionReason(slot.symbol,side):'',
         qty: pos.qty, amount: pos.amount, risk: pos.risk,
         equityRatio, ready, chg, trendState, divergence, stopDist, stopDistPct,
         fvgDir, fvgText,
@@ -2650,7 +3527,7 @@ createApp({
     },
 
     typeLabel(t) {
-      return { ema: 'EMA快线', channel: '通道边沿', midpoint: '中点限价单', retest: '回踩限价单', chase: 'FVG追价', market: '市价单', twap: 'TWAP分批' }[t] || t;
+      return { ema: 'EMA快线', channel: '通道边沿', midpoint: '中点限价单', retest: '回踩限价单', chase: 'FVG追价', market: '市价单', rhythm_market: '轨道市价单', twap: 'TWAP分批' }[t] || t;
     },
 
     // 判断是否为「不在多头/空头列表」拦截（结构化 code，或纯文本报错兜底）
@@ -2681,7 +3558,8 @@ createApp({
       const et = new Intl.DateTimeFormat('en-GB', {
         timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
       }).format(now);
-      if (et < '09:40') return true;
+      const slowMarket = et >= '09:40';
+      if (!slowMarket && !order.manualGoldenWindow) return true;
       const ticker = this.tickerOf(order.symbol);
       const side = order.side === 'short' ? '做空' : '做多';
       const terms = order.openingBreakout
@@ -2689,8 +3567,9 @@ createApp({
         : ` × ${order.qty} 股`;
       try {
         await this.$confirm(
-          `美东 ${et}，已过开盘十分钟。当前属于慢速行情，手动交易亏钱概率极大。确认继续${side} ${ticker}${terms}？`,
-          '慢速行情 · 手动交易二次确认', {
+          (slowMarket ? `美东 ${et}，已过开盘十分钟。当前属于慢速行情，手动交易亏钱概率极大。` : '')
+            + `确认${side} ${ticker}${terms}？`,
+          slowMarket ? '慢速行情 · 手动交易二次确认' : '确认黄金信号市价开仓', {
             type: 'warning', confirmButtonText: '确认继续下单', cancelButtonText: '取消下单',
             closeOnClickModal: false, autofocus: false,
           });
@@ -2733,6 +3612,86 @@ createApp({
       if (row.status !== 'preview' && this.now >= confirmedAt + 20) return true;
       return !row.stop_px || this.hasAutoPosition(row.symbol)
         || this.lots.some(lot => lot.signal_snapshot?.opening_breakout_id === row.id);
+    },
+
+    goldenFeedDay(time) {
+      return new Date(time * 1000).toLocaleDateString('en-US', { timeZone: 'America/New_York' });
+    },
+
+    goldenFeedRow(symbol, signal, time) {
+      if (!signal || !Number.isFinite(time) || signal.time !== time) return null;
+      const direction = signal.direction;
+      const stop = direction === 1 ? signal.long_stop : signal.short_stop;
+      if (![1, -1].includes(direction) || !(signal.entry_price > 0 && stop > 0)
+          || (signal.entry_price - stop) * direction <= 0) return null;
+      return { id: symbol + ':' + time + ':' + direction, symbol, time, direction,
+        ticker: this.tickerOf(symbol), side: direction === 1 ? 'long' : 'short',
+        entry: signal.entry_price, stop_px: stop, touched: signal.entry_signal === 1 };
+    },
+
+    rememberGoldenFeedRows(rows) {
+      const day = this.goldenFeedDay(this.now);
+      for (const [id, row] of Object.entries(this.goldenFeedHistory)) {
+        if (row.day !== day) delete this.goldenFeedHistory[id];
+      }
+      for (const row of rows) {
+        if (this.goldenFeedDay(row.time) !== day) continue;
+        const previous = this.goldenFeedHistory[row.id];
+        if (previous && (previous.touched || !row.touched)) continue;
+        this.goldenFeedHistory[row.id] = { ...row, day, touched: row.touched || !!previous?.touched };
+      }
+    },
+
+    rememberConfirmedGoldenFeedRows() {
+      const rows = [];
+      for (const [symbol, data] of Object.entries(this.market)) {
+        const row = this.goldenFeedRow(symbol, data.golden_c, data.bar_c?.time);
+        if (row) rows.push(row);
+      }
+      if (rows.length) this.rememberGoldenFeedRows(rows);
+    },
+
+    goldenEntryBlock(row) {
+      if (this.demoMode) return '演示模式';
+      if (!row || this.now >= row.time + 300) return '当前没有有效的黄金信号';
+      if (this.goldenSubmitted[row.id]) return '该黄金信号已提交';
+      if (this.status.halted) return '账户风控已暂停';
+      if (!this.status.dry_run && !this.status.connected) return 'IBKR 未连接';
+      const observation = this.market[row.symbol]?.price_observed_at;
+      if (this.status.market_stale || !(observation <= this.now && this.now - observation <= 15)) return '行情已过期';
+      if (this.hasAutoPosition(row.symbol)) return '已有自动策略仓位，禁止手动加仓';
+      return '';
+    },
+
+    goldenEntryDisabled(row) {
+      return this.placing || !!this.goldenEntryBlock(row);
+    },
+
+    async placeGoldenEntry(row, { validateSelection } = {}) {
+      if (this.goldenEntryDisabled(row)) return;
+      this.placing = true;
+      try {
+        if (!await this.confirmSlowMarketEntry({ ...row, openingBreakout: true, manualGoldenWindow: true })) return;
+        if (validateSelection && !validateSelection()) throw new Error('所选股票已变化，请重新确认');
+        const current = this.goldenSignalRows.find(item => item.id === row.id);
+        if (!current) throw new Error('黄金信号已变化或过期');
+        const block = this.goldenEntryBlock(current);
+        if (block) throw new Error(block);
+        const response = await fetch('/api/auto/golden-entry', {
+          method: 'POST', headers: this.tradeHeaders(true),
+          body: JSON.stringify({ symbol: row.symbol, bar_time: row.time, direction: row.direction,
+            manual_window: true }),
+        });
+        this.checkWrite403(response);
+        const data = await response.json();
+        if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : '开仓未确认');
+        this.goldenSubmitted[row.id] = true;
+        this.$message.success(`黄金策略已提交 ${row.ticker} · ${data.lot_id}`);
+      } catch (error) {
+        this.$message.error(error.message || String(error));
+      } finally {
+        this.placing = false;
+      }
     },
 
     async prepareOpeningBreakout(row) {
@@ -2789,23 +3748,51 @@ createApp({
       }
     },
 
-    async placeOrder(slot, force = false, forceReason = '') {
+    async placeOrder(slot, force = false, forceReason = '', validate = null) {
       if (this.placing && !force) return;
       if (this.hasAutoPosition(slot.symbol)) return this.$message.warning('该标的已有自动策略仓位，禁止手动加仓');
       if (!slot.ready || !(slot.qty > 0)) return this.$message.warning('行情或风险定量未就绪，无法下单');
+      const entryChecksPass=()=>{const failed=this.manualEntryChecks(slot).find(c=>!c.ok);if(failed)this.$message.warning(failed.label+'：'+failed.detail);return !failed;};
+      if(!entryChecksPass())return;
+      const optionsStillSelected=()=>slot.limitType!=='rhythm_market'||this.slots.some(source=>
+        source.symbol===slot.symbol&&JSON.stringify(this.candidateOrderOptions(source))===JSON.stringify(slot.candidateOrder));
+      if(!optionsStillSelected())return this.$message.warning('候选订单设置已变更，请重新确认');
+      const manualChoice = slot.marketDirectionMode === 'manual'
+        ? this.slots.find(source => source.symbol === slot.symbol)?.manualDirection : null;
+      const directionStillSelected = () => this.status.candidate_entry_required
+        ? !this.candidateAdmissionReason(slot.symbol,slot.side)
+          &&this.slots.some(s=>s.symbol===slot.symbol&&(s.stopMode||'atr_2')===(slot.manualStopMode||'atr_2'))
+        : slot.marketDirectionMode !== 'manual'
+        || this.slots.some(source => source.symbol === slot.symbol && source.limitType === 'market'
+          && source.manualDirection === manualChoice && manualChoice?.side === slot.side);
+      if (!directionStillSelected()) return this.$message.warning('手动方向已变更，请重新确认下单');
       this.placing = true;
       try {
+        if (validate && !validate()) return;
         const ticker = slot.symbol.split(':').pop();
-        const reason = (force && forceReason) ? `执意开仓：${forceReason}`
-          : `${ticker} ${slot.side} ${slot.limitType} 限价`;
+        const reason = slot.limitType === 'rhythm_market' ? `${ticker} 候选推荐${slot.side === 'long' ? '做多' : '做空'} · 市价 · ${slot.manualStopMode==='vwap_sigma'?'1σ止损':'5分钟2×ATR/当前K线外止损'}`
+          : (force && forceReason) ? `执意开仓：${forceReason}`
+          : `${ticker} ${slot.side} ${slot.limitType} ${['market','rhythm_market'].includes(slot.limitType) ? '市价' : '限价'}`
+            + (slot.marketDirectionMode === 'manual' ? ' · 已确认震荡行情，手动方向' : '');
         const body = {
           symbol: slot.symbol, side: slot.side, qty: slot.qty,
           limit_px: slot.limitPx, stop_px: slot.stopPx,
-          limit_type: slot.limitType, reason,
+          limit_type: slot.limitType === 'rhythm_market' ? 'market' : slot.limitType, reason,
+          entry_mode: slot.limitType === 'rhythm_market' ? 'rhythm_atr' : 'default',
+          manual_stop_mode: slot.manualStopMode || 'atr_2',
           force,
           max_position_pct: this.maxPositionPct,
         };
+        if(slot.candidateOrder)body.candidate_order={...slot.candidateOrder};
+        if (slot.limitType === 'market') {
+          body.market_direction_mode = slot.marketDirectionMode || 'st';
+          body.range_direction_confirmed = body.market_direction_mode === 'manual';
+        }
         if (!await this.confirmSlowMarketEntry(body)) return;
+        if (validate && !validate()) return;
+        if(!entryChecksPass())return;
+        if(!optionsStillSelected())return this.$message.warning('候选订单设置已变更，请重新确认');
+        if (!directionStillSelected()) return this.$message.warning('手动方向已变更，请重新确认下单');
         const r = await fetch('/api/lots/limit-stop', {
           method: 'POST', headers: this.tradeHeaders(true),
           body: JSON.stringify(body),
@@ -2814,10 +3801,10 @@ createApp({
         const data = await r.json();
         if (!r.ok) {
           // 未通过多头/空头过滤 → 二次确认：必须填写开仓原因才能执意开仓
-          if (this.isNotLongCandidate(data.detail)) {
+          if (slot.marketDirectionMode !== 'manual' && slot.limitType !== 'rhythm_market' && this.isNotLongCandidate(data.detail)) {
             const reasonText = await this.askForceReason(ticker, slot.side);
             if (reasonText == null) return;   // 取消：不开仓
-            return await this.placeOrder(slot, true, reasonText);
+            return await this.placeOrder(slot, true, reasonText, validate);
           }
           throw new Error(typeof data.detail === 'string' ? data.detail : (data.detail && data.detail.msg) || '下单失败');
         }
@@ -3004,6 +3991,8 @@ createApp({
     },
     exitReasonLabel(r) {
       return { trail_stop: '跟踪保护止损成交', stop: '保护止损触发', manual: '用户手动平仓',
+        candidate_timed_breakeven_stop:'定时保本退出（到期现价已越过成本）',
+        candidate_st_trailing_flip:'ST跟踪止盈反向退出（已启用ST模式）',
         manual_stop: '用户退出策略组', manual_stop_close: '用户退出策略组',
         st_flip: 'ST转向自动平仓（历史规则）', trend_reverse: '策略方向反向退出（历史规则）',
         fvg_reverse: '反向FVG自动退出（历史规则）', eod: '尾盘强平', eod_cancel: '尾盘撤单',

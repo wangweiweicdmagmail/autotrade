@@ -5,9 +5,10 @@ const path = require('node:path');
 const { loadPineModels, outputFromPeriod } = require('./pine_models');
 
 const versions = {
-  e9: '12.0', e20: '1.0', e7v2: '3.0', trend: '27.0', fvg: '7.0',
-  smart: '1.0', attack: '17.0',
+  e9: '12.0', e20: '1.0', e7v2: '3.0', golden: '1.0', trend: '27.0', fvg: '7.0',
+  smart: '1.0', attack: '17.0', vwap_pullback: '1.1',
 };
+const sourceFiles = { golden: 'large-candle-retracement.pine', vwap_pullback: 'vwap-outer-pullback-1m.pine' };
 const supplementalPlots = {
   trend: {
     Trend_State: 'Trend State', Atr_Value: 'Atr Value', ST_Duration_Bars: 'ST Duration Bars',
@@ -33,7 +34,7 @@ function getDefinition(id) {
   if (!plots || !Object.hasOwn(versions, key)) throw new Error(`未登记的本地指标: ${id}`);
   return {
     key, version: versions[key], model, plots,
-    source: fs.readFileSync(path.join(__dirname, '..', 'indicators', 'pinets', key + '.pine'), 'utf8'),
+    source: fs.readFileSync(path.join(__dirname, '..', 'indicators', sourceFiles[key] ?? `pinets/${key}.pine`), 'utf8'),
   };
 }
 
@@ -60,11 +61,12 @@ function candles(rows, seconds) {
   });
 }
 
-function createDatasetProvider({ symbol, metadata, bars, daily }) {
+function createDatasetProvider({ symbol, metadata, bars, daily }, intervalSeconds) {
   const [prefix, ticker] = symbol.split(':');
   const { timezone, minmove, pricescale } = metadata;
   if (!timezone || !(minmove > 0) || !(pricescale > 0)) throw new Error('PineTS 缺少标的元数据');
-  let fiveMinutes = candles(bars, 300);
+  let intraday = candles(bars, intervalSeconds);
+  const interval = String(intervalSeconds / 60);
   const dailyBars = daily && candles(daily, 86400);
   function checkSymbol(id) {
     // PineTS can pass the unqualified ticker for request.security(syminfo.tickerid, ...).
@@ -73,18 +75,18 @@ function createDatasetProvider({ symbol, metadata, bars, daily }) {
   return {
     configure() {},
     replaceLast(bar) {
-      const [current] = candles([bar], 300);
-      if (current.openTime !== fiveMinutes.at(-1)?.openTime) throw new Error('盘中重算只能替换当前 K 线');
-      fiveMinutes = [...fiveMinutes.slice(0, -1), current];
+      const [current] = candles([bar], intervalSeconds);
+      if (current.openTime !== intraday.at(-1)?.openTime) throw new Error('盘中重算只能替换当前 K 线');
+      intraday = [...intraday.slice(0, -1), current];
     },
     append(finalBar, currentBar) {
-      const [final, current] = candles([finalBar, currentBar], 300);
-      if (final.openTime !== fiveMinutes.at(-1)?.openTime) throw new Error('换根时缺少上一根最终 K 线');
-      fiveMinutes = [...fiveMinutes.slice(0, -1), final, current];
+      const [final, current] = candles([finalBar, currentBar], intervalSeconds);
+      if (final.openTime !== intraday.at(-1)?.openTime) throw new Error('换根时缺少上一根最终 K 线');
+      intraday = [...intraday.slice(0, -1), final, current];
     },
     async getMarketData(id, timeframe, limit, start, end) {
       checkSymbol(id);
-      if (String(timeframe) === '5') return start == null ? fiveMinutes : fiveMinutes.filter(bar => bar.openTime >= start);
+      if (String(timeframe) === interval) return start == null ? intraday : intraday.filter(bar => bar.openTime >= start);
       if (['D', '1D'].includes(timeframe) && dailyBars?.length) {
         // Include the preceding daily bar for [1] under lookahead_on.
         return end == null ? dailyBars : dailyBars.filter(bar => bar.openTime <= end);
@@ -141,8 +143,9 @@ function createCalculator(definition, { version, source = definition.source, inp
   async function open(dataset) {
     if (definition.key === 'attack' && !dataset.daily?.length) throw new Error('5M 进攻区域需要日线');
     const { symbol, bars } = dataset;
-    const provider = createDatasetProvider(dataset);
-    const pine = new PineTS(provider, symbol, '5', bars.length);
+    const intervalSeconds = definition.model?.interval_seconds ?? 300;
+    const provider = createDatasetProvider(dataset, intervalSeconds);
+    const pine = new PineTS(provider, symbol, String(intervalSeconds / 60), bars.length);
     const context = await pine.run(indicator);
     let outputBars = bars;
     let appended = 0;

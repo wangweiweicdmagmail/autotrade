@@ -36,7 +36,7 @@ import math
 import config
 from execution.external_guard import (
     GuardPreflightChanged, in_test_scope, scoped_order_account,
-    singleton_allocation_fills, unallocated_singleton_positions,
+    singleton_allocation_fills, unallocated_singleton_positions, is_external_guard_exempt,
 )
 from ib_async import ExecutionFilter
 
@@ -486,7 +486,7 @@ class IBKRGateway:
                 "trail_trade": trail_trade}
 
     async def place_market_with_stop(self, symbol: str, side: str, qty: int,
-                                     stop_px: float, order_ref: str = "") -> dict:
+                                     stop_px: float, order_ref: str = "", *, submit_before=None) -> dict:
         """市价单（父，MKT DAY）+ 固定 STOP 止损（子，STP GTC，parentId 关联）。
 
         严格市价成交（v2026-10-24 用户定稿：只做实时行情标的、严格市价成交）。
@@ -499,6 +499,8 @@ class IBKRGateway:
 
         if self.enabled and not self._connected:
             return {"ok": False, "error": "IBKR 未连接，入场未提交"}
+        if submit_before is not None and time.time() >= submit_before:
+            return {"ok": False, "not_sent": True, "error": "收盘下单窗口已结束"}
         if not self.enabled:
             fake_entry = next(self._fake_ids)
             fake_stop = next(self._fake_ids)
@@ -539,6 +541,8 @@ class IBKRGateway:
         stop.orderRef = order_ref + ":stop" if order_ref else ""
         self._apply_fa(stop)
         t0 = time.time()
+        if submit_before is not None and t0 >= submit_before:
+            return {"ok": False, "not_sent": True, "error": "收盘下单窗口已结束"}
         entry_trade = self.ib.placeOrder(contract, parent)
         stop_send_at = time.time()
         stop_trade = self.ib.placeOrder(contract, stop)
@@ -726,7 +730,7 @@ class IBKRGateway:
                 "stop_trade": stop_trade, "breakout_trade": brk_trade}
 
     async def place_close(self, symbol: str, side: str, qty: int,
-                          ref_px: float, order_ref: str = "") -> dict:
+                          ref_px: float, order_ref: str = "", *, market: bool = False) -> dict:
         """
         平仓：反向 marketable LIMIT（DAY）。
         side 是持仓方向：long 持仓 → SELL 平仓（限价略低于市价），
@@ -736,21 +740,22 @@ class IBKRGateway:
         premium = config.ENTRY_LIMIT_PREMIUM_PCT / 100.0
         action = "SELL" if side == "long" else "BUY"      # 反向
         sign = -1 if side == "long" else 1                # 平多卖略低 / 平空买略高
-        lmt = round(ref_px * (1 + premium * sign), 2)
+        lmt = None if market else round(ref_px * (1 + premium * sign), 2)
 
         if self.enabled and not self._connected:
             return {"ok": False, "error": "IBKR 未连接，平仓未提交"}
         if not self.enabled:
             fake = next(self._fake_ids)
-            logger.info("[DRY-RUN] 平仓 %s: %s x%d @LMT %.2f",
-                        symbol, action, qty, lmt)
+            logger.info("[DRY-RUN] 平仓 %s: %s x%d %s",
+                        symbol, action, qty, "MKT" if market else f"LMT {lmt:.2f}")
             return {"ok": True, "dry_run": True, "order_id": fake,
                     "status": "DryRun", "limit_price": lmt}
 
-        from ib_async import LimitOrder
+        from ib_async import LimitOrder, MarketOrder
         contract = await self._qualify(symbol)
-        order = LimitOrder(action, qty, lmt, tif="DAY",
-                           orderId=self._next_tool_order_id())
+        order_id = self._next_tool_order_id()
+        order = (MarketOrder(action, qty, tif="DAY", orderId=order_id) if market else
+                 LimitOrder(action, qty, lmt, tif="DAY", orderId=order_id))
         if order_ref:
             order.orderRef = order_ref
         self._apply_fa(order)
@@ -767,8 +772,8 @@ class IBKRGateway:
             return {"ok": False, "order_id": order.orderId,
                     "status": status, "error": err, "trade": trade,
                     "permId": getattr(trade.order, "permId", None)}
-        logger.info("平仓已提交 %s %s x%d @%.2f | orderId=%d(%s)",
-                    symbol, action, qty, lmt, order.orderId, status)
+        logger.info("平仓已提交 %s %s x%d %s | orderId=%d(%s)",
+                    symbol, action, qty, "MKT" if market else f"LMT {lmt:.2f}", order.orderId, status)
         return {"ok": True, "order_id": order.orderId, "status": status,
                 "limit_price": lmt, "trade": trade}
 
@@ -1295,8 +1300,9 @@ class IBKRGateway:
         try:
             for t in self.ib.trades():
                 out[t.order.orderId] = t
-            trades = await asyncio.wait_for(
-                self.ib.reqAllOpenOrdersAsync(), timeout=10)
+            trades = await self.open_orders_snapshot()
+            if trades is None:
+                return None
             for t in trades:
                 out.setdefault(t.order.orderId, t)
         except Exception as e:
@@ -1514,6 +1520,7 @@ class IBKRGateway:
         selected = config.EXTERNAL_MANUAL_GUARD_TEST_ACCOUNT
         return (
             self.enabled and self._connected and self.client_id == 0
+            and not is_external_guard_exempt(contract.symbol)
             and self._guard_verified_connection == (self.ib, selected)
             and (
                 in_test_scope(contract, account, qty, selected) if selected else
@@ -1544,6 +1551,8 @@ class IBKRGateway:
         from ib_async import Contract, MarketOrder, StopOrder
 
         source = position.contract
+        if is_external_guard_exempt(source.symbol):
+            raise GuardPreflightChanged(f"{source.symbol} 已豁免外部订单自动处理")
         quantity = abs(float(position.position))
         if not self._guard_write_allowed(source, position.account, quantity):
             raise GuardPreflightChanged("外部订单写操作超出已确认的 FA 账户范围")
@@ -1625,7 +1634,9 @@ class IBKRGateway:
             if not tickers:
                 return [], [], [], accounts
             fills = await asyncio.wait_for(ib.reqExecutionsAsync(ExecutionFilter()), timeout=10)
-            active_orders = await asyncio.wait_for(ib.reqAllOpenOrdersAsync(), timeout=10)
+            active_orders = await self.open_orders_snapshot()
+            if active_orders is None:
+                return None
             positions = [p for p in ib.positions() if p.account in accounts
                          and p.contract.secType == "STK" and p.position
                          and p.contract.symbol.upper() in tickers]
@@ -1670,8 +1681,9 @@ class IBKRGateway:
             return None
         accts = set(await self.fa_accounts())
         try:
-            trades = await asyncio.wait_for(
-                self.ib.reqAllOpenOrdersAsync(), timeout=10)
+            trades = await self.open_orders_snapshot()
+            if trades is None:
+                return None
         except Exception as e:
             logger.warning("开放订单查询失败: %s", e)
             return None

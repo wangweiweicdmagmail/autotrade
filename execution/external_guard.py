@@ -4,12 +4,15 @@ import asyncio
 import logging
 import math
 import sqlite3
-from collections import defaultdict
+import time
+from collections import defaultdict, deque
 from contextlib import closing
 from dataclasses import dataclass, replace
 from datetime import datetime
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+import config
 from execution.external_adoption import execution_groups
 
 logger = logging.getLogger(__name__)
@@ -20,6 +23,17 @@ STOP_TYPES = {"STP", "STP LMT", "TRAIL", "TRAIL LIMIT"}
 
 class GuardPreflightChanged(RuntimeError):
     """The operation was stopped before calling the broker's submit method."""
+
+
+def is_external_guard_exempt(symbol):
+    """Exact ticker match; accept the console's exchange-prefixed symbols too."""
+    if not isinstance(symbol, str):
+        return False
+    ticker = symbol.strip().upper().rsplit(":", 1)[-1]
+    return bool(ticker) and ticker in {
+        value.strip().upper().rsplit(":", 1)[-1]
+        for value in config.EXTERNAL_ORDER_GUARD_EXEMPT_TICKERS
+    }
 
 
 def in_test_scope(contract, account, qty, selected_account):
@@ -51,7 +65,8 @@ def unallocated_singleton_positions(positions, fills, accounts):
         return []
     pending = []
     for row in positions:
-        if row.account not in accounts or row.contract.secType != "STK" or not row.position:
+        if (row.account not in accounts or row.contract.secType != "STK" or not row.position
+                or is_external_guard_exempt(row.contract.symbol)):
             continue
         native = [f for f in fills if f.contract.conId == row.contract.conId
                   and f.execution.acctNumber == row.account]
@@ -113,6 +128,23 @@ class ExternalEntryGuard:
         self.gateway = gateway
         self.journal = journal
         self.test_account = test_account
+        self.recent_results = deque(maxlen=64)
+        self._pending_cancellations = {}
+
+    def _record_result(self, kind, symbol, **details):
+        self.recent_results.append({
+            "id": uuid4().hex, "ts": time.time(), "kind": kind, "symbol": symbol, **details,
+        })
+
+    def _observe_cancellations(self):
+        now = time.monotonic()
+        for perm_id, (trade, deadline) in list(self._pending_cancellations.items()):
+            status = trade.orderStatus.status
+            if status in TERMINAL_CANCEL:
+                self._record_result("cancelled", trade.contract.symbol)
+            elif not trade.isDone() and now < deadline:
+                continue
+            del self._pending_cancellations[perm_id]
 
     def _journal(self, account, perm_id, *, quantity=None, contract_id=0):
         with closing(sqlite3.connect(self.journal)) as connection, connection:
@@ -290,10 +322,11 @@ class ExternalEntryGuard:
                 continue
             perm_id = ref[len(prefix):]
             if perm_id.isdecimal() and entry.execId:
-                executed[entry.acctNumber, int(perm_id)][entry.execId] = float(entry.shares)
+                executed[entry.acctNumber, int(perm_id)][entry.execId] = fill
+        completed = []
         with closing(sqlite3.connect(self.journal)) as connection, connection:
-            for (account, perm_id), quantities in executed.items():
-                quantity = sum(quantities.values())
+            for (account, perm_id), executions in executed.items():
+                quantity = sum(float(fill.execution.shares) for fill in executions.values())
                 row = connection.execute(
                     "SELECT requested, observed FROM exits WHERE account=? AND entry_perm_id=?",
                     (account, perm_id),
@@ -306,6 +339,10 @@ class ExternalEntryGuard:
                 )
                 logger.info("外部手动仓平仓成交核对 account=%s entryPermId=%s filled=%s/%s",
                             account, perm_id, quantity, row[0])
+                if quantity == row[0]:
+                    completed.append((next(iter(executions.values())).contract.symbol, quantity))
+        for symbol, quantity in completed:
+            self._record_result("closed", symbol, qty=quantity)
 
     def _manual(self, order, owned):
         return (getattr(order, "clientId", None) == 0
@@ -316,6 +353,8 @@ class ExternalEntryGuard:
                 and not self.gateway.is_tool_order_id(order.orderId))
 
     def _order_in_scope(self, trade, accounts):
+        if is_external_guard_exempt(trade.contract.symbol):
+            return False
         if self.test_account is None:
             return True
         order = trade.order
@@ -336,6 +375,8 @@ class ExternalEntryGuard:
                    for child in linked)
 
     def _row_in_scope(self, row):
+        if is_external_guard_exempt(row.contract.symbol):
+            return False
         return self.test_account is None or in_test_scope(
             row.contract, row.account, abs(row.position), self.test_account,
         )
@@ -347,13 +388,19 @@ class ExternalEntryGuard:
         return {order.account} & accounts
 
     async def _cancel(self, trade):
-        if (trade.orderStatus.status != "PendingCancel"
-                and not self.gateway.cancel_external_bound_order(trade)):
-            logger.warning("外部订单未取得撤单权限 permId=%s", trade.order.permId)
-            return False
+        status = trade.orderStatus.status
+        if status != "PendingCancel":
+            if not self.gateway.cancel_external_bound_order(trade):
+                logger.warning("外部订单未取得撤单权限 permId=%s", trade.order.permId)
+                return False
+            # ib_async can mark inactive or untransmitted orders cancelled locally.
+            if (status not in TERMINAL_CANCEL | {"Filled", "Inactive"}
+                    and (status != "PendingSubmit" or getattr(trade.order, "transmit", True))):
+                self._pending_cancellations[trade.order.permId] = (trade, time.monotonic() + 300)
         for _ in range(20):
             if trade.isDone():
                 status = trade.orderStatus.status
+                self._observe_cancellations()
                 logger.info("外部订单撤单核对 permId=%s status=%s",
                             trade.order.permId, status)
                 return status in TERMINAL_CANCEL or status == "Filled"
@@ -430,6 +477,7 @@ class ExternalEntryGuard:
         return opening[0]
 
     async def run(self, owned, managed_tickers, *, allow_market):
+        self._observe_cancellations()
         snapshot = await self.gateway.external_guard_snapshot()
         if snapshot is None:
             logger.warning("外部交易处理跳过：FA 成员、仓位或订单未确认")

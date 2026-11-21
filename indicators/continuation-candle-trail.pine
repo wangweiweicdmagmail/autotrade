@@ -1,0 +1,85 @@
+//@version=6
+indicator("连续趋势 K 线跟踪止损", shorttitle="趋势 K 线跟踪", overlay=true)
+
+minStreak = input.int(2, "连续同向 K 线根数（含信号 K 线）", minval=2)
+atrLength = input.int(14, "ATR 周期", minval=1)
+minBodyAtr = input.float(1.0, "信号实体最小 ATR 倍数", minval=0.1, step=0.1)
+retracement = input.float(0.38, "从极值回撤比例", minval=0.01, maxval=0.99, step=0.01)
+
+atr = ta.atr(atrLength)
+[supertrend, stDirection] = ta.supertrend(1.0, 10)
+var int upStreak = 0
+var int downStreak = 0
+upStreak := close > open ? nz(upStreak[1]) + 1 : 0
+downStreak := close < open ? nz(downStreak[1]) + 1 : 0
+
+// 信号 K 线要先收盘。实体与其前一根已收盘 ATR 比较，避免把信号本身计入基准。
+int direction = na(supertrend[1]) or na(stDirection[1]) ? 0 : stDirection[1] < 0 ? 1 : -1
+sameDirectionStreak = direction == 1 ? upStreak[1] : downStreak[1]
+body = math.abs(close[1] - open[1])
+baseline = atr[2]
+setup = direction != 0 and sameDirectionStreak >= minStreak and baseline > 0 and body >= minBodyAtr * baseline
+
+// 信号价位只在其下一根 K 线有效，整根内保持固定。
+stopPrice = math.round_to_mintick(direction == 1 ? low[1] : high[1])
+float entryPrice = na
+if setup and direction == 1
+    entryPrice := math.round_to_mintick(high[1] - (high[1] - open[1]) * retracement)
+if setup and direction == -1
+    entryPrice := math.round_to_mintick(low[1] + (open[1] - low[1]) * retracement)
+
+// 跟踪的是指标内的理论仓位。上一根收盘的状态决定当根使用的止损。
+var int positionDirection = 0
+var float trailStop = na
+previousDirection = nz(positionDirection[1])
+previousStop = trailStop[1]
+validLong = previousDirection == 0 and setup and direction == 1 and stopPrice > 0 and entryPrice > stopPrice
+validShort = previousDirection == 0 and setup and direction == -1 and entryPrice > 0 and stopPrice > entryPrice
+longSignal = validLong and open >= entryPrice and low <= entryPrice and low > stopPrice
+shortSignal = validShort and open <= entryPrice and high >= entryPrice and high < stopPrice
+
+longExit = previousDirection == 1 and low < previousStop
+shortExit = previousDirection == -1 and high > previousStop
+exited = longExit or shortExit
+
+// 先按已生效的止损检查退出。收盘后才用当根极值更新下一根的止损。
+if barstate.isconfirmed
+    if exited
+        positionDirection := 0
+        trailStop := na
+    else if previousDirection == 1 or longSignal
+        positionDirection := 1
+        trailStop := math.max(previousDirection == 1 ? previousStop : stopPrice, math.round_to_mintick(low))
+    else if previousDirection == -1 or shortSignal
+        positionDirection := -1
+        trailStop := math.min(previousDirection == -1 ? previousStop : stopPrice, math.round_to_mintick(high))
+
+hasPlan = validLong or validShort
+visibleStop = exited ? na : barstate.isconfirmed ? trailStop : previousStop
+visibleDirection = barstate.isconfirmed ? positionDirection : previousDirection
+longTrail = visibleDirection == 1 ? visibleStop : na
+shortTrail = visibleDirection == -1 ? visibleStop : na
+
+// 入场快照保留初始止损，入场根收盘后的调整另由跟踪字段输出。
+plot(longSignal or shortSignal ? 1 : 0, "Entry_Signal", display=display.data_window, offset=0)
+plot(previousDirection != 0 ? previousDirection : direction, "Direction", display=display.data_window, offset=0)
+plot(hasPlan ? entryPrice : na, "Entry_Price", display=display.data_window, offset=0)
+plot(validLong ? stopPrice : longTrail, "Long_Stop", display=display.data_window, offset=0)
+plot(validShort ? stopPrice : shortTrail, "Short_Stop", display=display.data_window, offset=0)
+plot(baseline, "ATR", display=display.data_window, offset=0)
+plot(longTrail, "Long_Trail_Stop", display=display.data_window, offset=0)
+plot(shortTrail, "Short_Trail_Stop", display=display.data_window, offset=0)
+plot(exited ? 1 : 0, "Exit_Signal", display=display.data_window, offset=0)
+
+plot(hasPlan ? entryPrice : na, "入场参考价", color=color.aqua, linewidth=2, style=plot.style_linebr)
+plot(hasPlan ? stopPrice : na, "初始止损价", color=color.orange, linewidth=2, style=plot.style_linebr)
+// 单根计划没有相邻点可连线，仍标出实际价位。
+plotshape(hasPlan and not hasPlan[1] ? entryPrice : na, "入场参考价起点", style=shape.circle, location=location.absolute, color=color.aqua, size=size.tiny)
+plotshape(hasPlan and not hasPlan[1] ? stopPrice : na, "初始止损价起点", style=shape.circle, location=location.absolute, color=color.orange, size=size.tiny)
+plot(longTrail, "多头跟踪止损", color=color.lime, linewidth=2, style=plot.style_linebr)
+plot(shortTrail, "空头跟踪止损", color=color.red, linewidth=2, style=plot.style_linebr)
+plot(direction == 1 ? supertrend[1] : na, "ST 多头价格", color=color.green, style=plot.style_linebr)
+plot(direction == -1 ? supertrend[1] : na, "ST 空头价格", color=color.maroon, style=plot.style_linebr)
+plotshape(longSignal, "多头触发", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.tiny)
+plotshape(shortSignal, "空头触发", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.tiny)
+plotshape(exited ? previousStop : na, "退出", style=shape.xcross, location=location.absolute, color=color.orange, size=size.small)

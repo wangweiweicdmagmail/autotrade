@@ -113,6 +113,8 @@ async def run(strategy_name: str, symbols: list, params: dict) -> None:
         per_trade_usd=config.RISK_PER_TRADE_USD,
         max_order_qty=config.RISK_MAX_ORDER_QTY,
         max_open_positions=config.RISK_MAX_OPEN_POSITIONS,
+        max_total_risk_usd=config.RISK_MAX_TOTAL_RISK_USD,
+        max_direction_risk_usd=config.RISK_MAX_DIRECTION_RISK_USD,
         daily_loss_limit_usd=config.RISK_DAILY_LOSS_LIMIT_USD,
     ))
     order_mgr = OrderManager(gateway, risk_gate)

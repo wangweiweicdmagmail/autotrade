@@ -1,0 +1,319 @@
+{
+  "synthetic": true,
+  "final1060": [
+    {
+      "bodyOverflow": 0,
+      "headerHeight": 75.6953125,
+      "tab": "instances",
+      "width": 1060
+    },
+    {
+      "bodyOverflow": 0,
+      "headerHeight": 75.6953125,
+      "tab": "orders",
+      "width": 1060
+    },
+    {
+      "bodyOverflow": 0,
+      "headerHeight": 75.6953125,
+      "tab": "fvg",
+      "width": 1060
+    },
+    {
+      "bodyOverflow": 0,
+      "headerHeight": 75.6953125,
+      "tab": "screen",
+      "width": 1060
+    },
+    {
+      "bodyOverflow": 0,
+      "headerHeight": 75.6953125,
+      "tab": "backtest",
+      "width": 1060
+    },
+    {
+      "bodyOverflow": 0,
+      "headerHeight": 75.6953125,
+      "tab": "night",
+      "width": 1060
+    },
+    {
+      "bodyOverflow": 0,
+      "headerHeight": 75.6953125,
+      "tab": "reports",
+      "width": 1060
+    },
+    {
+      "bodyOverflow": 0,
+      "headerHeight": 75.6953125,
+      "tab": "news",
+      "width": 1060
+    },
+    {
+      "bodyOverflow": 0,
+      "headerHeight": 75.6953125,
+      "tab": "shadow",
+      "width": 1060
+    },
+    {
+      "bodyOverflow": 0,
+      "headerHeight": 75.6953125,
+      "tab": "returns",
+      "width": 1060
+    },
+    {
+      "bodyOverflow": 0,
+      "headerHeight": 75.6953125,
+      "tab": "perf",
+      "width": 1060
+    },
+    {
+      "bodyOverflow": 0,
+      "headerHeight": 75.6953125,
+      "tab": "log",
+      "width": 1060
+    },
+    {
+      "bodyOverflow": 0,
+      "headerHeight": 75.6953125,
+      "tab": "events",
+      "width": 1060
+    },
+    {
+      "bodyOverflow": 0,
+      "headerHeight": 75.6953125,
+      "tab": "copy",
+      "width": 1060
+    }
+  ],
+  "width820": [
+    {
+      "bodyOverflow": 0,
+      "paneOverflow": 0,
+      "tab": "instances",
+      "width": 820
+    },
+    {
+      "bodyOverflow": 0,
+      "paneOverflow": 0,
+      "tab": "orders",
+      "width": 820
+    },
+    {
+      "bodyOverflow": 0,
+      "paneOverflow": 0,
+      "tab": "fvg",
+      "width": 820
+    },
+    {
+      "bodyOverflow": 0,
+      "paneOverflow": 0,
+      "tab": "screen",
+      "width": 820
+    },
+    {
+      "bodyOverflow": 0,
+      "paneOverflow": 0,
+      "tab": "backtest",
+      "width": 820
+    },
+    {
+      "bodyOverflow": 0,
+      "paneOverflow": 0,
+      "tab": "night",
+      "width": 820
+    },
+    {
+      "bodyOverflow": 0,
+      "paneOverflow": 0,
+      "tab": "reports",
+      "width": 820
+    },
+    {
+      "bodyOverflow": 0,
+      "paneOverflow": 0,
+      "tab": "news",
+      "width": 820
+    },
+    {
+      "bodyOverflow": 0,
+      "paneOverflow": 0,
+      "tab": "shadow",
+      "width": 820
+    },
+    {
+      "bodyOverflow": 0,
+      "paneOverflow": 0,
+      "tab": "returns",
+      "width": 820
+    },
+    {
+      "bodyOverflow": 0,
+      "paneOverflow": 0,
+      "tab": "perf",
+      "width": 820
+    },
+    {
+      "bodyOverflow": 0,
+      "paneOverflow": 0,
+      "tab": "log",
+      "width": 820
+    },
+    {
+      "bodyOverflow": 0,
+      "paneOverflow": 0,
+      "tab": "events",
+      "width": 820
+    },
+    {
+      "bodyOverflow": 0,
+      "paneOverflow": 0,
+      "tab": "copy",
+      "width": 820
+    }
+  ],
+  "width1600": [
+    {
+      "bodyOverflow": 0,
+      "tab": "instances",
+      "width": 1600
+    },
+    {
+      "bodyOverflow": 0,
+      "tab": "orders",
+      "width": 1600
+    },
+    {
+      "bodyOverflow": 0,
+      "tab": "fvg",
+      "width": 1600
+    },
+    {
+      "bodyOverflow": 0,
+      "tab": "screen",
+      "width": 1600
+    },
+    {
+      "bodyOverflow": 0,
+      "tab": "backtest",
+      "width": 1600
+    },
+    {
+      "bodyOverflow": 0,
+      "tab": "night",
+      "width": 1600
+    },
+    {
+      "bodyOverflow": 0,
+      "tab": "reports",
+      "width": 1600
+    },
+    {
+      "bodyOverflow": 0,
+      "tab": "news",
+      "width": 1600
+    },
+    {
+      "bodyOverflow": 0,
+      "tab": "shadow",
+      "width": 1600
+    },
+    {
+      "bodyOverflow": 0,
+      "tab": "returns",
+      "width": 1600
+    },
+    {
+      "bodyOverflow": 0,
+      "tab": "perf",
+      "width": 1600
+    },
+    {
+      "bodyOverflow": 0,
+      "tab": "log",
+      "width": 1600
+    },
+    {
+      "bodyOverflow": 0,
+      "tab": "events",
+      "width": 1600
+    },
+    {
+      "bodyOverflow": 0,
+      "tab": "copy",
+      "width": 1600
+    }
+  ],
+  "width600": [
+    {
+      "bodyOverflow": 0,
+      "tab": "instances",
+      "width": 600
+    },
+    {
+      "bodyOverflow": 0,
+      "tab": "orders",
+      "width": 600
+    },
+    {
+      "bodyOverflow": 0,
+      "tab": "fvg",
+      "width": 600
+    },
+    {
+      "bodyOverflow": 0,
+      "tab": "screen",
+      "width": 600
+    },
+    {
+      "bodyOverflow": 0,
+      "tab": "backtest",
+      "width": 600
+    },
+    {
+      "bodyOverflow": 0,
+      "tab": "night",
+      "width": 600
+    },
+    {
+      "bodyOverflow": 0,
+      "tab": "reports",
+      "width": 600
+    },
+    {
+      "bodyOverflow": 0,
+      "tab": "news",
+      "width": 600
+    },
+    {
+      "bodyOverflow": 0,
+      "tab": "shadow",
+      "width": 600
+    },
+    {
+      "bodyOverflow": 0,
+      "tab": "returns",
+      "width": 600
+    },
+    {
+      "bodyOverflow": 0,
+      "tab": "perf",
+      "width": 600
+    },
+    {
+      "bodyOverflow": 0,
+      "tab": "log",
+      "width": 600
+    },
+    {
+      "bodyOverflow": 0,
+      "tab": "events",
+      "width": 600
+    },
+    {
+      "bodyOverflow": 0,
+      "tab": "copy",
+      "width": 600
+    }
+  ]
+}

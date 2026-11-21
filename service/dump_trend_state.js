@@ -35,7 +35,7 @@ const TREND_STATE_ID = 'USER;e577100fe79942b4830783d1ceaad535';
 const FVG_ID = 'USER;5ec7d04179b3429ca9286db452352d85';
 const SMART_STOP_ID = 'USER;ca26e3ab587841e2adb38cfbfd0bec41';
 const { loadPineModels, outputFromPeriod } = require('./pine_models.js');
-const PINE_MODELS = loadPineModels();
+const PINE_MODELS = loadPineModels().filter(model => !model.local_only);
 
 function parseArgs(argv) {
   const args = {

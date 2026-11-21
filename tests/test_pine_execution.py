@@ -336,6 +336,70 @@ def test_opening_range_blocks_entry_without_consuming_same_bar_signal(monkeypatc
     assert len(broker.calls) == 1
 
 
+@pytest.mark.parametrize("direction", [1, -1])
+def test_vwap_outer_pullback_uses_post_activation_minute_quote_and_confirmation(monkeypatch, direction):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from console.services import auto
+
+    minute = datetime(2026, 11, 17, 10, 1, tzinfo=ZoneInfo("America/New_York")).timestamp()
+    clock = [minute + 2]
+    monkeypatch.setattr(auto.time, "time", lambda: clock[0])
+    broker = StateBroker()
+    stop_field = "long_stop" if direction == 1 else "short_stop"
+    output = {"time": minute, "entry_signal": 0, "entry_price": 100, "direction": direction,
+              "candidate_direction": direction, stop_field: 100 - 2 * direction}
+    data = {
+        "bar": {"time": minute - 60, "close": 60},
+        "bar_c": {"time": minute - 360, "close": 60},
+        "market_1m": {"bar": {"time": minute, "close": 100 + direction},
+                      "price_observed_at": minute + 1},
+        "vwap_1m": {"time": minute, "speed": direction * 2},
+        "vwap_pullback": output,
+    }
+    service = AutoService(broker, SimpleNamespace(latest=lambda: {SYM: data}), None, watchlist=[SYM])
+    key = "vwap_outer_pullback"
+    data["market_1m"]["bar"]["close"] = 100
+    with pytest.raises(AutoServiceError, match="价格已经触及外沿"):
+        service.start(key, [SYM], {}, preview=True)
+    data["market_1m"]["bar"]["close"] = 100 + direction
+    check = service.start(key, [SYM], {}, preview=True)
+    assert check["candidate"]["entry_price"] == 100
+    output.update(direction=-direction, candidate_direction=0, entry_price=None)
+    with pytest.raises(AutoServiceError, match="一分钟 ST 同向"):
+        service.start(key, [SYM], {}, confirmed_directions=check["directions"])
+    output.update(direction=direction, candidate_direction=direction, entry_price=100)
+    assert service.start(key, [SYM], {}, confirmed_directions=check["directions"])["started"] == [SYM]
+    with pytest.raises(AutoServiceError, match="已有执行实例"):
+        service.start(key, [SYM], {}, instance_id="duplicate", confirmed_directions=check["directions"])
+
+    runtime = StrategyRuntime(service)
+    output["entry_signal"] = 1
+    data["market_1m"]["bar"]["close"] = 100 - direction * 0.05
+    run(runtime.step({SYM: data}, 601, trading=True))
+    assert not broker.calls
+    clock[0] = minute + 4
+    data["market_1m"]["price_observed_at"] = minute + 3
+    run(runtime.step({SYM: data}, 601, trading=True))
+    run(runtime.step({SYM: data}, 601, trading=True))
+    order, = broker.calls
+    assert order["side"] == ("long" if direction == 1 else "short")
+    assert order["stop_px"] == output[stop_field]
+    assert order["meta"]["entry_order_type"] == "MKT"
+    assert order["meta"]["risk_reference_price"] == 100 - direction * 0.05
+    assert order["meta"]["submission_deadline"] == minute + 60
+    assert order["meta"]["manual_entry"] is False
+
+    clock[0] = minute + 61
+    data["market_1m"]["bar"] = {"time": minute + 60, "close": 100}
+    data["market_1m"]["bar_c"] = {"time": minute, "close": 100}
+    data["vwap_pullback_c"] = output | {stop_field: 100 - direction}
+    run(runtime.step({SYM: data}, 602, trading=True))
+    assert runtime.last_bars[key, "default", SYM] == minute
+    assert broker.lots["lot-1"].stop_px == 100 - direction
+
+
 def test_service_restores_same_session_watch_and_position_only():
     from datetime import date, datetime
     from zoneinfo import ZoneInfo
@@ -365,4 +429,91 @@ def test_service_restores_same_session_watch_and_position_only():
     assert restored["NASDAQ:AMD"]["start_direction"] == 1
     assert restored["NASDAQ:AMD"]["initial_risk_usd"] == 700
     assert restored[SYM]["lot_ids"] == ["lot-1"]
+    assert len(broker.calls) == 1
+
+
+@pytest.mark.parametrize("direction", [1, -1])
+def test_golden_strategy_moves_to_actual_cost_after_filled_bar_confirms(direction):
+    broker = StateBroker()
+    model = registry().get("golden_strategy")
+    engine = PineExecutionEngine(broker, model=model)
+    engine.start([SYM], 100)
+    entry_bar = 1_793_802_600
+    signal = {
+        "time": entry_bar, "entry_signal": 1, "direction": direction, "entry_price": 100,
+        "long_stop": 99 if direction == 1 else None,
+        "short_stop": 101 if direction == -1 else None,
+    }
+    run(engine.on_price(SYM, 100, signal, 600))
+    lot = broker.lots["lot-1"]
+    lot.avg_fill = 100 + direction * 0.1
+    lot.entry_broker_time = entry_bar + 20
+    assert broker.calls[0]["meta"]["entry_order_type"] == "MKT"
+    favorable = lot.avg_fill + direction * 0.2
+    run(engine.on_price(SYM, favorable, signal | {"time": entry_bar + 300, "entry_signal": 0}, 605))
+    assert lot.stop_px == 100 - direction
+    run(engine.on_bar(SYM, {"time": entry_bar, "close": favorable}, signal))
+    next_output = {"time": entry_bar + 300, "entry_signal": 0, "direction": -direction}
+    run(engine.on_price(SYM, lot.avg_fill - direction * 0.05, next_output, 605))
+    assert lot.stop_px == 100 - direction
+    run(engine.on_price(SYM, favorable, next_output, 605))
+    assert lot.stop_px == lot.avg_fill
+    assert engine.get_instance(SYM).breakeven_done
+    assert not broker.closes
+
+
+def test_golden_strategy_can_start_before_large_candle():
+    market = {SYM: {"golden": {"time": 1_793_802_600, "entry_signal": 0, "direction": 0}}}
+    service = AutoService(StateBroker(), SimpleNamespace(latest=lambda: market), None, registry=registry())
+    preview = service.start("golden_strategy", [SYM], {}, preview=True)
+    assert preview["follow_signal_direction"]
+    result = service.start("golden_strategy", [SYM], {}, confirmed_directions=preview["directions"])
+    assert result["started"] == [SYM]
+    assert result["params"]["start_directions"] == {SYM: 0}
+
+
+@pytest.mark.parametrize("manual_window", [False, True])
+def test_golden_click_places_only_current_valid_signal(monkeypatch, manual_window):
+    import time
+    from fastapi import HTTPException
+    from console.schemas import GoldenEntryRequest
+    from console.services.automatic import AutomaticService
+
+    broker = StateBroker()
+    now = time.time()
+    bar_time = int(now // 300) * 300
+    market = {SYM: {
+        "bar": {"time": bar_time, "close": 100.1},
+        "price_observed_at": now,
+        "golden": {"time": bar_time, "entry_signal": 0, "direction": 1,
+                   "entry_price": 100, "long_stop": 99},
+    }}
+    collector = SimpleNamespace(latest=lambda: market, data_health=lambda: {"stale": False})
+    service = AutoService(broker, collector, None, registry=registry())
+    context = SimpleNamespace(
+        auto_service=service, collector=collector, system=SimpleNamespace(_is_trading_hours=lambda: True),
+        strategy_runtime=SimpleNamespace(require_opening_range=False),
+        events=SimpleNamespace(record_event=lambda *args, **kwargs: None),
+    )
+    api = AutomaticService(context)
+    monkeypatch.setattr("console.services.automatic.time.time", lambda: now)
+    req = GoldenEntryRequest(symbol=SYM, bar_time=bar_time, direction=1)
+    with pytest.raises(HTTPException, match="未触线"):
+        run(api.api_golden_entry(req, "master"))
+    if manual_window:
+        req = GoldenEntryRequest(symbol=SYM, bar_time=bar_time, direction=1, manual_window=True)
+        expired = GoldenEntryRequest(symbol=SYM, bar_time=bar_time - 300, direction=1, manual_window=True)
+        with pytest.raises(HTTPException, match="过有效期"):
+            run(api.api_golden_entry(expired, "master"))
+        market[SYM]["bar"]["close"] = 99
+        with pytest.raises(HTTPException, match="保护价无效"):
+            run(api.api_golden_entry(req, "master"))
+        market[SYM]["bar"]["close"] = 101
+    else:
+        market[SYM]["golden"]["entry_signal"] = 1
+    assert run(api.api_golden_entry(req, "master"))["lot_id"] == "lot-1"
+    assert broker.calls[0]["meta"]["submission_deadline"] == bar_time + 300
+    assert broker.calls[0]["meta"]["entry_order_type"] == "MKT"
+    with pytest.raises(HTTPException, match="已有一键开仓实例"):
+        run(api.api_golden_entry(req, "master"))
     assert len(broker.calls) == 1

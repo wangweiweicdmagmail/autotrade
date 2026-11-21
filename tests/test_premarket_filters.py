@@ -104,7 +104,7 @@ def test_settings_endpoint_partial_update_and_validation(app, tmp_path):
         run(app.settings.api_update_settings(schemas.SettingsRequest(stop_atr_mult=99.0), trader='master'))
     assert ei.value.status_code == 400
     got = run(app.settings.api_get_settings())
-    assert set(got) == {'stop_atr_mult', 'screen_premarket_filter', 'screen_opening_range_filter', 'fvg_premarket_filter', 'imessage_recipient', 'pyramid_auto_breakeven', 'pyramid_breakeven_r', 'pyramid_add_unlock_r'}
+    assert set(got) == {'stop_atr_mult', 'screen_premarket_filter', 'screen_opening_range_filter', 'fvg_premarket_filter', 'imessage_recipient', 'pyramid_auto_breakeven', 'pyramid_breakeven_r', 'pyramid_add_unlock_r', 'candidate_order_protection'}
     assert got['imessage_recipient'] == ''
     assert got['pyramid_auto_breakeven'] is True
     assert got['pyramid_breakeven_r'] == 3.0

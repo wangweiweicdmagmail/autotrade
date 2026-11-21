@@ -181,15 +181,13 @@ class NativeUI:
         self.click(button)
         self.menu_command(self.windows(), titles)
 
-    def split(self, console_url, chart_url, chart_title, chart_host):
+    def split(self, console_url, chart_url, console_title, console_host):
         self.prepare()
         positions = self.positions(console_url, chart_url)
         if len(positions) == 2:
             if positions["console"][0] == positions["chart"][0]:
                 self.adjust(("并排显示", "Side by side", "Side-by-side"))
                 positions = self.positions(console_url, chart_url)
-            if positions["console"][0] > positions["chart"][0]:
-                self.adjust(("反转视图", "Reverse views", "Swap views"))
         else:
             def picker():
                 return next((n for n in self.nodes() if self.text(n, "AXRole") == "AXWebArea"
@@ -205,21 +203,26 @@ class NativeUI:
                 if area:
                     rows = [n for n in self.walk(area, web_contents=True)
                             if self.text(n, "AXRole") == "AXStaticText"]
-                    exact = [n for n in rows if self.text(n, "AXValue").startswith(chart_title)]
-                    candidates = exact or [n for n in rows if chart_host in self.text(n, "AXValue")]
+                    exact = [n for n in rows if self.text(n, "AXValue").startswith(console_title)]
+                    candidates = exact or [n for n in rows if console_host in self.text(n, "AXValue")]
                     if len(candidates) == 1:
                         self.click(candidates[0])
                         break
                     if len(candidates) > 1:
-                        raise RuntimeError("图表候选不唯一，已停止自动选择")
+                        raise RuntimeError("控制台候选不唯一，已停止自动选择")
                 time.sleep(0.15)
         deadline = time.monotonic() + 4
+        reversed_views = False
         while time.monotonic() < deadline:
             positions = self.positions(console_url, chart_url)
-            if len(positions) == 2 and positions["console"][0] < positions["chart"][0]:
-                return
+            if len(positions) == 2:
+                if positions["chart"][0] < positions["console"][0]:
+                    return
+                if positions["console"][0] < positions["chart"][0] and not reversed_views:
+                    self.adjust(("反转视图", "Reverse views", "Swap views"))
+                    reversed_views = True
             time.sleep(0.15)
-        raise RuntimeError("未确认左侧控制台、右侧 TradingView；请检查两个页面是否位于同一窗口")
+        raise RuntimeError("未确认左侧 TradingView、右侧控制台；请检查两个页面是否位于同一窗口")
 
 
 if __name__ == "__main__":

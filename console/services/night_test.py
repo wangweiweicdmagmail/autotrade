@@ -77,6 +77,8 @@ class NightTestService:
             if session not in ("regular", "extended", "24h"):
                 raise NightTestError("不支持的数据时段")
             model = self.registry.get(strategy)
+            if model.local_only:
+                raise NightTestError("该策略尚未接入夜盘验证")
             if self.feed:
                 await self.feed.stop()
             self.engine = self.broker = None

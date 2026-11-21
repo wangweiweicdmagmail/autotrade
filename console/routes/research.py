@@ -1,11 +1,23 @@
 """HTTP adapters; application logic lives in services."""
 
-from fastapi import Depends, HTTPException
+from fastapi import Depends, HTTPException, Query
 from console.schemas import BtLoadRequest, BtRunRequest
 from console.dependencies import get_services
 from fastapi import APIRouter
+import time
 
 router = APIRouter()
+
+
+@router.get("/api/ipo-openings")
+async def api_ipo_openings(*, services=Depends(get_services)) -> dict:
+    return services.ipo_alerts.snapshot(services.collector,time.time())
+
+
+@router.get("/api/market-rhythm")
+async def api_market_rhythm(symbol: str = Query("", max_length=80), watch: str = Query("", max_length=340),
+                            *, services=Depends(get_services)) -> dict:
+    return await services.research.api_market_rhythm(symbol=symbol, watch=watch)
 
 
 @router.post("/api/bt/run")

@@ -389,3 +389,41 @@ def test_breakout_waiting_for_bar_close_is_checked_again_next_tick(app, monkeypa
     with pytest.raises(asyncio.CancelledError):
         run(app.monitoring._auto_breakeven_loop())
     assert calls == [1001, 1002]
+
+
+def test_external_alert_clears_on_fresh_flat_snapshot(monkeypatch):
+    from types import SimpleNamespace as Row
+    from unittest.mock import AsyncMock
+
+    import config
+    from console.services.monitoring import MonitoringService
+    from execution.ibkr import IBKRGateway
+
+    monkeypatch.setattr(config, "EXTERNAL_ORDER_CLEANUP_ENABLED", False)
+    gateway = IBKRGateway.from_config()
+    gateway.enabled = gateway._connected = True
+    gateway.positions = AsyncMock(return_value={"SKHY": 3300})
+    gateway.fa_accounts = AsyncMock(return_value=["member"])
+    stop = Row(contract=Row(symbol="SKHY"), isDone=lambda: False,
+               order=Row(orderId=0, permId=109, account="member", faGroup="",
+                         action="SELL", totalQuantity=3300, orderType="STP"))
+    gateway.ib = Row(trades=lambda: [stop],
+                     reqAllOpenOrdersAsync=AsyncMock(return_value=[stop]))
+    ledger = Row(list_lots=lambda: [], aggregate=lambda: [])
+    context = Row(gateway=gateway, order_mgr=ledger,
+                  events=Row(record_event=lambda *args, **kwargs: None))
+    context.monitoring = MonitoringService(context)
+    context.monitoring._external_alert_last = {}
+
+    async def scenario():
+        await context.monitoring._external_cleanup_once()
+        assert {row["kind"] for row in context.monitoring._external_alerts} == {"order", "position"}
+
+        gateway.positions.return_value = {}
+        gateway.ib.reqAllOpenOrdersAsync.return_value = []
+        ledger.aggregate = lambda: [{"symbol": "SKHY", "net_qty": 3300}]
+        await context.monitoring._external_cleanup_once()
+        assert context.monitoring._external_alerts == []
+        assert list((await gateway.trade_map()).values()) == [stop]
+
+    run(scenario())

@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+from console.services.chart_entries import entry_markers
 from hmac import compare_digest
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -9,6 +10,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 import config
 from console.shared import logger
 from execution.copy_channel import copy_channel_token
+from execution.entry_admission import TD_THRESHOLD
 
 
 class SnapshotService:
@@ -27,6 +29,8 @@ class SnapshotService:
             "type": "snapshot",
             "ts": time.time(),
             "market_frame_id": self.context.collector.market_frame_id,
+            "ipo_openings": self.context.ipo_alerts.snapshot(self.context.collector,time.time()),
+            "entry_candidates": self.context.research.entry_candidates(),
             "status": {
                 "execution_enabled": bool(self.context.gateway.enabled),
                 "connected": bool(self.context.gateway._connected),
@@ -41,6 +45,7 @@ class SnapshotService:
                     "client_id": external.client_id if external else None,
                     "submit_client_id": self.context.gateway.client_id if external else None,
                     "fa_group": external.fa_group if external else None,
+                    "exempt_tickers": list(config.EXTERNAL_ORDER_GUARD_EXEMPT_TICKERS),
                     "confirmed_member_count": len(verified_accounts),
                     "member_suffixes": sorted(account[-4:] for account in verified_accounts),
                 },
@@ -51,12 +56,30 @@ class SnapshotService:
                 "open_symbols": open_symbols,
                 "total_risk_usd": self.context.order_mgr.risk_exposure()["total"],
                 "max_total_risk_usd": config.RISK_MAX_TOTAL_RISK_USD,
+                "max_direction_risk_usd": config.RISK_MAX_DIRECTION_RISK_USD,
+                "long_risk_usd": self.context.order_mgr.risk_exposure()["long"],
+                "short_risk_usd": self.context.order_mgr.risk_exposure()["short"],
                 "total_position_pct": self.context.accounts._total_position_pct(
                     status["equity"]
                 ),
                 "max_order_qty": config.RISK_MAX_ORDER_QTY,
+                "max_symbol_position_pct": config.RISK_MAX_SYMBOL_POSITION_PCT,
                 "risk_per_trade_usd": config.RISK_PER_TRADE_USD,
                 "allow_short": config.ALLOW_SHORT,
+                "manual_market_st_interval_seconds": 60,
+                "tv_view_same_window": True,
+                "tv_single_chart_cell": 6,
+                "tv_grid_same_window": True,
+                "tv_grid_cells": 8,
+                "tv_grid_layouts": {'candidates': 8, 'focus': 6},
+                "candidate_entry_required": getattr(self.context.order_mgr,'entry_admission',None) is not None,
+                "candidate_td_threshold": TD_THRESHOLD,
+                "candidate_ema9_filter": {"period": 9, "interval_seconds": 300, "price_source": "bar.close", "ema_source": "ts.ema_9"},
+                "manual_stop_modes": ['atr_2','vwap_sigma'],
+                "candidate_order_policy_version": 1,
+                "candidate_protection_live_version": 1,
+                "candidate_order_protection": self.context.settings._candidate_order_protection(),
+                "tv_entry_markers": True,
                 "fvg_chase_max_ratio": config.FVG_CHASE_MAX_ATR_RATIO,
                 "stop_atr_mult": self.context.settings._stop_atr_mult(),
                 "pyramid_auto_breakeven": self.context.settings._pyramid_auto_breakeven(),
@@ -85,15 +108,17 @@ class SnapshotService:
                 "ibkr_time": self.context.gateway.ibkr_time,
                 "bar_update_delay": self.context.collector.bar_update_delay,
                 "tv_study": self.context.collector.study_health(),
-                "tv_view": self.context.desktop._tv_view_info,
                 "tv_paper_sync": self.context.tv_paper_sync.status(),
             },
             "market": {
                 symbol: {key: value for key, value in data.items() if key != "opening_breakout_history"}
                 for symbol, data in self.context.collector.latest().items()
             },
+            "vwap_distribution": self.context.collector.vwap_distribution,
+            "vwap_opening_signals": self.context.opening_vwap.display(time.time()),
             "positions": self.context.order_mgr.aggregate(),
             "lots": self.context.order_mgr.list_lots(),
+            "tv_entry_markers": entry_markers(self.context.order_mgr.list_lots(), now=time.time()),
             "logs": list(self.context.events._log_buffer),
             "screen": self.context.signals.compute_screen(),
             "momentum": self.context.signals.compute_momentum(),
@@ -108,6 +133,7 @@ class SnapshotService:
                 reverse=True,
             ),
             "external_alerts": list(self.context.monitoring._external_alerts),
+            "external_entry_results": self.context.order_mgr.external_entry_results(),
             "slow_break_alerts": sorted(
                 self.context.monitoring._slow_break_alerts.values(),
                 key=lambda x: x.get("alerted_at", 0),

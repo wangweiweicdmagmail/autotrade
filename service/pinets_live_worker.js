@@ -4,7 +4,7 @@ const { parentPort } = require('node:worker_threads');
 const { createCalculator, getDefinition } = require('./pinets_runtime');
 
 const version = require('../package-lock.json').packages['node_modules/pinets'].version;
-const keys = ['e9', 'e20', 'e7v2', 'trend', 'fvg', 'smart', 'attack'];
+const fiveMinuteKeys = ['e9', 'e20', 'e7v2', 'golden', 'trend', 'fvg', 'smart', 'attack'];
 const calculators = new Map();
 const sessions = new Map();
 
@@ -13,12 +13,13 @@ parentPort.on('message', async ({ dataset, history, advance }) => {
   const errors = {};
   if ((history && !advance) || !sessions.has(dataset.symbol)) sessions.set(dataset.symbol, {});
   const byIndicator = sessions.get(dataset.symbol);
-  for (const key of keys) {
+  for (const key of dataset.intervalSeconds === 60 ? ['vwap_pullback'] : fiveMinuteKeys) {
     if (key === 'attack' && !dataset.daily?.length) continue;
     try {
       if (!calculators.has(key)) {
         const inputs = key === 'attack'
-          ? { showLargeRange: false, showSmallRange: false, showOpening3Range: false } : {};
+          ? { showLargeRange: false, showSmallRange: false, showOpening3Range: false }
+          : key === 'golden' ? { showLevels: false } : {};
         calculators.set(key, createCalculator(getDefinition(key), { version, inputs }));
       }
       const calculate = calculators.get(key);
@@ -29,7 +30,7 @@ parentPort.on('message', async ({ dataset, history, advance }) => {
       } else if (byIndicator[key]) {
         try {
           if (advance) {
-            const tail = key === 'fvg' ? 0 : ['e9', 'trend', 'attack'].includes(key) ? 175 : 2;
+            const tail = key === 'fvg' ? 0 : key === 'trend' ? dataset.bars.length : ['e9', 'attack'].includes(key) ? 175 : 2;
             rows = await byIndicator[key].advance(dataset.bars, tail);
           } else {
             rows = await byIndicator[key].replaceLast(dataset.bars.at(-1), key === 'fvg' ? 0 : 2);
@@ -41,7 +42,7 @@ parentPort.on('message', async ({ dataset, history, advance }) => {
       if (!rows) {
         const session = await calculate.open(dataset);
         byIndicator[key] = session;
-        rows = session.read(key === 'fvg' ? 0 : ['e9', 'trend', 'attack'].includes(key) ? 175 : 2);
+        rows = session.read(key === 'fvg' ? 0 : key === 'trend' ? dataset.bars.length : ['e9', 'attack'].includes(key) ? 175 : 2);
       }
       rows.reverse();
       if (key === 'fvg') {

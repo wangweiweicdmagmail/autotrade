@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>AutoTrade 图表联动</title>
+  <style>
+    body { width: 290px; margin: 16px; font: 14px/1.5 system-ui, sans-serif; color: #172033; }
+    h1 { margin: 0 0 12px; font-size: 16px; }
+    input, select, button { box-sizing: border-box; width: 100%; font: inherit; padding: 7px; margin-top: 6px; }
+    button { border: 0; border-radius: 5px; background: #2456aa; color: white; cursor: pointer; }
+    button:disabled { opacity: .6; }
+    p { margin: 10px 0 0; }
+  </style>
+</head>
+<body>
+  <h1>绑定本机 TradingView 图表</h1>
+  <form>
+    <label for="origin">AutoTrade 控制台地址</label>
+    <input id="origin" type="url" required placeholder="http://192.168.1.10:8000">
+    <label for="layout">当前图表的用途</label>
+    <select id="layout"><option value="candidates">auto_trade 八格 · 席位3～10</option><option value="focus">auto_trade2 六格 · 四大盘与前两席</option></select>
+    <button type="submit">绑定当前图表</button>
+  </form>
+  <p id="status" role="status">请先打开你要联动的 TradingView 图表标签页。</p>
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,51 @@
+//@version=6
+indicator("VWAP 外沿回踩", overlay=true)
+
+// Use this model on a one-minute chart with the regular session selected.
+et = "America/New_York"
+minuteOfDay = hour(time, et) * 60 + minute(time, et)
+regular = timeframe.isminutes and timeframe.multiplier == 1 and syminfo.session == session.regular and minuteOfDay >= 570 and minuteOfDay < 960
+opening = regular and minuteOfDay == 570
+dayKey = year(time, et) * 10000 + month(time, et) * 100 + dayofmonth(time, et)
+var int sessionDay = na
+var float weight = 0.0
+var float vwap = 0.0
+var float m2 = 0.0
+if opening
+    sessionDay := dayKey
+    weight := 0.0
+    vwap := 0.0
+    m2 := 0.0
+complete = regular and sessionDay == dayKey
+if complete and not na(volume) and volume > 0
+    nextWeight = weight + volume
+    delta = hlc3 - vwap
+    vwap += delta * volume / nextWeight
+    m2 += volume * delta * (hlc3 - vwap)
+    weight := nextWeight
+
+ema = ta.ema(close, 7)
+width = complete and weight > 0 ? math.sqrt(math.max(0.0, m2 / weight)) : na
+upper = width > 0 ? vwap + width : na
+lower = width > 0 ? vwap - width : na
+[st, stSign] = ta.supertrend(4.0, 10)
+atr = ta.atr(10)
+direction = regular and not na(atr) ? -stSign : 0
+candidate = direction == 1 and ema > upper ? 1 : direction == -1 and ema < lower ? -1 : 0
+entry = math.round_to_mintick(candidate == 1 ? upper : candidate == -1 ? lower : na)
+stop = math.round_to_mintick(st)
+longStop = direction == 1 ? stop : na
+shortStop = direction == -1 ? stop : na
+longTouch = candidate == 1 and stop > 0 and stop < entry and stop < close and close <= entry
+shortTouch = candidate == -1 and entry > 0 and stop > entry and stop > close and close >= entry
+
+plot(upper, "VWAP 上轨", color=color.green, style=plot.style_linebr)
+plot(lower, "VWAP 下轨", color=color.red, style=plot.style_linebr)
+plot(direction != 0 ? stop : na, "1M ST", color=direction == 1 ? color.green : color.red, style=plot.style_linebr)
+plot(longTouch or shortTouch ? 1 : 0, "Entry_Signal", display=display.data_window, offset=0)
+plot(direction, "Direction", display=display.data_window, offset=0)
+plot(entry, "Entry_Price", display=display.data_window, offset=0)
+plot(longStop, "Long_Stop", display=display.data_window, offset=0)
+plot(shortStop, "Short_Stop", display=display.data_window, offset=0)
+plot(regular ? atr : na, "ATR", display=display.data_window, offset=0)
+plot(candidate, "Candidate_Direction", display=display.data_window, offset=0)

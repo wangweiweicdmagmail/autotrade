@@ -247,6 +247,27 @@ def test_drawdown_halt_blocks_entry_not_close(tmp_path):
     run(go())
 
 
+def test_startup_drawdown_baseline_uses_the_same_et_day_when_local_date_is_ahead(tmp_path,monkeypatch):
+    import copy_trader
+    from datetime import datetime
+    from types import SimpleNamespace
+    class Clock(datetime):
+        @classmethod
+        def now(cls,tz=None):
+            return datetime(2026,11,20,15,0,tzinfo=copy_trader.ET)
+    monkeypatch.setattr(copy_trader,'datetime',Clock)
+    monkeypatch.setattr(copy_trader,'time',SimpleNamespace(time=time.time,time_ns=time.time_ns,strftime=lambda *_:'2026-11-21'))
+    async def go():
+        follower,gw=make_follower(tmp_path)
+        await follower.startup()
+        assert follower.baseline_date=='2026-11-20'
+        gw.equity=96000.;follower._equity_ts=0
+        await follower.tick()
+        assert follower.baseline_equity==100000.
+        assert follower.drawdown_pct==4.0 and follower.halted
+    run(go())
+
+
 def test_cmd_retry_dismiss_unhalt(tmp_path):
     """⑧ cmd retry（重放入场）/ dismiss（标记忽略）/ unhalt（解除熔断）。"""
     async def go():

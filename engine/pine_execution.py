@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 from engine.states import ACTIVE, DONE, PENDING, WATCHING
 from engine.broker_protocols import TradeBroker, SimulatedPriceFeed
 from engine.pine_models import PineModel, PineModelRegistry
-from domain.contracts import ClosedBar, ExecutionGroupState, OrderPlan, PriceObservation, StrategyOutput, TradingGroupKey, TERMINAL_ORDER_VALUES, OPEN_ORDER_VALUES
+from domain.contracts import ClosedBar, ExecutionGroupState, OrderPlan, PriceObservation, StrategyOutput, TradingGroupKey, TERMINAL_ORDER_VALUES, OPEN_ORDER_VALUES, EntryAdmissionRejected
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +62,8 @@ class ExecutionInstance:
     last_order_stop: float = 0.0
     max_notional: float = 0.0
     last_signal_bar: float = 0.0
+    last_protection_bar: float = 0.0
+    entry_only_bar: float = 0.0
     last_signal_event_bar: float = 0.0
     done_reason: str = ""
     last_reverse_alert_bar: float = -1.0
@@ -206,6 +208,7 @@ class PineExecutionEngine:
         symbols: List[str],
         initial_risk_usd: float,
         directions: Optional[dict] = None,
+        *, entry_only_bar: float = 0,
     ) -> List[str]:
         if initial_risk_usd <= 0:
             raise ValueError("首仓风险预算必须大于 0")
@@ -238,6 +241,7 @@ class PineExecutionEngine:
                 risk_ratios=self.profile.risk_ratios,
                 initial_risk_usd=float(initial_risk_usd),
                 start_direction=start_direction,
+                entry_only_bar=entry_only_bar,
             )
             started.append(symbol)
             self._record_start(self._instances[symbol])
@@ -727,7 +731,7 @@ class PineExecutionEngine:
                 )
         if not kept:
             side = inst.side
-            if had_fill and (not inst.enabled or inst.start_direction):
+            if had_fill and (not inst.enabled or inst.start_direction or self.profile.finish_after_trade):
                 inst.state = DONE
                 inst.done_reason = inst.done_reason or "round_finished"
                 inst.total_qty = 0
@@ -786,6 +790,24 @@ class PineExecutionEngine:
         if ok:
             inst.stop_px = round(new_stop, 2)
         return ok
+
+    async def _entry_bar_breakeven(self, inst: ExecutionInstance, price: float) -> None:
+        if not inst.total_qty or inst.breakeven_done or not inst.last_protection_bar:
+            return
+        lots = [self._broker.get(lot_id) for lot_id in inst.lot_ids]
+        if len(lots) != 1 or lots[0] is None or lots[0].state != ACTIVE:
+            return
+        lot = lots[0]
+        fill_time = (getattr(lot, "entry_broker_time", 0)
+                     or getattr(lot, "fill_time", 0) or getattr(lot, "entry_time", 0))
+        cost = round(lot.avg_fill or 0, 2)
+        if not fill_time or not cost or math.floor(fill_time / 300) * 300 > inst.last_protection_bar:
+            return
+        if not (price > cost if inst.side == "long" else 0 < price < cost):
+            return
+        if await self._move_all_stops(inst, cost):
+            inst.breakeven_done = True
+            self._emit("entry_bar_breakeven", symbol=inst.symbol, lot_id=lot.lot_id, stop_px=cost)
 
     async def manual_breakeven(self, symbol: str, group_id: str, expected_qty: int,
                                expected_avg_cost: float) -> dict:
@@ -891,7 +913,16 @@ class PineExecutionEngine:
         if e9.get("entry_signal") != 1:
             return
         bar_time = e9.get("time") or 0
+        submission_deadline = inst.entry_only_bar + self.model.interval_seconds if inst.entry_only_bar else None
+        if self.model.startup_candidate_field:
+            now = time.time()
+            submission_deadline = bar_time + self.model.interval_seconds
+            if (not observed_at or observed_at <= inst.started_at or not 0 <= now - observed_at <= 15
+                    or not bar_time <= now < submission_deadline):
+                return
         if bar_time and inst.last_signal_event_bar == bar_time:
+            return
+        if inst.entry_only_bar and bar_time != inst.entry_only_bar:
             return
         direction = e9.get("direction")
         side = "long" if direction == 1 else "short" if direction == -1 else ""
@@ -920,6 +951,7 @@ class PineExecutionEngine:
             if inst.last_decision_reason != block:
                 signal("ignored", block)
             return
+        previous_signal_event_bar = inst.last_signal_event_bar
         inst.last_signal_event_bar = bar_time
         if not self.profile.entry_start_hm <= now_hm < self.profile.entry_end_hm:
             signal("ignored", "非进场时段")
@@ -960,6 +992,7 @@ class PineExecutionEngine:
             return
         entry_px, order_stop, qty = plan.entry_price, plan.stop_price, plan.qty
         risk_dist = plan.risk_distance
+        previous_signal_bar = inst.last_signal_bar
         inst.last_signal_bar = bar_time
         self._emit(
             "pyramid_entry_decision",
@@ -980,6 +1013,8 @@ class PineExecutionEngine:
                 reason=f"{self.model.name} 第{inst.entries + 1}次 预算${budget:.2f}",
                 meta={
                     "entry_order_type": "MKT",
+                    **({"submission_deadline": submission_deadline} if submission_deadline else {}),
+                    **({"manual_entry": False} if self.model.startup_candidate_field else {}),
                     "risk_reference_price": plan.reference_price,
                     "execution_observed_at": observed_at,
                     "order_plan": plan.values(),
@@ -996,6 +1031,12 @@ class PineExecutionEngine:
                     "planned_risk_usd": plan.planned_risk,
                 },
             )
+        except EntryAdmissionRejected as error:
+            inst.last_signal_bar = previous_signal_bar
+            inst.last_signal_event_bar = previous_signal_event_bar
+            if inst.last_decision_reason != str(error):
+                signal('ignored',str(error))
+            return
         except Exception as e:
             logger.warning("金字塔下单失败 %s: %s", inst.symbol, e)
             signal("order_failed", str(e))
@@ -1137,6 +1178,16 @@ class PineExecutionEngine:
         if inst.exit_requested_reason and inst.lot_ids:
             await self._stop_close(inst, price, inst.exit_requested_reason)
             return
+        if (self.model.startup_candidate_field and inst.state == WATCHING and not inst.lot_ids
+                and not inst.pending_lot_id and inst.started_at):
+            et = ZoneInfo("America/New_York")
+            if datetime.fromtimestamp(inst.started_at, et).date() != datetime.fromtimestamp(time.time(), et).date():
+                inst.enabled = False
+                inst.state = DONE
+                inst.done_reason = "session_expired"
+                return
+        if self.profile.breakeven_on_entry_bar_close and e9.get("time", 0) > inst.last_protection_bar:
+            await self._entry_bar_breakeven(inst, price)
         if observed_at is not None and observed_at < inst.mfe_since:
             return
         if inst.total_qty and inst.initial_r > 0:
@@ -1213,6 +1264,8 @@ class PineExecutionEngine:
         if inst is None:
             return
         await self._refresh(inst)
+        if self.profile.breakeven_on_entry_bar_close and e9_c.get("time") == bar.get("time"):
+            inst.last_protection_bar = max(inst.last_protection_bar, bar.get("time") or 0)
         if not inst.enabled and inst.done_reason == "manual_stop_close":
             await self._stop_close(inst, bar.get("close") or 0, "manual_stop")
             return
@@ -1221,6 +1274,8 @@ class PineExecutionEngine:
                 inst, bar.get("close") or 0, inst.exit_requested_reason
             )
         elif inst.lot_ids:
+            if self.profile.breakeven_on_entry_bar_close and isinstance(self._broker, SimulatedPriceFeed):
+                await self._entry_bar_breakeven(inst, bar.get("close") or 0)
             direction = e9_c.get("direction")
             flipped = (inst.side == "long" and direction == -1) or (
                 inst.side == "short" and direction == 1

@@ -8,6 +8,7 @@ from execution.external_guard import ET, ExternalEntryGuard
 
 
 CONTRACT = NS(conId=17, secType="STK", symbol="GOOGL", currency="USD")
+ANT_CONTRACT = NS(conId=777, secType="STK", symbol="ANT", currency="USD")
 
 
 def position(account="A", qty=10):
@@ -79,6 +80,139 @@ def run(tmp_path, broker, *, managed=(), owned=(), market=True, test_account=Non
     asyncio.run(guard.run(set(owned), set(managed), allow_market=market))
 
 
+@pytest.fixture
+def ant_exemption(monkeypatch):
+    """An optional policy under test; production defaults have no exemptions."""
+    import config
+    monkeypatch.setattr(config, 'EXTERNAL_ORDER_GUARD_EXEMPT_TICKERS', ('ANT',))
+
+
+@pytest.mark.parametrize('symbol,exempt', [('ANT',True),('nasdaq:ant',True),(' ant ',True),
+                                        ('ANTX',False),('PLANT',False),('GOOGL',False),('',False),(None,False)])
+def test_long_term_exemption_matches_exact_ticker_only(ant_exemption, symbol, exempt):
+    from execution.external_guard import is_external_guard_exempt
+    assert is_external_guard_exempt(symbol) is exempt
+
+
+def test_ant_entry_and_protection_orders_remain_while_other_external_entry_is_cancelled(tmp_path, ant_exemption):
+    entry = trade(contract=ANT_CONTRACT)
+    entry.order.permId, entry.order.orderId = 901, -901
+    stop = trade(stop=True, parent=-901, contract=ANT_CONTRACT)
+    stop.order.permId = 902
+    other = trade()
+    broker = Broker(([], [], [entry, stop, other], {'A'}))
+    run(tmp_path, broker, market=False)
+    assert broker.cancelled == [100]
+    assert broker.submitted == []
+    assert entry.orderStatus.status == stop.orderStatus.status == 'Submitted'
+
+
+@pytest.mark.parametrize('account,qty', [('A',1041),('B',100),('A',-10)])
+def test_ant_position_is_not_closed_or_journaled_in_any_fa_member(tmp_path, ant_exemption, account, qty):
+    row = NS(account=account, contract=ANT_CONTRACT, position=qty, avgCost=100)
+    broker = Broker(([row], [], [], {'A','B'}))
+    run(tmp_path, broker)
+    assert broker.cancelled == broker.submitted == broker.restored == []
+    assert not (tmp_path / 'external.sqlite3').exists()
+
+
+def test_ant_exemption_does_not_disable_other_external_position_liquidation(tmp_path, ant_exemption):
+    ant = NS(account='A', contract=ANT_CONTRACT, position=100, avgCost=100)
+    stop = trade(stop=True, contract=ANT_CONTRACT)
+    snapshot = ([ant, position()], [fill()], [stop], {'A'})
+    broker = Broker(snapshot, snapshot)
+    run(tmp_path, broker)
+    assert broker.submitted == [('A',10,100)]
+    assert broker.cancelled == broker.restored == []
+    assert stop.orderStatus.status == 'Submitted'
+
+
+def test_long_term_ant_does_not_trigger_unnecessary_fa_execution_reconstruction(ant_exemption):
+    from execution.external_guard import unallocated_singleton_positions
+    ant = NS(account='A', contract=ANT_CONTRACT, position=100, avgCost=100)
+    other = position()
+    assert unallocated_singleton_positions([ant,other], [], {'A'}) == [(other,None)]
+
+
+def test_gateway_preflight_refuses_exempt_cancel_close_and_stop_replacement(monkeypatch, ant_exemption):
+    import config
+    from execution.ibkr import IBKRGateway
+    from execution.external_guard import GuardPreflightChanged
+    from unittest.mock import Mock
+    monkeypatch.setattr(config, 'EXTERNAL_MANUAL_GUARD_TEST_ACCOUNT', '')
+    monkeypatch.setattr(config, 'EXTERNAL_MANUAL_GUARD_FA_SCOPE', True)
+    gateway = IBKRGateway('localhost',0,0,'','FA',enabled=True)
+    gateway._connected = True
+    order = trade(contract=ANT_CONTRACT)
+    gateway.ib = NS(openTrades=lambda:[order], positions=lambda:pytest.fail('exemption must precede any write preflight'))
+    gateway._guard_verified_accounts = frozenset({'A'})
+    gateway._guard_verified_connection = (gateway.ib,'')
+    cancel = Mock(side_effect=AssertionError('ANT order must remain'))
+    monkeypatch.setattr(gateway, 'cancel_order', cancel)
+    assert gateway.cancel_external_bound_order(order) is False
+    row = NS(account='A', contract=ANT_CONTRACT, position=100)
+    with pytest.raises(GuardPreflightChanged, match='豁免'):
+        gateway.submit_external_close(row,901)
+    with pytest.raises(GuardPreflightChanged, match='豁免'):
+        gateway.restore_external_stop(row,901,95,'GTC',False)
+    cancel.assert_not_called()
+
+
+@pytest.mark.parametrize('cleanup', [True,False])
+def test_legacy_cleanup_and_alert_modes_also_exempt_ant(monkeypatch, ant_exemption, cleanup):
+    import config
+    from console.services.monitoring import MonitoringService
+    from unittest.mock import AsyncMock, Mock
+    monkeypatch.setattr(config, 'EXTERNAL_MANUAL_GUARD_ENABLED', False)
+    monkeypatch.setattr(config, 'EXTERNAL_ORDER_CLEANUP_ENABLED', cleanup)
+    order = trade(stop=True,contract=ANT_CONTRACT)
+    gateway = NS(enabled=True,_connected=True,
+        positions=AsyncMock(return_value={'ANT':100}),fa_accounts=AsyncMock(return_value=['A']),
+        trade_map=AsyncMock(return_value={-20:order}),open_orders_snapshot=AsyncMock(return_value=[order]),
+        cancel_order=Mock(side_effect=AssertionError('exempt order')),
+        place_close=AsyncMock(side_effect=AssertionError('exempt position')))
+    context = NS(gateway=gateway,order_mgr=NS(list_lots=lambda:[],aggregate=lambda:[]),
+                 events=NS(record_event=Mock()))
+    context.monitoring = MonitoringService(context)
+    context.monitoring._external_alerts = []
+    result = asyncio.run(context.monitoring._external_cleanup_once())
+    assert result['cancelled'] == result['closed'] == result['failed'] == 0
+    assert context.monitoring._external_alerts == []
+    context.events.record_event.assert_not_called()
+    gateway.cancel_order.assert_not_called()
+    gateway.place_close.assert_not_awaited()
+
+
+def test_console_status_reports_no_long_term_exemptions(console_app):
+    snapshot = asyncio.run(console_app.snapshot.build_snapshot())
+    assert snapshot['status']['external_order_guard']['exempt_tickers'] == []
+
+
+@pytest.mark.parametrize('order_type', ['LMT','STP'])
+def test_ant_external_pending_order_is_cancelled_without_exemption(tmp_path, order_type):
+    entry = trade(contract=ANT_CONTRACT)
+    entry.order.orderType = order_type
+    entry.order.auxPrice = 105 if order_type == 'STP' else 0
+    broker = Broker(([], [], [entry], {'A'}))
+    run(tmp_path, broker, market=False)
+    assert broker.cancelled == [100]
+    assert entry.orderStatus.status == 'Cancelled'
+
+
+@pytest.mark.parametrize('managed', [False,True])
+def test_ant_external_position_is_closed_but_console_owned_position_is_preserved(tmp_path, managed):
+    row = NS(account='A', contract=ANT_CONTRACT, position=10, avgCost=100)
+    execution = fill()
+    execution.contract = ANT_CONTRACT
+    stop = trade(stop=True, contract=ANT_CONTRACT)
+    before = ([row], [execution], [stop], {'A'})
+    after = ([row], [execution], [], {'A'})
+    broker = Broker(before, after)
+    run(tmp_path, broker, managed={'ANT'} if managed else ())
+    assert broker.cancelled == ([] if managed else [200])
+    assert broker.submitted == ([] if managed else [('A',10,100)])
+
+
 def test_pending_external_entry_cancelled_and_partial_fill_closed(tmp_path):
     entry = trade()
     partial = ([position(qty=4)], [fill(qty=4)], [], {"A"})
@@ -86,6 +220,50 @@ def test_pending_external_entry_cancelled_and_partial_fill_closed(tmp_path):
     run(tmp_path, broker)
     assert broker.cancelled == [100]
     assert broker.submitted == [("A", 4, 100)]
+
+
+def test_voice_result_waits_for_cancel_and_ignores_filled_order(tmp_path, monkeypatch):
+    async def skip_wait(_seconds):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", skip_wait)
+    pending = trade()
+    filled = trade()
+    filled.order.permId = 101
+    empty = ([], [], [], {"A"})
+    broker = Broker(([], [], [pending, filled], {"A"}), empty, empty)
+    broker.cancel_status = "PendingCancel"
+    guard = ExternalEntryGuard(broker, tmp_path / "external.sqlite3")
+    asyncio.run(guard.run(set(), set(), allow_market=False))
+    assert list(guard.recent_results) == []
+
+    pending.orderStatus.status = "Cancelled"
+    filled.orderStatus.status = "Filled"
+    asyncio.run(guard.run(set(), set(), allow_market=False))
+    asyncio.run(guard.run(set(), set(), allow_market=False))
+    assert [(result["kind"], result["symbol"]) for result in guard.recent_results] == [
+        ("cancelled", "GOOGL"),
+    ]
+
+
+def test_voice_result_waits_for_full_external_exit(tmp_path):
+    first = fill(qty=4, side="SLD", perm=500, client_id=11)
+    last = fill(qty=6, side="SLD", perm=500, client_id=11)
+    last.execution.execId = "A.500.2"
+    for execution in (first.execution, last.execution):
+        execution.orderRef = "external-guard:100"
+    full = ([], [first, last], [], {"A"})
+    broker = Broker(([], [first], [], {"A"}), full, full)
+    guard = ExternalEntryGuard(broker, tmp_path / "external.sqlite3")
+    assert guard._journal("A", 100, quantity=10, contract_id=17)
+
+    asyncio.run(guard.run(set(), set(), allow_market=False))
+    assert list(guard.recent_results) == []
+    asyncio.run(guard.run(set(), set(), allow_market=False))
+    asyncio.run(guard.run(set(), set(), allow_market=False))
+    assert [(result["kind"], result["symbol"], result["qty"]) for result in guard.recent_results] == [
+        ("closed", "GOOGL", 10),
+    ]
 
 
 def test_fa_stop_late_fill_only_closes_member_remainder(tmp_path):

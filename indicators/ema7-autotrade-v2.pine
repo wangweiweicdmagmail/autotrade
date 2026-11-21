@@ -16,9 +16,23 @@ int direction = na(supertrend) or na(stDirection) ? 0 : stDirection < 0 ? 1 : -1
 velocity = (ema7[1] - ema7[4]) / 3.0
 forecast = ema7[1] + velocity
 entryPrice = math.round_to_mintick(forecast + math.sign(velocity) * offsetMultiplier * confirmedAtr)
-longStop = math.round_to_mintick(entryPrice - stopMultiplier * confirmedAtr)
-shortStop = math.round_to_mintick(entryPrice + stopMultiplier * confirmedAtr)
+candidateLong = math.round_to_mintick(entryPrice - stopMultiplier * confirmedAtr)
+candidateShort = math.round_to_mintick(entryPrice + stopMultiplier * confirmedAtr)
 ready = not na(entryPrice) and entryPrice > 0 and not na(confirmedAtr) and confirmedAtr > 0
+
+// 只从上一根已收盘 K 线继承同方向的止损。反向后重新初始化。
+float longStop = na
+float shortStop = na
+if direction == 1
+    longStop := longStop[1]
+    if ready and candidateLong > 0 and candidateLong < entryPrice
+        longStop := math.max(nz(longStop[1], candidateLong), candidateLong)
+if direction == -1
+    shortStop := shortStop[1]
+    if ready and candidateShort > entryPrice
+        shortStop := math.min(nz(shortStop[1], candidateShort), candidateShort)
+
+// 若已有止损越过入场参考价，保留止损线并暂停新入场。
 validLong = ready and longStop > 0 and longStop < entryPrice
 validShort = ready and shortStop > entryPrice
 
@@ -39,5 +53,8 @@ plot(longTouch or shortTouch ? 1 : 0, "Forecast_Touched", display=display.data_w
 plot(ema7, "实际 EMA7", color=color.orange)
 plot(forecast, "预测重心", color=color.aqua, style=plot.style_stepline)
 plot(entryPrice, "修正触线价", color=color.fuchsia, linewidth=2, style=plot.style_stepline)
+// 反向期间输出 na，转回同一方向时从新的止损段起画。
+plot(longStop, "多头止损线", color=color.lime, linewidth=2, style=plot.style_linebr, display=display.pane)
+plot(shortStop, "空头止损线", color=color.red, linewidth=2, style=plot.style_linebr, display=display.pane)
 plotshape(longTouch ? entryPrice : na, "多头曾触线", style=shape.triangleup, location=location.absolute, color=color.lime, size=size.tiny)
 plotshape(shortTouch ? entryPrice : na, "空头曾触线", style=shape.triangledown, location=location.absolute, color=color.red, size=size.tiny)

@@ -69,9 +69,9 @@ class LifecycleService:
                 "label": "图表工作区",
                 "ready": browser_ready,
                 "detail": (
-                    "左侧 autotrade · 右侧 TradingView 分屏已就绪"
+                    "auto_trade 八格 / auto_trade2 四格 / 控制台独立窗口已就绪"
                     if self.context.lifecycle._startup_state.get("split_ready")
-                    else "浏览器已打开；自动分屏未完成："
+                    else "浏览器已打开；独立窗口未全部确认："
                     + self.context.lifecycle._startup_state["split_error"]
                     if self.context.lifecycle._startup_state.get("split_error")
                     else "控制台与 TradingView 标签页已就绪"
@@ -210,6 +210,9 @@ class LifecycleService:
         self.context.signals._breakout_task = self.context.tasks.start(
             "signals._breakout", lambda: self.context.signals._breakout_loop()
         )
+        self.context.opening_vwap.task = self.context.tasks.start(
+            "signals._opening_vwap", self.context.opening_vwap.run
+        )
         self.context.monitoring._naked_position_task = self.context.tasks.start(
             "monitoring._naked_position",
             lambda: self.context.monitoring._naked_position_loop(),
@@ -247,6 +250,7 @@ class LifecycleService:
             self.context.signals._fvg_task,
             self.context.monitoring._fvg_reverse_task,
             self.context.signals._breakout_task,
+            self.context.opening_vwap.task,
             self.context.monitoring._naked_position_task,
             self.context.monitoring._health_watch_task,
             self.context.reports._report_loop_task,

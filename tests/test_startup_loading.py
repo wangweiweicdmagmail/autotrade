@@ -120,129 +120,52 @@ def test_first_readiness_is_latched(console_app, monkeypatch):
     assert console_app.lifecycle._startup_status()["ready"] is True
 
 
-def test_cold_browser_launch_uses_one_process_with_two_tabs(console_app, monkeypatch):
-    commands = []
-    alive = iter([False, True])
-
-    async def fake_alive():
-        return next(alive)
-
-    class FakeProcess:
-        async def wait(self):
-            return 0
-
-    async def fake_exec(*args, **kwargs):
+def test_cold_launch_opens_eight_grid_then_prepares_three_independent_windows(console_app, monkeypatch):
+    from controller import browser_workspace
+    commands=[];alive=iter([False, True]);seen=[]
+    async def fake_alive():return next(alive)
+    async def fake_exec(*args,**kwargs):
         commands.append(args)
-        return FakeProcess()
-
-    async def no_sleep(_seconds):
-        return None
-
-    async def fake_tv_ready():
-        return None
-
-    async def fake_activate():
-        return None
-
-    monkeypatch.setattr(console_app.desktop, "_cdp_alive", fake_alive)
-    monkeypatch.setattr(console_app.asyncio, "create_subprocess_exec", fake_exec)
-    monkeypatch.setattr(console_app.asyncio, "sleep", no_sleep)
-    monkeypatch.setattr(console_app.desktop, "_tv_ensure_browser", fake_tv_ready)
-    monkeypatch.setattr(console_app.desktop, "_cdp_page_id", lambda _prefix: "console-tab")
-    monkeypatch.setattr(console_app.desktop, "_activate_console_tab", fake_activate)
-    monkeypatch.setattr(console_app.desktop, "_workspace_arrange_split", fake_activate)
-
+        async def wait():return 0
+        return SimpleNamespace(wait=wait)
+    async def no_sleep(_seconds):pass
+    async def windows(endpoint,urls):
+        seen.extend(urls);return {url:'target-'+str(i) for i,url in enumerate(urls)}
+    async def activate():pass
+    monkeypatch.setattr(console_app.desktop,'_cdp_alive',fake_alive)
+    monkeypatch.setattr(console_app.asyncio,'create_subprocess_exec',fake_exec)
+    monkeypatch.setattr(console_app.asyncio,'sleep',no_sleep)
+    monkeypatch.setattr(browser_workspace,'ensure_independent_windows',windows)
+    monkeypatch.setattr(console_app.desktop,'_activate_console_tab',activate)
     assert run(console_app.desktop._workspace_ensure_browser()) is None
-    assert len(commands) == 1
-    command = commands[0]
-    assert command[:4] == ("open", "-na", "Google Chrome", "--args")
-    assert console_app.desktop._CONSOLE_URL in command
-    assert console_app.desktop._TV_CHART_URL in command
-    assert command.index(console_app.desktop._CONSOLE_URL) < command.index(console_app.desktop._TV_CHART_URL)
-    assert console_app.lifecycle._startup_state["split_ready"] is True
+    assert len(commands)==1 and commands[0][-1]==console_app.desktop._TV_CHART_URL
+    assert seen==[console_app.desktop._TV_CHART_URL,console_app.desktop._TV_FOCUS_CHART_URL,console_app.desktop._CONSOLE_URL]
+    assert console_app.lifecycle._startup_state['split_ready']
+    assert console_app.desktop._tv_bindings['target-2']['chart_id']=='target-0'
 
 
-def test_existing_browser_only_opens_missing_console_tab(console_app, monkeypatch):
-    opened = []
-    console_open = False
-
-    async def fake_alive():
-        return True
-
-    def fake_page_id(_prefix):
-        return "console-tab" if console_open else None
-
-    async def fake_open_tab(url):
-        nonlocal console_open
-        opened.append(url)
-        console_open = True
-
-    async def fake_tv_ready():
-        return None
-
-    async def fake_activate():
-        return None
-
-    async def unexpected_exec(*args, **kwargs):
-        raise AssertionError("已有浏览器不应再启动 Chrome 进程")
-
-    monkeypatch.setattr(console_app.desktop, "_cdp_alive", fake_alive)
-    monkeypatch.setattr(console_app.desktop, "_cdp_page_id", fake_page_id)
-    monkeypatch.setattr(console_app.desktop, "_cdp_open_tab", fake_open_tab)
-    monkeypatch.setattr(console_app.desktop, "_tv_ensure_browser", fake_tv_ready)
-    monkeypatch.setattr(console_app.desktop, "_activate_console_tab", fake_activate)
-    monkeypatch.setattr(console_app.desktop, "_workspace_arrange_split", fake_activate)
-    monkeypatch.setattr(console_app.asyncio, "create_subprocess_exec", unexpected_exec)
-
+def test_window_error_is_visible_without_holding_browser_readiness(console_app,monkeypatch):
+    from controller import browser_workspace
+    async def alive():return True
+    async def fail(*_):raise RuntimeError('图表存在多个副本')
+    async def activate():pass
+    monkeypatch.setattr(console_app.desktop,'_cdp_alive',alive)
+    monkeypatch.setattr(browser_workspace,'ensure_independent_windows',fail)
+    monkeypatch.setattr(console_app.desktop,'_activate_console_tab',activate)
     assert run(console_app.desktop._workspace_ensure_browser()) is None
-    assert opened == [console_app.desktop._CONSOLE_URL]
+    assert '多个副本' in console_app.lifecycle._startup_state['split_error']
+    console_app.lifecycle._startup_state['browser_ready']=True
+    stage=next(s for s in console_app.lifecycle._startup_status()['stages'] if s['key']=='browser')
+    assert stage['ready'] and '多个副本' in stage['detail']
 
 
-@pytest.mark.parametrize("problem,expected", [
-    (RuntimeError("需要辅助功能权限"), "辅助功能"),
-    (TimeoutError(), "TimeoutError"),
-])
-def test_split_permission_problem_is_visible_without_browser_retry(console_app, monkeypatch, problem, expected):
-    async def ready():
-        return None
-
-    async def alive():
-        return True
-
-    async def denied():
-        raise problem
-
-    monkeypatch.setattr(console_app.desktop, "_cdp_alive", alive)
-    monkeypatch.setattr(console_app.desktop, "_cdp_page_id", lambda _url: "existing")
-    monkeypatch.setattr(console_app.desktop, "_tv_ensure_browser", ready)
-    monkeypatch.setattr(console_app.desktop, "_activate_console_tab", ready)
-    monkeypatch.setattr(console_app.desktop, "_workspace_arrange_split", denied)
-    assert run(console_app.desktop._workspace_ensure_browser()) is None
-    state = console_app.lifecycle._startup_state
-    assert state["split_ready"] is False
-    assert expected in state["split_error"]
-    state["browser_ready"] = True
-    stage = next(s for s in console_app.lifecycle._startup_status()["stages"] if s["key"] == "browser")
-    assert stage["ready"] is True
-    assert expected in stage["detail"]
-
-
-def test_split_can_be_disabled_without_suppressing_browser_open(console_app, monkeypatch):
-    async def ready():
-        return None
-
-    async def alive():
-        return True
-
-    async def unexpected():
-        raise AssertionError("关闭自动分屏后不能发出 UI 操作")
-
-    monkeypatch.setattr(console_app.desktop, "_CONSOLE_AUTO_SPLIT_BROWSER", False)
-    monkeypatch.setattr(console_app.desktop, "_cdp_alive", alive)
-    monkeypatch.setattr(console_app.desktop, "_cdp_page_id", lambda _url: "existing")
-    monkeypatch.setattr(console_app.desktop, "_tv_ensure_browser", ready)
-    monkeypatch.setattr(console_app.desktop, "_activate_console_tab", ready)
-    monkeypatch.setattr(console_app.desktop, "_workspace_arrange_split", unexpected)
+def test_window_preparation_can_be_disabled_without_ui_commands(console_app,monkeypatch):
+    from controller import browser_workspace
+    async def alive():return True
+    async def forbidden(*_):raise AssertionError('disabled')
+    monkeypatch.setattr(console_app.desktop,'_cdp_alive',alive)
+    monkeypatch.setattr(console_app.desktop,'_CONSOLE_AUTO_ARRANGE_WINDOWS',False)
+    monkeypatch.setattr(browser_workspace,'ensure_independent_windows',forbidden)
     assert run(console_app.desktop._workspace_ensure_browser()) is None
 
 

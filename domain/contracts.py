@@ -6,6 +6,10 @@ from datetime import datetime
 from enum import Enum
 
 
+class EntryAdmissionRejected(RuntimeError):
+    """Expected entry filtering; no broker submission occurred."""
+
+
 def finite_number(value) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None

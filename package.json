@@ -6,9 +6,10 @@
   "dependencies": {
     "@mathieuc/tradingview": "^3.5.2",
     "chrome-remote-interface": "^0.33.2",
+    "https-proxy-agent": "^5.0.1",
     "pinets": "0.13.1"
   },
   "scripts": {
-    "test": "node --test tests/test_chart_snapshot.js tests/test_chart_health.js tests/test_candle_metrics.js tests/test_ema.js tests/test_pine_text.js tests/test_pine_models.js tests/test_pinets_shadow.js tests/test_pinets_live.js tests/test_pyramid_ui.js tests/test_backtest_ui.js tests/test_console_ui_semantics.js tests/test_night_test.js tests/test_tv_paper_bridge.js"
+    "test": "node --test tests/test_chart_snapshot.js tests/test_chart_health.js tests/test_candle_metrics.js tests/test_ema.js tests/test_pine_text.js tests/test_pine_models.js tests/test_pinets_shadow.js tests/test_pinets_live.js tests/test_pyramid_ui.js tests/test_backtest_ui.js tests/test_console_ui_semantics.js tests/test_range_actions.js tests/test_night_test.js tests/test_tv_paper_bridge.js tests/test_vwap_1m.js tests/test_market_rhythm.js tests/test_rhythm_score.js tests/test_rhythm_trade_ui.js tests/test_tv_grid.js tests/test_tv_grid_ui.js tests/test_ipo_watch.js tests/test_ipo_voice.js tests/test_tv_client_extension.js"
   }
 }

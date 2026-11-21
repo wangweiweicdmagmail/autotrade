@@ -5,10 +5,18 @@ const path = require('node:path');
 const vm = require('node:vm');
 let options;
 const requests = [], confirmations = [];
+const storage = new Map();
+const speechQueue = [];
+let speechCancels = 0;
 let responseBody = { ok: true };
 vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../console/static/app.js'), 'utf8'), {
   Vue: { createApp(value) { options = value; return { use() { return { mount() {} }; } }; } },
-  ElementPlus: {}, localStorage: { setItem() {} },
+  ElementPlus: {}, localStorage: { getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value) },
+  window: { speechSynthesis: {
+    cancel() { speechCancels += 1; speechQueue.length = 0; },
+    speak(utterance) { speechQueue.push(utterance); },
+  } },
+  SpeechSynthesisUtterance: class { constructor(text) { this.text = text; } },
   fetch: async (url, request) => { requests.push({ url, request }); return { ok: true, json: async () => responseBody }; },
 });
 const ui = { ...options.methods, demoMode: false, status: { dry_run: false, connected: true },
@@ -57,6 +65,67 @@ assert.equal(ui.wbReport().manual_review.expected, 'frozen expectation');
 // Selecting the promoted screening page must use the execution workspace,
 // including after a saved research layout still points to its old location.
 const initial = options.data();
+assert.equal(initial.bottomTab, 'rhythm');
+assert.deepEqual(Array.from(initial.workspaceTabs.execution.slice(0, 2)), ['rhythm', 'vwap1m']);
+assert.equal(initial.workspaceExpanded, true);
+const openingCandidatesVisible = time => options.computed.showOpeningVwapCandidates.call({now: Date.parse(time) / 1000});
+assert.equal(openingCandidatesVisible('2026-11-17T14:29:59Z'), false);
+assert.equal(openingCandidatesVisible('2026-11-17T14:30:00Z'), true);
+assert.equal(openingCandidatesVisible('2026-11-17T14:44:59Z'), true);
+assert.equal(openingCandidatesVisible('2026-11-17T14:45:00Z'), false);
+assert.equal(openingCandidatesVisible('2026-07-21T13:30:00Z'), true);
+assert.equal(openingCandidatesVisible('2026-11-21T14:35:00Z'), false);
+const nav = fs.readFileSync(path.join(__dirname, '../console/static/index.html'), 'utf8')
+  .split('<nav class="workspace-nav"')[1].split('</nav>')[0];
+assert.deepEqual(Array.from(nav.matchAll(/<button :aria-pressed="bottomTab === '([^']+)'"/g), match => match[1]).slice(0, 2),
+  ['rhythm', 'vwap1m']);
+const spoken = [];
+const entryResults = {
+  ...options.methods, lastExternalEntryResult: {}, speak: text => spoken.push(text),
+};
+const externalResults = [
+  { id: 'old', ts: 100, symbol: 'AMD', kind: 'closed', qty: 8 },
+  { id: 'cancel', ts: 200, symbol: 'NVDA', kind: 'cancelled' },
+  { id: 'partial', ts: 200, symbol: 'AMD', kind: 'partial', qty: 2 },
+  { id: 'close', ts: 201, symbol: 'QQQ', kind: 'closed', qty: 5 },
+];
+entryResults.checkExternalEntryResults(externalResults, 202);
+entryResults.checkExternalEntryResults(externalResults, 203);
+entryResults.lastExternalEntryResult = {};
+entryResults.checkExternalEntryResults(externalResults, 204);
+assert.deepEqual(spoken, ['N V D A 外部挂单已自动撤销。Q Q Q 外部持仓已自动平仓，成交 5 股']);
+const failurePopups = [];
+const strategyNotices = {
+  ...options.methods, ...initial, $notify: notice => failurePopups.push(notice),
+};
+const failure = {id: 'failed-order', event: 'pyramid_order_failed', symbol: 'NASDAQ:SPCX', error: '风险额度不足'};
+strategyNotices.autoNotices = [{...failure, id: 'historical-order'}];
+strategyNotices.checkAutoNotices();
+assert.equal(speechQueue.length, 0);
+strategyNotices.autoNotices.push(failure);
+strategyNotices.checkAutoNotices();
+strategyNotices.checkAutoNotices();
+assert.equal(failurePopups.length, 1);
+assert.match(failurePopups[0].message, /SPCX.*风险额度不足/);
+assert.equal(speechQueue.length, 1);
+assert.match(speechQueue[0].text, /S P C X 自动策略下单失败/);
+strategyNotices.speak('普通通知');
+assert.equal(speechCancels, 1);
+assert.equal(speechQueue.length, 2);
+speechQueue[0].onerror();
+strategyNotices.speak('后续普通通知');
+assert.equal(strategyNotices.prioritySpeechCount, 0);
+assert.equal(speechCancels, 2);
+assert.equal(speechQueue[0].text, '后续普通通知');
+const breakout = {id: 'breakout', ticker: 'SPCX', side: 'long', status: 'preview'};
+strategyNotices.updateOpeningBreakouts([breakout]);
+const failedBreakout = {...breakout, status: 'submission_failed'};
+strategyNotices.updateOpeningBreakouts([failedBreakout]);
+strategyNotices.updateOpeningBreakouts([failedBreakout]);
+assert.equal(failurePopups.length, 2);
+assert.equal(speechQueue.length, 1);
+assert.match(speechQueue[0].text, /S P C X 开盘小区间突破下单失败/);
+speechQueue[0].onend();
 ui.workspaceTabs = initial.workspaceTabs;
 ui.workspaceLayouts = { research: { tab: 'screen', expanded: true } };
 ui.selectWorkspace('execution', 'screen');
@@ -68,7 +137,8 @@ ui.workspaceTabs = { execution: ['orders'], validation: ['backtest'] };
 ui.workspaceGroup = 'execution'; ui.bottomTab = 'orders'; ui.bottomPanelHeight = 300;
 ui.workspaceLayouts = {}; ui.workspaceExpanded = false;
 ui.selectWorkspace('validation'); assert.equal(ui.bottomTab, 'backtest'); assert.equal(ui.workspaceExpanded, true);
-ui.selectWorkspace('execution'); assert.equal(ui.bottomTab, 'orders'); assert.equal(ui.workspaceExpanded, false);
+ui.selectWorkspace('execution'); assert.equal(ui.bottomTab, 'orders'); assert.equal(ui.workspaceExpanded, true);
+assert.equal(typeof ui.toggleWorkspace, 'undefined');
 ui.workspaceTabs.execution = ['instances', 'orders', 'fvg'];
 ui.selectWorkspace('execution', 'instances');
 assert.equal(ui.bottomTab, 'instances');
@@ -196,7 +266,7 @@ assert.equal(ui.lotExitReason({state:'CLOSED'}),'原因未记录');
 assert.equal(ui.lotExitReason({state:'CLOSING'}),'待成交确认：原因未记录');
 assert.match(ui.lotExitReason({state:'CLOSING',close_reason:'manual'}),/^待成交确认/);
 const orderPage=fs.readFileSync(path.join(__dirname,'../console/static/index.html'),'utf8');
-for (const label of ['开仓方向','开仓时间 · 美东','平仓时间 · 美东','平仓原因']) assert.ok(orderPage.includes(label));
+for (const label of ['方向 / 状态','股数 / 占比','开仓 / 止损','开仓时间 · 美东','平仓时间 · 美东','平仓原因']) assert.ok(orderPage.includes(label));
 
 // A mixed live/confirmed ST alert must show both, without claiming the live ST flipped short.
 flipUI.lastScanAlert={};flipUI.scanAlerts=[{ticker:'QCOM',side:'long',qty:608,
@@ -207,10 +277,10 @@ assert.match(flipNotices.at(-1).message,/实时ST 多头.*收盘确认ST 空头/
 {
   const range = require('../console/static/range-distribution');
   const time = Date.parse('2026-11-05T09:45:00-05:00') / 1000;
-  function quote(close, open, speed) {
+  function quote(close, open, speed, ema7 = close) {
     return {
       previous_regular_range: {day: '2026-11-05', date: '2026-11-04', high: 120, low: 80},
-      bar: {time, close, open}, e9: {time, ema_slope_atr: speed},
+      bar: {time, close, open}, e9: {time, ema_slope_atr: speed, ema_9: ema7},
       attack: {time, pmh: 106, pml: 95, opening3High: 105, opening3Low: 93},
     };
   }
@@ -218,8 +288,43 @@ assert.match(flipNotices.at(-1).message,/实时ST 多头.*收盘确认ST 空头/
   wrong.e9.time -= 300;
   const map = range.build({AMD: quote(106, 100, -1), NVDA: quote(108, 109, 2),
     COIN: quote(90, 95, -3.4), WRONG: wrong}, ['AMD', 'NVDA', 'COIN', 'WRONG']);
-  assert.deepEqual(map.rows.map(r => [r.ticker, r.major, r.minor, r.tone]),
-    [['AMD', 1, 1, 'flat'], ['NVDA', 1, 0, 'down'], ['COIN', 1, 2, 'down']]);
+  assert.deepEqual(map.rows.map(r => [r.ticker, r.minor, r.tone]),
+    [['AMD', 1, 'flat'], ['NVDA', 0, 'down'], ['COIN', 2, 'down']]);
+  const zoneMarket = {
+    ABOVE: quote(121, 120, 2, 108), INSIDE: quote(100, 99, 1, 108),
+    BELOW: quote(79, 80, -1, 108), HIGH_EDGE: quote(120, 119, 0),
+    LOW_EDGE: quote(80, 81, 0),
+  };
+  const zoneMap = range.build(zoneMarket, Object.keys(zoneMarket), 820, 760);
+  assert.deepEqual(zoneMap.groups.map(group => [group.name, group.count]),
+    [['昨高上方', 1], ['昨日区间内', 3], ['昨低下方', 1]]);
+  for (const major of [0, 1, 2]) {
+    const focused = range.build(zoneMarket, Object.keys(zoneMarket), 820, 760, major);
+    assert.deepEqual(focused.visibleGroups.map(group => group.major), [major]);
+    assert.equal(focused.visibleRows.length, zoneMap.groups[major].count);
+    assert.equal(focused.rows.length, zoneMap.rows.length);
+    const [panel] = focused.visibleGroups;
+    assert.deepEqual([panel.frameX, panel.frameY, panel.frameWidth, panel.frameHeight], [0, 0, 820, 760]);
+    assert.ok(focused.visibleRows.every(row => row.major === major && row.x >= panel.left && row.x <= panel.right));
+    assert.deepEqual(range.referenceLines(focused.rows.find(row => row.major !== major), focused), []);
+  }
+  const bySymbol = Object.fromEntries(zoneMap.rows.map(row => [row.symbol, row]));
+  assert.equal(bySymbol.ABOVE.major, 0);
+  assert.equal(bySymbol.INSIDE.major, 1);
+  assert.equal(bySymbol.BELOW.major, 2);
+  assert.equal(bySymbol.HIGH_EDGE.major, 1);
+  assert.equal(bySymbol.LOW_EDGE.major, 1);
+  assert.equal(bySymbol.ABOVE.normalizedPosition, bySymbol.BELOW.normalizedPosition);
+  assert.ok(bySymbol.INSIDE.anchorX > bySymbol.ABOVE.anchorX);
+  assert.ok(bySymbol.INSIDE.anchorX > bySymbol.BELOW.anchorX);
+  assert.ok(bySymbol.ABOVE.anchorY < bySymbol.BELOW.anchorY);
+  assert.ok(zoneMap.groups[1].bottom - zoneMap.groups[1].top > zoneMap.groups[0].bottom - zoneMap.groups[0].top);
+  assert.equal(zoneMap.groups[0].left, zoneMap.groups[2].left);
+  for (const row of zoneMap.rows) {
+    const group = zoneMap.groups[row.major];
+    assert.ok(row.y >= group.top && row.y <= group.bottom);
+    assert.ok(row.x >= group.left && row.x <= group.right);
+  }
   assert.deepEqual(map.rows[1].target, {label: '昨高', price: 120});
   assert.equal(map.limit, 4);
   assert.deepEqual(map.pending, ['WRONG']);
@@ -232,17 +337,80 @@ assert.match(flipNotices.at(-1).message,/实时ST 多头.*收盘确认ST 空头/
     INSIDE2: quote(100, 99, 0.41),
   };
   const layout = range.build(crowded, Object.keys(crowded), 480);
-  const [outside, inside] = layout.groups[1].lanes;
-  assert.equal(outside.layers, 3);
-  assert.deepEqual(outside.rows.map(row => [row.ticker, row.layer]),
-    [['SLOW', 0], ['MID', 1], ['FAST', 2], ['FAR', 0]]);
-  assert.equal(inside.layers, 1);
-  assert.equal(range.build(crowded, Object.keys(crowded), 3200).groups[1].lanes[0].layers, 1);
+  assert.ok(layout.rows.some(row => row.displaced));
+  for (const row of layout.rows) {
+    assert.ok(row.x >= layout.bounds.left && row.x <= layout.bounds.right);
+    assert.ok(row.y >= layout.bounds.top && row.y <= layout.bounds.bottom);
+  }
+  assert.deepEqual(layout.rows.map(row => row.ticker), ['INSIDE1', 'INSIDE2', 'SLOW', 'MID', 'FAST', 'FAR']);
+  const nearBoundary = Object.fromEntries(Array.from({length: 10}, (_, i) =>
+    ['NEAR' + i, quote(108, 107, 1, 106.01)]));
+  const nearLayout = range.build(nearBoundary, Object.keys(nearBoundary), 360);
+  for (const row of nearLayout.rows) {
+    assert.equal(row.minor, 0);
+    assert.ok(row.y < nearLayout.groups[row.major].upperY, row.ticker);
+  }
+  const reference = quote(110, 109, 1, 100);
+  reference.attack = {time, pmh: 104, pml: 100, opening3High: 103, opening3Low: 101};
+  const central = range.build({TEST: reference}, ['TEST']).rows[0];
+  assert.equal(central.normalizedPosition, -1);
+  assert.equal(central.tone, 'flat'); // The close is outside, but Pine EMA7 is still at the boundary.
+  reference.e9.ema_9 = 110;
+  const advanced = range.build({TEST: reference}, ['TEST']);
+  assert.equal(advanced.rows[0].normalizedPosition, 4);
+  assert.equal(advanced.rows[0].distance, 3);
+  reference.e9.ema_9 = 98;
+  const down = range.build({TEST: reference}, ['TEST']).rows[0];
+  assert.equal(down.normalizedPosition, -2);
+  assert.equal(down.distance, 1);
+  const unequalPrice = quote(220, 218, 1, 220);
+  unequalPrice.attack = {time, pmh: 208, pml: 200, opening3High: 206, opening3Low: 202};
+  assert.equal(range.build({TEST: unequalPrice}, ['TEST']).rows[0].normalizedPosition, 4);
+  const zeroRange = quote(100, 100, 0);
+  zeroRange.attack.pmh = zeroRange.attack.pml = zeroRange.attack.opening3High = zeroRange.attack.opening3Low = 100;
+  const missing = quote(110, 109, 1);
+  delete missing.e9.ema_9;
+  assert.deepEqual(range.build({ZERO: zeroRange, MISSING: missing}, ['ZERO', 'MISSING']).pending, ['ZERO', 'MISSING']);
+  const fallback = quote(110, 109, 1);
+  fallback.bar_c = {...fallback.bar};
+  fallback.e9_c = {...fallback.e9};
+  fallback.attack_c = {...fallback.attack};
+  fallback.e9.time -= 300;
+  assert.equal(range.build({TEST: fallback}, ['TEST']).rows[0].confirmed, true);
+  const selected = {...advanced.rows[0], prior: {high: 108, low: 96}};
+  assert.deepEqual(range.referenceLines(selected, advanced).map(line => [line.label, line.position, line.tone]),
+    [['昨高', 3, 'up'], ['昨低', -3, 'down']]);
   const early = quote(109, 108, 1);
-  early.bar.time -= 3600;
+  early.bar.time = Date.parse("2026-11-05T14:40:00Z") / 1000;
   early.e9.time = early.attack.time = early.bar.time;
-  early.attack.opening3High = early.attack.opening3Low = null;
+  early.attack.opening3High = 110;
+  early.attack.opening3Low = 93;
   const provisional = range.build({EARLY: early}, ['EARLY']).rows[0];
   assert.equal(provisional.forming, true);
   assert.equal(provisional.target, null);
+  assert.equal(provisional.ready, false);
+  assert.deepEqual([provisional.lower, provisional.upper], [95, 106]);
+  early.bar.time += 300;
+  early.e9.time = early.attack.time = early.bar.time;
+  const complete = range.build({EARLY: early}, ['EARLY']).rows[0];
+  assert.equal(complete.forming, false);
+  assert.deepEqual([complete.lower, complete.upper], [93, 110]);
 }
+
+// Entry-feed folding is local presentation; signal objects and execution are untouched.
+const signalRows = [{time:100,rows:[{kind:'golden',row:{id:'keep'}}]}];
+let scrollAfterUnfold = 0;
+const foldedFeed = {...options.methods, openingFeedCollapsed:false, openingFeedPreferenceSet:false,
+  workspaceLayouts:null, entrySignalGroups:signalRows, $nextTick:fn=>fn(),
+  scrollOpeningFeedToLatest:()=>{scrollAfterUnfold++;}};
+foldedFeed.onBottomTabChange('rhythm');
+assert.equal(foldedFeed.openingFeedCollapsed,true);
+foldedFeed.toggleOpeningFeed();
+assert.equal(foldedFeed.openingFeedCollapsed,false);
+assert.equal(scrollAfterUnfold,1);
+foldedFeed.onBottomTabChange('orders');
+assert.equal(foldedFeed.openingFeedCollapsed,false);
+foldedFeed.toggleOpeningFeed();
+assert.equal(foldedFeed.openingFeedCollapsed,true);
+assert.equal(foldedFeed.entrySignalGroups,signalRows);
+assert.equal(storage.get('opening_feed_collapsed'),'1');

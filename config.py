@@ -107,6 +107,10 @@ WATCHLIST: List[str] = [
     "NASDAQ:COST",
 ]
 
+# IPO 专用只读监测，不加入常规指标/回测/VWAP齐备门槛；日期为美东上市日。
+# ANT 的 IPO 监测已结束；当前不建立 IPO 专用报价或分钟图订阅。
+IPO_OPENING_WATCHES = {}
+
 # 八宫格布局参数（对齐 Premium 套餐每标签页 8 图上限）
 # TV 8 图布局为 4 列 x 2 行
 GRID_ROWS = 2
@@ -213,17 +217,18 @@ EXECUTION_ENABLED = _os.environ.get("EXECUTION_ENABLED", "0") == "1"
 # 直接实盘小仓位，风控是唯一兜底）
 # ---------------------------------------------------------------------------
 
-# 以损定量：每一笔止损的固定损失 = 账户净值 × RISK_PER_TRADE_PCT。
-# qty = floor(净值 × 0.1% / |entry - 止损价|)。
-# 净值取不到（dry-run 未连 IBKR）时退化用 RISK_PER_TRADE_USD 固定额。
+# 控制台手动建仓与执行实例首仓使用固定美元风险预算。
+# RISK_PER_TRADE_PCT 仅保留供旧 RiskGate.size_position 调用兼容。
 RISK_PER_TRADE_PCT = 0.001        # 0.1% 账户净值
-RISK_PER_TRADE_USD = 700.0        # 控制台手动单笔风险、执行实例首仓预算
+RISK_PER_TRADE_USD = 1000.0       # 控制台手动单笔风险、执行实例首仓预算
+RISK_MAX_SYMBOL_POSITION_PCT = 140.0  # 同一股票全部未结束批次合计名义仓位上限
 RISK_MAX_ORDER_QTY = 100000       # 单笔最大股数硬顶（仅极端兜底，不再干扰以损定量）
 RISK_MAX_OPEN_POSITIONS = 0       # 最大同时持仓数；0 = 不限制（2026-10-22 用户要求取消三笔上限）
 # 总风险敞口预算：全部开放 lot 的剩余风险（PENDING 全额计划风险 /
 # 已成交按「当前止损到成本的不利距离」，保本后归 0）合计超过该预算即拦截新开仓；
 # 0 = 不限制
-RISK_MAX_TOTAL_RISK_USD = float(_os.environ.get("RISK_MAX_TOTAL_RISK_USD", "3000"))  # 2026-10-23 由 2000 调为 3000
+RISK_MAX_TOTAL_RISK_USD = float(_os.environ.get("RISK_MAX_TOTAL_RISK_USD", "2200"))
+RISK_MAX_DIRECTION_RISK_USD = 1100.0  # 多头、空头各自剩余风险上限，保本后释放
 RISK_DAILY_LOSS_LIMIT_USD = 1000.0  # 日亏损熔断（SOD 净值锚点口径）
 ALLOW_SHORT = True                # 是否允许做空（2026-10-17 起双向交易：
                                   # 方向 = trend_state/ST 方向，无反向订单）
@@ -285,6 +290,9 @@ EXTERNAL_ORDER_CLEANUP_ENABLED = _os.environ.get("EXTERNAL_ORDER_CLEANUP_ENABLED
 EXTERNAL_MANUAL_GUARD_ENABLED = _os.environ.get("EXTERNAL_MANUAL_GUARD_ENABLED", "0") == "1"
 EXTERNAL_MANUAL_GUARD_TEST_ACCOUNT = _os.environ.get("EXTERNAL_MANUAL_GUARD_TEST_ACCOUNT", "").strip()
 EXTERNAL_MANUAL_GUARD_FA_SCOPE = _os.environ.get("EXTERNAL_MANUAL_GUARD_FA_SCOPE", "0") == "1"
+# 外部订单守卫豁免名单目前为空；ANT 长线持仓豁免已按用户要求取消。
+# 仅豁免外部清理，不绕过控制台显式开仓/平仓及其他正常订单风控。
+EXTERNAL_ORDER_GUARD_EXEMPT_TICKERS = ()
 
 # 全自动策略：单引擎并行实例上限（理论无上限，实际最多 5 个）
 AUTO_MAX_INSTANCES = 5
@@ -341,3 +349,6 @@ LOG_LEVEL = "INFO"
 #   "node"   - controller/tv_control.js（基于开源项目 tradingview-mcp，推荐）
 #   "python" - controller/tv_cdp.py（纯 Python websockets 实现，备用）
 CONTROLLER_IMPL = "node"
+
+# 2026-11-19：停用TV模拟账户跟踪，改为实盘成交图表标记；保留历史绑定和账本。
+TV_PAPER_SYNC_ENABLED = False

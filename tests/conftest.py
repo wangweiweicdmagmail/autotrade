@@ -53,6 +53,9 @@ def run(coro):
 def console_app(tmp_path, monkeypatch):
     """每个测试一个应用实例；所有生产状态路径在加载前即指向 tmp_path。"""
     context = build_services(RuntimePaths(data_dir=tmp_path))
+    # Unit tests isolate execution from the research ranking cache. Admission
+    # integration tests explicitly enable it and verify production injection.
+    context.order_mgr.entry_admission = None
     context.events.record_event = lambda *a, **k: None
     context.copy._COPY_TRADER_PY = tmp_path / "copy_trader.py"
     create_app(context)

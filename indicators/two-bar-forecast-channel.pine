@@ -1,0 +1,29 @@
+//@version=6
+indicator("两根K线高低点外推通道", shorttitle="2-Bar Forecast", overlay=true)
+
+// 最近两根已收盘 K 线的移动速度，外推到当前 K 线。
+// 本根内预测固定，绘图时间与被预测的 K 线对齐。
+forecastHigh = high[1] + (high[1] - high[2])
+forecastLow = low[1] + (low[1] - low[2])
+
+// 高低点同时升高为多，同时降低为空。其余形态延续原方向。
+// 空头收盘站上前根高点转多，多头收盘跌破前根低点转空。
+// 使用已收盘数据，转向在下一根开始时生效。
+var int direction = 0
+int turnSignal = 0
+if not na(high[2]) and not na(low[2])
+    if direction[1] == -1 and close[1] > high[2]
+        direction := 1
+        turnSignal := 1
+    else if direction[1] == 1 and close[1] < low[2]
+        direction := -1
+        turnSignal := -1
+    else if high[1] > high[2] and low[1] > low[2]
+        direction := 1
+    else if high[1] < high[2] and low[1] < low[2]
+        direction := -1
+
+forecastPrice = direction == 1 ? forecastLow : direction == -1 ? forecastHigh : na
+plot(forecastPrice, "Forecast_Price", color=direction == 1 ? color.lime : color.red, linewidth=2, style=plot.style_stepline, offset=0)
+plot(direction, "Direction", display=display.data_window, offset=0)
+plot(turnSignal, "Turn_Signal", display=display.data_window, offset=0)

@@ -1,5 +1,6 @@
 """automatic application functions and owned state. No console.app dependency."""
 
+from dataclasses import replace
 from console.services.auto import AutoServiceError
 from fastapi import HTTPException
 from typing import Optional
@@ -77,6 +78,77 @@ class AutomaticService:
             self.context.automatic._auto_strategy_name,
         ) = (self.context.auto_service.enabled, self.context.auto_service.strategy_name)
         return result
+
+    async def api_golden_entry(self, req, trader: str) -> dict:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from domain.contracts import PriceObservation
+        from engine.opening_range import opening_entry_block
+
+        context = self.context
+        service = context.auto_service
+        symbol = service.symbol(req.symbol)
+        if req.direction == -1 and not config.ALLOW_SHORT:
+            raise HTTPException(409, "当前配置禁止做空")
+        if symbol not in config.WATCHLIST:
+            raise HTTPException(400, "标的不在股票池内")
+        now = time.time()
+        if not context.system._is_trading_hours() or not req.bar_time <= now < req.bar_time + 300:
+            raise HTTPException(409, "黄金信号已过有效期或当前不在交易时段")
+        if context.collector.data_health()["stale"]:
+            raise HTTPException(409, "行情陈旧，无法开仓")
+        data = (context.collector.latest() or {}).get(symbol) or {}
+        model = service.registry.get("golden_strategy")
+        try:
+            observation = PriceObservation.from_market(symbol, data, now)
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from error
+        output = model.from_market(data)
+        if (observation.time_basis != "collector_observed" or not 0 <= now - observation.observed_at <= 15
+                or observation.bar_open_time != req.bar_time or output.time != req.bar_time
+                or output.direction not in (1, -1) or output.direction != req.direction or output.errors
+                or output.entry_price is None or output.stop_px is None or output.stop_px <= 0
+                or (output.entry_price - output.stop_px) * output.direction <= 0
+                or (observation.price - output.stop_px) * output.direction <= 0):
+            raise HTTPException(409, "黄金信号已变化或保护价无效，请刷新后核对")
+        if not req.manual_window and not output.entry_signal:
+            raise HTTPException(409, "黄金信号未触线，请等待回撤")
+        if context.strategy_runtime.require_opening_range:
+            reason = opening_entry_block(data, output.direction, observation.price, as_of=now)
+            if reason:
+                raise HTTPException(409, reason)
+        instance_id = "golden-click"
+        engine = service.engine(model.strategy_id, instance_id)
+        instance = engine.get_instance(symbol)
+        if instance and instance.state != "DONE":
+            raise HTTPException(409, "该标的已有一键开仓实例，请查看执行监控")
+        try:
+            result = service.start(model.strategy_id, [symbol], {}, instance_id,
+                                   entry_scope=(req.bar_time, req.direction))
+        except AutoServiceError as error:
+            raise HTTPException(error.status, error.detail) from error
+        if symbol not in result["started"]:
+            raise HTTPException(409, "执行实例未启动，请检查实例上限")
+        instance = engine.get_instance(symbol)
+        et = datetime.fromtimestamp(now, ZoneInfo("America/New_York"))
+        token = decision_market_frame.set(getattr(context.collector, "market_frame_id", None))
+        try:
+            context.events.record_event("golden_entry_click", symbol=symbol, trader=trader,
+                                        direction=req.direction, bar_time=req.bar_time,
+                                        manual_window=req.manual_window, retracement_triggered=output.entry_signal)
+            if req.manual_window:
+                # This request explicitly authorizes one entry in the validated bar.
+                output = replace(output, entry_signal=True)
+            await engine.on_observation(observation, output, et.hour * 60 + et.minute)
+        finally:
+            decision_market_frame.reset(token)
+            if not instance.lot_ids:
+                engine.stop_symbol(symbol)
+        if not instance.lot_ids:
+            raise HTTPException(409, instance.last_decision_reason or "开仓未确认，请查看执行监控")
+        self._auto_enabled = service.enabled
+        self._auto_strategy_name = service.strategy_name
+        return {"ok": True, "lot_id": instance.lot_ids[-1]}
 
     async def api_auto_stop(
         self, close_positions: bool = False, trader: str = None

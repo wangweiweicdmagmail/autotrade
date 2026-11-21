@@ -3,6 +3,8 @@
 读取 TradingView Pine 策略模型的输出，执行风控、下单、止损同步和订单恢复。
 第一个已接入模型是用户自定义的 **EMA9-ST-ATR**。
 
+当前功能与使用规则见 [近期功能整理（2026-11-21）](docs/FEATURES_2026-11-21.md)：候选与订单工作台、TV 八格与六格联动、趋势评分、开仓准入、候选持仓保护、VWAP 策略及验证边界。
+
 开发新指标时，先读取 [项目协作约定](AGENTS.md) 和 [Pine 指标长期规范](docs/PINE_INDICATOR_CONTRACT.md)。
 这些规则作为项目上下文沿用，用户只需描述本次策略逻辑，无需再次粘贴通用提示词。
 
@@ -27,11 +29,15 @@ Pine 自动信号的首仓与加仓使用 **市价 MKT + STOP 保护单**，不�
 
 控制台按执行监控、回测验证、研究复盘和系统运维组织工作区。参数按作用范围管理，实例行显示生效规则与风险，订单明细集中展示成交、止损和保护回报；回测支持价格/决策联动、人工预期和 JSON / CSV 导出。见 [界面优化交付记录](docs/UI_OPTIMIZATION_DELIVERY_2026-11-02.md)。
 
-导航集中为单排，默认执行监控独占内容区；订单、FVG、选股按需切换，选股独立位于 FVG 监控之后，研究和运维通过同排菜单进入。需要同时看订单与实例时可主动分屏，底部不再保留重复 Tab 栏。所有工作区已适配与 TradingView 左右分屏，见 [分屏优化与逐页截图](docs/UI_SPLIT_SCREEN_OPTIMIZATION_2026-11-02.md)。
+导航集中为单排，默认打开“候选与订单”，左侧候选榜和持仓保护控制，右侧订单批次。其他工作区按需切换，研究和运维通过同排菜单进入；控制台内部的执行实例分屏按钮和拖动分隔条已移除，各 Tab 使用完整内容区。早期布局保留在 [历史分屏优化记录](docs/UI_SPLIT_SCREEN_OPTIMIZATION_2026-11-02.md)，当前以 [工作台说明](docs/MARKET_RHYTHM.md) 为准。
 
-macOS 启动控制台后默认自动打开专用 Chrome，并整理为原生左右分屏：左侧 autotrade，右侧 TradingView。复用已有图表及正确排列的分屏；通过 PID 绑定的原生可访问性句柄定位专用浏览器，需要运行控制台的应用具有辅助功能权限。可用 `CONSOLE_AUTO_SPLIT_BROWSER=0` 保留双标签页，用 `CONSOLE_AUTO_OPEN_BROWSER=0` 完全关闭自动打开。详见 [浏览器自动分屏说明](docs/BROWSER_WORKSPACE.md)。
+启动控制台后默认准备专用 Chrome 的三个独立窗口：`auto_trade` 八格、`auto_trade2` 六格、AutoTrade 控制台。已有确切布局页面会复用，不重新加载图表；三个窗口的位置由用户安排。`CONSOLE_AUTO_OPEN_BROWSER=0` 关闭自动打开，`CONSOLE_AUTO_ARRANGE_WINDOWS=0` 跳过三窗口整理；旧左右分屏不是默认启动路径。远程客户端使用自己的 [Chrome 扩展](extensions/autotrade-tv/README.md) 绑定本机图表。详见 [浏览器工作区说明](docs/BROWSER_WORKSPACE.md)。
 
 - [架构、模型接入与运行入口](ARCHITECTURE.md)
+- [当前功能、操作规则与验证汇总（2026-11-21）](docs/FEATURES_2026-11-21.md)
+- [候选榜评分、TV 联动与候选持仓保护](docs/MARKET_RHYTHM.md)
+- [当前风险预算与开仓限制](docs/RISK_LIMITS.md)
+- [TD 分时指标与开仓门槛](docs/TD_PRICE_LINE.md)
 - [专业术语与模块命名规范](docs/TERMINOLOGY.md)
 - [独立系统架构图（PNG / SVG）](docs/diagrams/README.md)
 - [Pine 指标长期开发规范](docs/PINE_INDICATOR_CONTRACT.md)
@@ -48,3 +54,7 @@ macOS 启动控制台后默认自动打开专用 Chrome，并整理为原生左�
 `main.py`、`auto_runner.py` 是历史流程，策略语义与当前控制台不同，定位见架构文档。
 
 小区间突破的完整信号、预约、风险和退出口径见 [突破规则](docs/OPENING_BREAKOUT_RULES.md)，也可从系统架构中的“突破规则”查看。
+
+### TradingView 行情代理
+
+如果控制台通过 Tailscale 远程访问，同时 TradingView 行情需要走本机代理，可在 `service/tv_market_proxy.local.json` 写入 `{"proxy":"http://127.0.0.1:1082"}`，将地址替换为本机 HTTP 代理地址。也可以用环境变量 `TV_MARKET_PROXY` 为部署指定地址。行情进程重连时会读取配置，登录授权和行情 WebSocket 使用同一个代理。删除本地配置并清除环境变量后恢复默认连接方式。

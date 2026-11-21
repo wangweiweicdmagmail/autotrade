@@ -2,11 +2,11 @@
 
 from console.services.night_test import NightTestService
 from console.services.tv_paper_sync import TvPaperSync, configured_paper_account
+from console.services.ipo_alerts import IpoAlerts
 from console.services.strategy_shadow import StrategyShadow
 from console.services.auto import AutoService
 from engine.backtest_session import BacktestSession
 from engine.breakout_tracker import BreakoutTracker
-from typing import Dict
 from fastapi import HTTPException
 from execution.ibkr import IBKRGateway
 from engine.brokers import LiveBroker
@@ -50,6 +50,7 @@ from console.services.reports import ReportsService
 from console.services.research import ResearchService
 from console.services.settings import SettingsService
 from console.services.signals import SignalsService
+from console.services.opening_vwap import OpeningVwapService
 from console.services.snapshot import SnapshotService
 from console.services.system import SystemService
 from console.services.trading import TradingService
@@ -83,6 +84,7 @@ class ConsoleServices:
         self.copy = CopyService(self)
         self.desktop = DesktopService(self)
         self.events = EventsService(self)
+        self.ipo_alerts = IpoAlerts(self, config.IPO_OPENING_WATCHES)
         self.lifecycle = LifecycleService(self)
         self.monitoring = MonitoringService(self)
         self.news = NewsService(self)
@@ -91,6 +93,7 @@ class ConsoleServices:
         self.research = ResearchService(self)
         self.settings = SettingsService(self)
         self.signals = SignalsService(self)
+        self.opening_vwap = OpeningVwapService(self)
         self.snapshot = SnapshotService(self)
         self.system = SystemService(self)
         self.trading = TradingService(self)
@@ -141,6 +144,7 @@ class ConsoleServices:
                 max_order_qty=config.RISK_MAX_ORDER_QTY,
                 max_open_positions=config.RISK_MAX_OPEN_POSITIONS,
                 max_total_risk_usd=config.RISK_MAX_TOTAL_RISK_USD,
+                max_direction_risk_usd=config.RISK_MAX_DIRECTION_RISK_USD,
                 daily_loss_limit_usd=config.RISK_DAILY_LOSS_LIMIT_USD,
             ),
             halt_dir=self.paths.data_dir,
@@ -164,9 +168,14 @@ class ConsoleServices:
         self.collector: RealtimeCollector = RealtimeCollector(
             config.WATCHLIST, audit=self.market_audit, market_session=config.TV_MARKET_SESSION,
             default_session_symbols=config.TV_DEFAULT_SESSION_SYMBOLS,
+            ipo_watches=config.IPO_OPENING_WATCHES,
+            on_ipo_trade=self.ipo_alerts.refresh,
         )
         self.order_mgr.market_health = self.collector.data_health
+        self.order_mgr.entry_admission = self.research.check_candidate_entry
+        self.order_mgr.candidate_protection_options = self.settings._candidate_order_protection
         self.accounts._equity_cache = {"equity": None, "daily_pnl": None, "ts": 0.0}
+        self.order_mgr.position_equity = lambda: self.accounts._equity_cache.get("equity")
         self.monitoring._scan_alerts: dict = {}
         self.monitoring._scan_task: Optional[asyncio.Task] = None
         self.monitoring._stop_alerts: dict = {}
@@ -210,6 +219,7 @@ class ConsoleServices:
             default_engine_provider=lambda: self.auto_engine,
             watchlist=config.WATCHLIST,
             default_risk=config.RISK_PER_TRADE_USD,
+            allow_short=config.ALLOW_SHORT,
             max_instances=config.AUTO_MAX_INSTANCES,
             emit=lambda *a, **k: self.automatic._emit_auto(*a, **k),
             record_event=lambda *a, **k: self.events.record_event(*a, **k),
@@ -262,8 +272,8 @@ class ConsoleServices:
             ),
         )
         self.system._TWS_PROCESS_PATTERN = "/Trader Workstation/Trader Workstation.app/Contents/MacOS/JavaApplicationStub"
-        self.desktop._TV_SHOW_JS = "\n(async () => {\n  const prim = v => (typeof v === 'function') ? v() : v;\n  const readSym = cw => {\n    try { const s = cw.symbol();\n      return String((s && typeof s.value === 'function') ? s.value() : s);\n    } catch (e) {}\n    try { return String(cw.model().mainSeries().symbol()); } catch (e) {}\n    return 'ERR';\n  };\n  const rectOf = cw => {\n    try {\n      if (cw._mainDiv && cw._mainDiv.getBoundingClientRect) {\n        const b = cw._mainDiv.getBoundingClientRect();\n        return { x: b.x, y: b.y, w: b.width, h: b.height };\n      }\n    } catch (e) {}\n    return null;\n  };\n  // 收集 widget（TradingViewApi 优先，_exposed 回退）\n  let cws = [];\n  const api = window.TradingViewApi && window.TradingViewApi._chartWidgetCollection;\n  if (api && typeof api.getAll === 'function') cws = api.getAll() || [];\n  if (!cws.length) {\n    const col = window._exposed_chartWidgetCollection;\n    if (col && col._chartWidgetsDefs) {\n      cws = col._chartWidgetsDefs.map(d => d.chartWidget);\n    }\n  }\n  if (!cws.length) return JSON.stringify({fatal: 'no chart widget collection'});\n  // 过滤不可见 pane（rect 缺失或 0x0），按 (y, x) 视觉行优先排序\n  const panes = cws.map(cw => ({ cw, rect: rectOf(cw) }))\n    .filter(p => p.rect && p.rect.w > 50 && p.rect.h > 50)\n    .sort((a, b) => (a.rect.y - b.rect.y) || (a.rect.x - b.rect.x));\n  if (!panes.length) {\n    // 单图/无法取 rect：退回集合顺序第一个\n    panes.push({ cw: cws[0], rect: null });\n  }\n  const first = panes[0].cw;\n  const before = readSym(first);\n  const target = %SYMBOL%;\n  if (typeof first.setSymbol === 'function') first.setSymbol(target);\n  else if (first.model && first.model().mainSeries) {\n    first.model().mainSeries().setSymbol(target);\n  } else return JSON.stringify({fatal: 'widget 无 setSymbol', before});\n  await new Promise(r => setTimeout(r, 300));\n  const after = readSym(first);\n  const ticker = String(target).split(':').pop().toUpperCase();\n  const got = String(after).split(':').pop().toUpperCase();\n  return JSON.stringify({before, after, ok: got === ticker, ticker,\n                         panes: panes.length});\n})()\n"
         self.desktop._TV_CHART_URL = "https://cn.tradingview.com/chart/I2KwX1s0/"
+        self.desktop._TV_FOCUS_CHART_URL = "https://cn.tradingview.com/chart/IWzSaxF7/"
         self.desktop._TV_CHROME_PROFILE = str(Path.home() / ".tv-chrome-profile")
         self.desktop._CONSOLE_URL = os.getenv("CONSOLE_URL", "http://127.0.0.1:8000/")
         self.desktop._CONSOLE_AUTO_OPEN_BROWSER = (
@@ -272,26 +282,7 @@ class ConsoleServices:
         self.desktop._CONSOLE_AUTO_SPLIT_BROWSER = (
             os.getenv("CONSOLE_AUTO_SPLIT_BROWSER", "1") != "0"
         )
-        self.desktop._TV_PANES_COLLECT_JS = "\n  const readSym = cw => {\n    try { const s = cw.symbol();\n      return String((s && typeof s.value === 'function') ? s.value() : s);\n    } catch (e) {}\n    try { return String(cw.model().mainSeries().symbol()); } catch (e) {}\n    return '';\n  };\n  const rectOf = cw => {\n    try {\n      if (cw._mainDiv && cw._mainDiv.getBoundingClientRect) {\n        const b = cw._mainDiv.getBoundingClientRect();\n        return { x: b.x, y: b.y, w: b.width, h: b.height };\n      }\n    } catch (e) {}\n    return null;\n  };\n  let cws = [];\n  const api = window.TradingViewApi && window.TradingViewApi._chartWidgetCollection;\n  if (api && typeof api.getAll === 'function') cws = api.getAll() || [];\n  if (!cws.length) {\n    const col = window._exposed_chartWidgetCollection;\n    if (col && col._chartWidgetsDefs) {\n      cws = col._chartWidgetsDefs.map(d => d.chartWidget);\n    }\n  }\n  const panes = cws.map(cw => ({ cw, rect: rectOf(cw) }))\n    .filter(p => p.rect && p.rect.w > 50 && p.rect.h > 50)\n    .sort((a, b) => (a.rect.y - b.rect.y) || (a.rect.x - b.rect.x));\n"
-        self.desktop._TV_PANES_JS = (
-            "\n(() => {"
-            + self.desktop._TV_PANES_COLLECT_JS
-            + "\n  return JSON.stringify(panes.map(p => ({ symbol: readSym(p.cw),\n                                          rect: p.rect })));\n})()\n"
-        )
-        self.desktop._TV_PANE_SHOW_JS = (
-            "\n(async () => {"
-            + self.desktop._TV_PANES_COLLECT_JS
-            + "\n  const idx = %PANE%;\n  if (!panes.length) return JSON.stringify({ fatal: 'no visible pane' });\n  if (idx >= panes.length) return JSON.stringify({ fatal: 'pane 不足',\n                                                   panes: panes.length });\n  const target = %SYMBOL%;\n  const ticker = String(target).split(':').pop().toUpperCase();\n  const cw = panes[idx].cw;\n  const before = readSym(cw);\n  const needSwitch = String(before).split(':').pop().toUpperCase() !== ticker;\n  if (needSwitch) {\n    if (typeof cw.setSymbol === 'function') cw.setSymbol(target);\n    else if (cw.model && cw.model().mainSeries) {\n      cw.model().mainSeries().setSymbol(target);\n    } else return JSON.stringify({ fatal: 'widget 无 setSymbol', before });\n    await new Promise(r => setTimeout(r, 300));\n  }\n  const after = readSym(cw);\n  const got = String(after).split(':').pop().toUpperCase();\n  return JSON.stringify({ before, after, ok: got === ticker,\n                          switched: needSwitch, rect: panes[idx].rect,\n                          panes: panes.length });\n})()\n"
-        )
-        self.desktop._TV_PANE_READY_JS = (
-            "\n(() => {"
-            + self.desktop._TV_PANES_COLLECT_JS
-            + "\n  const idx = %PANE%;\n  const ticker = %TICKER%;\n  if (idx >= panes.length) return 'false';\n  const cw = panes[idx].cw;\n  try {\n    const s = cw.symbol();\n    const cur = String((s && typeof s.value === 'function') ? s.value() : s)\n      .split(':').pop().toUpperCase();\n    if (cur !== ticker) return 'false';\n    const bars = cw.model().mainSeries().bars();\n    return String(!!(bars && bars.size() > 5));\n  } catch (e) { return 'false'; }\n})()\n"
-        )
-        self.desktop._TV_PANES_PATH = self.paths.data_dir / "tv_panes.json"
-        self.desktop._TV_PANE_STALE_S = 2 * 3600
-        self.desktop._tv_pane_locks: Dict[int, asyncio.Lock] = {}
-        self.desktop._tv_view_info: dict = {"panes": 0, "slots": 0, "checked_at": 0.0}
+        self.desktop._CONSOLE_AUTO_ARRANGE_WINDOWS = os.getenv('CONSOLE_AUTO_ARRANGE_WINDOWS', '1') != '0'
         self.research._bt_session: Optional[BacktestSession] = None
         self.news._ZI_ET = _ZoneInfo("America/New_York")
         self.news._live_news = LiveNewsService()

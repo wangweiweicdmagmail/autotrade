@@ -3,18 +3,129 @@
 from fastapi import HTTPException
 from typing import Optional
 import asyncio
-import base64
 import config
 import json
-import os
 import time
+from pathlib import Path
+from contextlib import asynccontextmanager
 from console.shared import logger
-from console.schemas import TvShowRequest
+from console.schemas import TvShowRequest, TvViewRequest
 
 
 class DesktopService:
     def __init__(self, context):
         self.context = context
+        self._tv_bindings_path = context.paths.data_dir / 'tv_chart_bindings.json'
+        self._tv_bindings = {}
+        self._tv_binding_error = ''
+        try:
+            if self._tv_bindings_path.exists():
+                saved=json.loads(self._tv_bindings_path.read_text())
+                if saved.get('version')!=1 or not isinstance(saved.get('bindings'),dict):
+                    raise ValueError('图表绑定配置无效')
+                from controller.window_chart import _chart_address
+                for source,binding in saved['bindings'].items():
+                    if (not isinstance(source,str) or not isinstance(binding,dict)
+                            or not isinstance(binding.get('chart_id'),str)
+                            or not isinstance(binding.get('address'),str)
+                            or _chart_address(binding.get('address',''))!=binding.get('address')):
+                        raise ValueError('图表绑定配置无效')
+                self._tv_bindings=saved['bindings']
+        except (OSError,ValueError,TypeError) as error:
+            self._tv_binding_error=str(error)
+
+    @asynccontextmanager
+    async def _chart_scope(self, origin, token, *, layout=None):
+        from controller.window_chart import same_window_chart, layout_chart
+        if layout is not None:
+            address = self._TV_FOCUS_CHART_URL if layout == 'focus' else self._TV_CHART_URL
+            async with layout_chart(config.CDP_HTTP_ENDPOINT, origin, token, address) as selected:
+                yield selected
+            return
+        if self._tv_binding_error:
+            raise RuntimeError(self._tv_binding_error+'，请重新绑定图表')
+        options={'bindings':self._tv_bindings} if self._tv_bindings else {}
+        async with same_window_chart(config.CDP_HTTP_ENDPOINT,origin,token,**options) as selected:
+            yield selected
+
+    async def api_tv_charts(self, trader=None):
+        if trader!='master':
+            raise HTTPException(403,'请使用本机扩展绑定自己的图表')
+        from controller.window_chart import _pages,_chart_address
+        pages=await asyncio.to_thread(_pages,config.CDP_HTTP_ENDPOINT)
+        return {'charts':[{'id':p['id'],'title':p.get('title') or _chart_address(p.get('url','')),
+                           'address':_chart_address(p.get('url',''))}
+                          for p in pages if _chart_address(p.get('url',''))]}
+
+    async def api_tv_bind(self, req, trader=None, *, origin):
+        if trader!='master':
+            raise HTTPException(403,'请使用本机扩展绑定自己的图表')
+        from controller.window_chart import bind_console_chart
+        try:
+            async with asyncio.timeout(10):
+                binding=await bind_console_chart(config.CDP_HTTP_ENDPOINT,origin,req.source_token,req.target_id)
+            updated={**self._tv_bindings,binding['source_id']:{'chart_id':binding['chart_id'],'address':binding['address']}}
+            self._save_tv_bindings(updated)
+            return {'ok':True,'binding':binding}
+        except Exception as error:
+            return {'ok':False,'reason':str(error) or type(error).__name__}
+
+    def _save_tv_bindings(self, bindings):
+        self._tv_bindings_path.parent.mkdir(parents=True, exist_ok=True)
+        pending = self._tv_bindings_path.with_suffix('.tmp')
+        pending.write_text(json.dumps({'version': 1, 'bindings': bindings}, ensure_ascii=False))
+        pending.replace(self._tv_bindings_path)
+        self._tv_bindings = bindings
+        self._tv_binding_error = ''
+
+    async def api_tv_entry_markers(self, req, trader=None, *, origin):
+        from console.services.chart_entries import entry_markers
+        if trader != "master":
+            raise HTTPException(403, "请使用本机Chrome扩展显示自己的图表标记")
+        entries = entry_markers(self.context.order_mgr.list_lots(), now=time.time())
+        source = (Path(__file__).resolve().parents[2] / "extensions/autotrade-tv/chart-grid.js").read_text()
+        results = []
+        for layout in ('candidates', 'focus'):
+            try:
+                async with asyncio.timeout(10):
+                    async with self._chart_scope(origin, req.source_token, layout=layout) as (tv, address):
+                        script = "(async()=>{" + source + "\nreturn await markTradingViewEntries(" + json.dumps(entries) + "," + json.dumps(address) + ");})()"
+                        result = await asyncio.wait_for(tv.evaluate(script), timeout=8)
+                        results.append({'layout': layout, **result})
+            except Exception as error:
+                results.append({'layout': layout, 'ok': False, 'reason': str(error) or 'TV仓位线段响应超时'})
+        return {'ok': all(r.get('ok') for r in results), 'marked': sum(r.get('marked', 0) for r in results),
+                'layouts': results, 'reason': '；'.join(r.get('reason') or '仓位线段未全部确认' for r in results if not r.get('ok'))}
+
+    async def api_tv_grid(self, req, trader=None, *, origin):
+        """Mirror ranks only in the originating console's resolved chart."""
+        import re
+        if trader != "master":
+            raise HTTPException(403, "请使用本机 Chrome 扩展控制自己的 TradingView 图表")
+        symbols = [s.strip().upper() for s in req.symbols]
+        if any(not re.fullmatch(r"[A-Z0-9_.-]{1,24}:[A-Z0-9_.!+/-]{1,32}", s) for s in symbols):
+            raise HTTPException(400, "宫格标的代码无效")
+        count = 6 if req.layout == 'focus' else 8
+        label = 'auto_trade2 六宫格' if req.layout == 'focus' else 'auto_trade 八宫格'
+        source = (Path(__file__).resolve().parents[2] / "extensions/autotrade-tv/chart-grid.js").read_text()
+        try:
+            async with asyncio.timeout(10):
+                async with self._chart_scope(origin, req.source_token, layout=req.layout) as (tv, address):
+                    for attempt in range(16):
+                        script = "(()=>{" + source + "\nreturn inspectTradingViewGrid(" + json.dumps(symbols) + "," + json.dumps(address) + "," + ("true" if attempt == 0 else "false") + ",null," + json.dumps(req.layout) + ");})()"
+                        result = await asyncio.wait_for(tv.evaluate(script), timeout=3)
+                        if not isinstance(result, dict):
+                            return {"ok": False, "reason": label+"未返回可核对的状态"}
+                        if not result.get("pending"):
+                            if result.get('ok') and (len(result.get('panes', [])) != count or not all(p.get('ok') for p in result['panes'])):
+                                return {'ok': False, 'reason': label+'未逐格确认'}
+                            return {**result, 'layout': req.layout}
+                        await asyncio.sleep(.2)
+                    return {**result, "ok": False, "reason": label+"未全部确认切换，请检查标的同步分组后重试"}
+        except TimeoutError:
+            return {"ok": False, "reason": "TV图表响应超时，请切到TV确认后点同步重试"}
+        except Exception as error:
+            return {"ok": False, "reason": str(error)}
 
     async def _tv_startup_check(self) -> None:
         """启动首要任务：TV 数据源就绪检查，正常/异常都给出提示确认（一次性）。
@@ -315,59 +426,49 @@ class DesktopService:
         await asyncio.to_thread(_activate)
 
     async def _workspace_ensure_browser(self) -> Optional[str]:
-        """准备专用 Chrome，并组合为左控制台、右 TV 的原生分屏。"""
-        if not await self.context.desktop._cdp_alive():
-            logger.info("启动交易工作区浏览器（控制台 + TradingView）...")
+        """Prepare three independent windows without reloading existing pages."""
+        if not await self._cdp_alive():
+            logger.info('启动交易工作区浏览器（auto_trade 八格 / auto_trade2 六格 / 控制台）...')
             proc = await asyncio.create_subprocess_exec(
-                "open",
-                "-na",
-                "Google Chrome",
-                "--args",
-                "--remote-debugging-port=9222",
-                f"--user-data-dir={self.context.desktop._TV_CHROME_PROFILE}",
-                "--no-first-run",
-                "--new-window",
-                self.context.desktop._CONSOLE_URL,
-                self.context.desktop._TV_CHART_URL,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
+                'open', '-na', 'Google Chrome', '--args',
+                '--remote-debugging-port=9222',
+                f'--user-data-dir={self._TV_CHROME_PROFILE}',
+                '--no-first-run', '--new-window', self._TV_CHART_URL,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
             )
             await proc.wait()
             for _ in range(15):
                 await asyncio.sleep(2)
-                if await self.context.desktop._cdp_alive():
+                if await self._cdp_alive():
                     break
             else:
-                return "调试 Chrome 的 9222 端口 30s 未就绪"
-        elif not await asyncio.to_thread(
-            self.context.desktop._cdp_page_id, self.context.desktop._CONSOLE_URL
-        ):
-            await self.context.desktop._cdp_open_tab(self.context.desktop._CONSOLE_URL)
-        not_ready = await self.context.desktop._tv_ensure_browser()
-        if not_ready:
-            return not_ready
-        if not await asyncio.to_thread(
-            self.context.desktop._cdp_page_id, self.context.desktop._CONSOLE_URL
-        ):
-            await self.context.desktop._cdp_open_tab(self.context.desktop._CONSOLE_URL)
+                return '调试 Chrome 的 9222 端口 30s 未就绪'
         try:
-            await self.context.desktop._activate_console_tab()
-        except Exception as e:
-            logger.info("控制台标签页置前失败（静默）: %s", e)
-        if self.context.desktop._CONSOLE_AUTO_SPLIT_BROWSER:
-            try:
-                await self.context.desktop._workspace_arrange_split()
-                self.context.lifecycle._startup_state["split_ready"] = True
-                self.context.lifecycle._startup_state["split_error"] = ""
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                # Do not retry native menu actions forever or hold the trading
-                # readiness gate closed for a desktop permission problem.
-                self.context.lifecycle._startup_state["split_ready"] = False
-                reason = str(e).strip() or f"自动分屏失败（{type(e).__name__}）"
-                self.context.lifecycle._startup_state["split_error"] = reason
-                logger.warning("浏览器已打开，自动分屏未完成: %s", reason)
+            from controller.browser_workspace import ensure_independent_windows
+            if not self._CONSOLE_AUTO_ARRANGE_WINDOWS:
+                return None
+            async with asyncio.timeout(20):
+                targets = await ensure_independent_windows(config.CDP_HTTP_ENDPOINT,
+                    [self._TV_CHART_URL, self._TV_FOCUS_CHART_URL, self._CONSOLE_URL])
+            # Chrome can restore new target IDs after restart. Bind only the
+            # exact dedicated console and known eight-pane layout.
+            source = targets[self._CONSOLE_URL]
+            updated = {source: {'chart_id': targets[self._TV_CHART_URL], 'address': self._TV_CHART_URL}}
+            self._save_tv_bindings(updated)
+            self.context.lifecycle._startup_state['split_ready'] = True
+            self.context.lifecycle._startup_state['split_error'] = ''
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            # Window arrangement is display-only; never hold trading readiness.
+            reason = str(error).strip() or type(error).__name__
+            self.context.lifecycle._startup_state['split_ready'] = False
+            self.context.lifecycle._startup_state['split_error'] = reason
+            logger.warning('独立图表工作区未完成: %s', reason)
+        try:
+            await self._activate_console_tab()
+        except Exception as error:
+            logger.info('控制台标签页置前失败: %s', error)
         return None
 
     async def _workspace_arrange_split(self) -> None:
@@ -427,262 +528,83 @@ class DesktopService:
                 return
             await asyncio.sleep(1)
 
-    async def _tv_show_symbol(self, symbol: str) -> dict:
-        """切第一个 pane 到该标的 + 读回校验 + 窗口置前。
-        前置：CDP 不在线先启动浏览器并定位到 TradingView（_tv_ensure_browser）。"""
+    async def _tv_show_symbol(self, symbol: str, *, origin=None, source_token=None) -> dict:
+        """Switch only visual cell 6, using the same geometry as full-grid sync."""
+        import re
         from controller.tv_cdp import TradingViewCDPController
+        from controller.window_chart import same_window_chart
 
-        not_ready = await self.context.desktop._tv_ensure_browser()
-        if not_ready:
-            logger.warning("TV 不可用: %s", not_ready)
-            return {"ok": False, "reason": not_ready}
-        report = {}
-        for attempt in range(3):
-            try:
-                async with TradingViewCDPController() as tv:
-                    report = json.loads(
-                        await asyncio.wait_for(
-                            tv.evaluate(
-                                self.context.desktop._TV_SHOW_JS.replace(
-                                    "%SYMBOL%", json.dumps(symbol)
-                                )
-                            ),
-                            timeout=10,
-                        )
-                    )
-            except Exception as e:
-                logger.info("TV 切标的不可用（静默降级）: %s", e)
-                return {"ok": False, "reason": str(e)}
-            if report.get("fatal") or report.get("ok"):
-                break
-            if attempt < 2:
-                await asyncio.sleep(2)
-        if report.get("fatal"):
-            logger.info("TV 切标的失败: %s", report["fatal"])
-            return {"ok": False, "reason": report["fatal"]}
+        symbol = symbol.strip().upper()
+        if not re.fullmatch(r"(?:[A-Z0-9_.-]{1,24}:)?[A-Z0-9_.!+/-]{1,32}", symbol):
+            return {"ok": False, "reason": "标的代码无效"}
+        if source_token is None:
+            not_ready = await self.context.desktop._tv_ensure_browser()
+            if not_ready:
+                logger.warning("TV 不可用: %s", not_ready)
+                return {"ok": False, "reason": not_ready}
+        source = (Path(__file__).resolve().parents[2] / "extensions/autotrade-tv/chart-grid.js").read_text()
+
+        async def switch(tv, address):
+            expected = None
+            for attempt in range(16):
+                script = "(()=>{" + source + "\nreturn inspectTradingViewGrid(" + ",".join((
+                    json.dumps(symbol), json.dumps(address),
+                    "true" if attempt == 0 else "false", json.dumps(expected),
+                )) + ");})()"
+                result = await asyncio.wait_for(tv.evaluate(script), timeout=3)
+                if not isinstance(result, dict):
+                    return {"ok": False, "reason": "TradingView 未返回可核对的第六格状态"}
+                if not result.get("pending"):
+                    return result
+                if expected is None:
+                    expected = [pane["symbol"] for pane in result["panes"]]
+                await asyncio.sleep(.2)
+            return {**result, "ok": False, "pending": False,
+                    "reason": "TradingView 第六格未确认切换到目标标的"}
+
+        try:
+            async with asyncio.timeout(10):
+                if source_token is None:
+                    from controller.window_chart import _pages, _chart_address
+                    pages = await asyncio.to_thread(_pages, config.CDP_HTTP_ENDPOINT)
+                    candidates = [p for p in pages if _chart_address(p.get('url', '')) == self._TV_CHART_URL]
+                    if len(candidates) != 1:
+                        return {'ok': False, 'reason': '请只打开一个 auto_trade 八宫格窗口'}
+                    target_id = candidates[0]['id']
+                    async with TradingViewCDPController(config.CDP_HTTP_ENDPOINT, target_id=target_id) as tv:
+                        address = await tv.evaluate("location.origin + location.pathname")
+                        if address != self._TV_CHART_URL:
+                            return {'ok': False, 'reason': '八宫格地址已变化，未切换标的'}
+                        report = await switch(tv, address)
+                else:
+                    async with self._chart_scope(origin, source_token) as (tv, address):
+                        report = await switch(tv, address)
+        except TimeoutError:
+            return {"ok": False, "reason": "TV 第六格响应超时，请重试"}
+        except Exception as error:
+            logger.info("TV 第六格切换失败: %s", error)
+            return {"ok": False, "reason": str(error)}
         if report.get("ok"):
-            logger.info(
-                "TV 第一个 pane 已切到 %s（%s → %s）",
-                symbol,
-                report.get("before"),
-                report.get("after"),
-            )
-            await self.context.desktop._tv_activate_window()
-            return {"ok": True, "shown": report.get("after")}
-        logger.warning(
-            "TV 切标的读回不一致: 目标 %s 读回 %s", symbol, report.get("after")
-        )
-        return {
-            "ok": False,
-            "reason": f"读回不一致: {report.get('after')}",
-            "shown": report.get("after"),
-        }
+            logger.info("TV 第六格已切到 %s，读回 %s", symbol, report.get("shown"))
+            if source_token is None:
+                from controller.browser_workspace import activate_page
+                await asyncio.to_thread(activate_page, config.CDP_HTTP_ENDPOINT, target_id)
+        return report
 
     async def api_tv_show(self, req: TvShowRequest, trader: str = None) -> dict:
-        """选股点选联动：本机 TV 桌面端视觉左上角第一个 pane 切到该标的。
-        幂等快速（多客户端同时点各自切同一台 TV，单机单屏本质）；失败静默。"""
+        """Control only the host's chart, for its local console."""
+        if trader != "master":
+            raise HTTPException(403, "请使用本机 Chrome 扩展控制自己的 TradingView 图表")
         symbol = req.symbol.strip()
         if not symbol:
             raise HTTPException(400, "symbol 不能为空")
         return await self.context.desktop._tv_show_symbol(symbol)
 
-    def _tv_load_pane_map(self) -> dict:
-        """trader → {pane, last_used} 映射；缺文件/损坏返回 {}。"""
-        try:
-            payload = json.loads(
-                self.context.desktop._TV_PANES_PATH.read_text(encoding="utf-8")
-            )
-            if isinstance(payload, dict):
-                return payload
-        except FileNotFoundError:
-            pass
-        except (OSError, ValueError) as e:
-            logger.warning("tv_panes.json 加载失败: %s", e)
-        return {}
-
-    def _tv_save_pane_map(self, m: dict) -> None:
-        try:
-            self.context.desktop._TV_PANES_PATH.parent.mkdir(
-                parents=True, exist_ok=True
-            )
-            tmp = self.context.desktop._TV_PANES_PATH.with_suffix(".json.tmp")
-            tmp.write_text(
-                json.dumps(m, ensure_ascii=False, indent=1), encoding="utf-8"
-            )
-            os.replace(tmp, self.context.desktop._TV_PANES_PATH)
-        except OSError:
-            logger.exception("tv_panes.json 落盘失败")
-
-    def _tv_assign_pane(self, trader: str, pane_count: int) -> Optional[int]:
-        """给客户端分配画面位：已有映射且仍有效 → 复用；否则取最小空位
-        （pane 0 是 master 的）；全满时先回收两小时未用的旧映射，仍无位 → None。"""
-        now = time.time()
-        m = self.context.desktop._tv_load_pane_map()
-        row = m.get(trader)
-        if isinstance(row, dict) and 0 < int(row.get("pane", 0)) < pane_count:
-            row["last_used"] = now
-            self.context.desktop._tv_save_pane_map(m)
-            return int(row["pane"])
-        m = {
-            k: v
-            for k, v in m.items()
-            if isinstance(v, dict) and 0 < int(v.get("pane", 0)) < pane_count
-        }
-        used = {int(v["pane"]) for v in m.values()}
-        for idx in range(1, pane_count):
-            if idx not in used:
-                m[trader] = {"pane": idx, "last_used": now}
-                self.context.desktop._tv_save_pane_map(m)
-                return idx
-        stale = sorted(m.items(), key=lambda kv: kv[1].get("last_used", 0))
-        if (
-            stale
-            and now - stale[0][1].get("last_used", 0)
-            > self.context.desktop._TV_PANE_STALE_S
-        ):
-            old_trader, old = stale[0]
-            idx = int(old["pane"])
-            del m[old_trader]
-            m[trader] = {"pane": idx, "last_used": now}
-            self.context.desktop._tv_save_pane_map(m)
-            logger.info("TV 画面位回收：%s 的 pane %d 转给 %s", old_trader, idx, trader)
-            return idx
-        self.context.desktop._tv_save_pane_map(m)
-        return None
-
-    async def _tv_list_panes(self) -> Optional[list]:
-        """读当前可见 pane 列表 [{symbol, rect}]（视觉行优先）；失败返回 None。"""
-        from controller.tv_cdp import TradingViewCDPController
-
-        try:
-            async with TradingViewCDPController() as tv:
-                return json.loads(
-                    await asyncio.wait_for(
-                        tv.evaluate(self.context.desktop._TV_PANES_JS), timeout=10
-                    )
-                )
-        except Exception as e:
-            logger.info("TV pane 列表读取失败（静默）: %s", e)
-            return None
-
-    async def _tv_view_for_trader(self, symbol: str, trader: str) -> dict:
-        """客户端看盘主流程：确保浏览器 → 分配画面位 → 切该 pane → 等数据就绪
-        → 按 pane rect 裁剪截图回传。每 pane 一把锁防并发切换同一格。"""
-        from controller.tv_cdp import TradingViewCDPController
-
-        not_ready = await self.context.desktop._tv_ensure_browser()
-        if not_ready:
-            return {"ok": False, "reason": not_ready}
-        panes = await self.context.desktop._tv_list_panes()
-        if not panes:
-            return {"ok": False, "reason": "TV 无可用画面（图表未加载或宫格为空）"}
-        idx = self.context.desktop._tv_assign_pane(trader, len(panes))
-        if idx is None:
-            return {
-                "ok": False,
-                "code": "pane_full",
-                "reason": f"画面位已满（TV 当前 {len(panes)} 格，master 占 1 格，客户端画面位已全部分完）",
-            }
-        lock = self.context.desktop._tv_pane_locks.setdefault(idx, asyncio.Lock())
-        async with lock:
-            report = {}
-            try:
-                async with TradingViewCDPController() as tv:
-                    show_js = self.context.desktop._TV_PANE_SHOW_JS.replace(
-                        "%PANE%", str(idx)
-                    ).replace("%SYMBOL%", json.dumps(symbol))
-                    for attempt in range(3):
-                        report = json.loads(
-                            await asyncio.wait_for(tv.evaluate(show_js), timeout=10)
-                        )
-                        if report.get("fatal") or report.get("ok"):
-                            break
-                        if attempt < 2:
-                            await asyncio.sleep(2)
-                    if report.get("fatal"):
-                        return {"ok": False, "reason": report["fatal"]}
-                    if not report.get("ok"):
-                        return {
-                            "ok": False,
-                            "reason": f"读回不一致: {report.get('after')}",
-                        }
-                    if report.get("switched"):
-                        ticker = symbol.split(":")[-1].upper()
-                        ready_js = self.context.desktop._TV_PANE_READY_JS.replace(
-                            "%PANE%", str(idx)
-                        ).replace("%TICKER%", json.dumps(ticker))
-                        for _ in range(12):
-                            ok = await asyncio.wait_for(
-                                tv.evaluate(ready_js), timeout=5
-                            )
-                            if str(ok) == "true":
-                                break
-                            await asyncio.sleep(1)
-                        await asyncio.sleep(1.2)
-                    rect = report["rect"]
-                    shot = await asyncio.wait_for(
-                        tv.screenshot(
-                            quality=70,
-                            clip={
-                                "x": rect["x"],
-                                "y": rect["y"],
-                                "width": rect["w"],
-                                "height": rect["h"],
-                            },
-                        ),
-                        timeout=15,
-                    )
-            except Exception as e:
-                logger.info("TV 客户端看盘失败（%s pane %d）: %s", trader, idx, e)
-                return {"ok": False, "reason": str(e)}
-        logger.info(
-            "TV 看盘：%s → pane %d 切到 %s（截图 %d KB）",
-            trader,
-            idx,
-            report.get("after"),
-            len(shot) // 1024,
-        )
-        return {
-            "ok": True,
-            "pane": idx,
-            "shown": report.get("after"),
-            "image": base64.b64encode(shot).decode("ascii"),
-        }
-
-    async def api_tv_view(self, req: TvShowRequest, trader: str = None) -> dict:
-        """看盘统一入口：master → 只切 pane 0 不截图（面前就是屏幕）；
-        已审批客户端 → 专属 pane 切标的 + 截图回传。"""
+    async def api_tv_view(self, req: TvViewRequest, trader: str = None, *, origin: str) -> dict:
+        if trader != "master":
+            raise HTTPException(403, "请使用本机 Chrome 扩展控制自己的 TradingView 图表")
         symbol = req.symbol.strip()
-        if not symbol:
-            raise HTTPException(400, "symbol 不能为空")
-        if trader == "master":
-            return {
-                **await self.context.desktop._tv_show_symbol(symbol),
-                "master": True,
-            }
-        return await self.context.desktop._tv_view_for_trader(symbol, trader)
-
-    async def _tv_view_startup_check(self):
-        """启动校验 TV 画面位（布局由人工保证，这里只盘点并在快照里展示）。"""
-
-        async def _check():
-            if not await self.context.desktop._cdp_alive():
-                self.context.desktop._tv_view_info = {
-                    "panes": 0,
-                    "slots": 0,
-                    "checked_at": time.time(),
-                    "note": "CDP 离线",
-                }
-                return
-            panes = await self.context.desktop._tv_list_panes()
-            n = len(panes or [])
-            self.context.desktop._tv_view_info = {
-                "panes": n,
-                "slots": max(0, n - 1),
-                "checked_at": time.time(),
-            }
-            logger.info(
-                "TV 画面位校验：%d 格（master 1 + 客户端位 %d）", n, max(0, n - 1)
-            )
-
-        self.context.tasks.start("check", lambda: _check())
+        if not symbol or not req.source_token:
+            raise HTTPException(400, "缺少标的或当前标签页标识，请刷新 AutoTrade 后重试")
+        result = await self.context.desktop._tv_show_symbol(symbol, origin=origin, source_token=req.source_token)
+        return {**result, "master": True}

@@ -16,6 +16,7 @@ function candle(row) {
 }
 
 function createLocalIndicators({ onError = () => {}, onReady = () => {}, onResult = () => {},
+  intervalSeconds = 300, barLimit = BAR_LIMIT, minBars = MIN_BARS,
   workers = Math.min(8, Math.max(1, os.availableParallelism() - 2)),
   makeWorker = () => new Worker(path.join(__dirname, 'pinets_live_worker.js')) } = {}) {
   const states = new Map();
@@ -28,7 +29,7 @@ function createLocalIndicators({ onError = () => {}, onReady = () => {}, onResul
     pending.delete(symbol);
     const slot = states.get(symbol)?.slot ?? slots[states.size % slots.length];
     states.set(symbol, { slot, revision: 0, publishedRevision: 0, nextAt: 0,
-      history: {}, confirmed: {}, busy: false });
+      history: {}, confirmed: {}, confirmedHistoryKeys: {}, busy: false });
   }
 
   function observe(symbol, periods, infos, raw, daily = [], now = Date.now()) {
@@ -37,14 +38,14 @@ function createLocalIndicators({ onError = () => {}, onReady = () => {}, onResul
     const state = states.get(symbol);
     const metadata = { timezone: infos?.timezone, minmove: infos?.minmov ?? infos?.minmove,
       pricescale: infos?.pricescale, type: infos?.type, session: infos?.subsession_id };
-    const bars = periods.slice(0, BAR_LIMIT).reverse().map(candle);
+    const bars = periods.slice(0, barLimit).reverse().map(candle);
     const last = bars.at(-1);
     const priceKey = JSON.stringify(last);
     if (state.priceKey !== priceKey) {
       state.priceKey = priceKey;
       state.observedAt = now;
     }
-    if (bars.length < MIN_BARS || !metadata.timezone || !(metadata.minmove > 0) || !(metadata.pricescale > 0)) return;
+    if (bars.length < minBars || !metadata.timezone || !(metadata.minmove > 0) || !(metadata.pricescale > 0)) return;
     // The daily study reads high[1]/low[1]. The current daily bar's
     // changing prices cannot change those outputs, but a new day can.
     const dailyKey = JSON.stringify([daily.slice(0, -1), daily.at(-1)?.time]);
@@ -54,7 +55,7 @@ function createLocalIndicators({ onError = () => {}, onReady = () => {}, onResul
     state.key = key;
     const urgent = !state.latest || state.latest.raw.bar_c?.time !== raw.bar_c?.time;
     const job = { symbol, state, revision: ++state.revision, historyKey, dailyKey, urgent,
-      observedAt: state.observedAt, raw: { ...raw }, dataset: { symbol, bars, daily, metadata } };
+      observedAt: state.observedAt, raw: { ...raw }, dataset: { symbol, bars, daily, metadata, intervalSeconds } };
     state.latest = job;
     pending.set(symbol, job);
     pump();
@@ -93,13 +94,14 @@ function createLocalIndicators({ onError = () => {}, onReady = () => {}, onResul
       state.busy = true;
       state.nextAt = now + REFRESH_MS;
       slot.job = candidate;
-      candidate.history = state.historyKey !== candidate.historyKey || !state.history.e9 || !state.history.trend ||
-        (candidate.dataset.daily.length > 0 && !state.history.attack);
+      const missing = intervalSeconds === 60 ? !state.history.vwap_pullback :
+        !state.history.e9 || !state.history.trend || (candidate.dataset.daily.length > 0 && !state.history.attack);
+      candidate.history = state.historyKey !== candidate.historyKey || missing;
       const previous = state.completed;
       const oldBars = previous?.dataset.bars;
       const bars = candidate.dataset.bars;
       const advance = candidate.history && oldBars && previous.dailyKey === candidate.dailyKey &&
-        oldBars.at(-1).time + 300 === bars.at(-1).time &&
+        oldBars.at(-1).time + intervalSeconds === bars.at(-1).time &&
         JSON.stringify(oldBars.slice(oldBars.length + 1 - bars.length, -1)) === JSON.stringify(bars.slice(0, -2));
       try {
         if (!slot.worker) startWorker(slot);
@@ -143,9 +145,11 @@ function createLocalIndicators({ onError = () => {}, onReady = () => {}, onResul
       state.history = history;
       state.completed = { ...job, outputs };
       const confirmedKey = JSON.stringify(candle(job.raw.bar_c));
-      if (state.confirmedKey !== confirmedKey) state.confirmed = {};
+      if (state.confirmedKey !== confirmedKey) {state.confirmed = {};state.confirmedHistoryKeys={};}
       state.confirmedKey = confirmedKey;
-      for (const [key, rows] of Object.entries(outputs)) state.confirmed[key] = rows.slice(1);
+      for (const [key, rows] of Object.entries(outputs)) {
+        state.confirmed[key] = rows.slice(1);state.confirmedHistoryKeys[key]=job.historyKey;
+      }
       onResult(symbol, { receivedAt: job.observedAt, completedAt: Date.now(), outputs });
     }
     if (Object.keys(errors).length && !pending.has(symbol) && state.latest.revision === job.revision) {
@@ -169,11 +173,20 @@ function createLocalIndicators({ onError = () => {}, onReady = () => {}, onResul
     const outputs = {};
     const confirmed = base.bar_c && JSON.stringify(candle(base.bar_c)) === state?.confirmedKey
       ? state.confirmed : {};
-    const live = coherent && now < (base.bar.time + 300) * 1000 ? completed.outputs : {};
+    const live = coherent && now < (base.bar.time + intervalSeconds) * 1000 ? completed.outputs : {};
     for (const key of new Set([...Object.keys(live), ...Object.keys(confirmed)])) {
       outputs[key] = [live[key]?.[0] ?? null, ...(confirmed[key] || [])];
     }
     return { base, outputs, observedAt: coherent ? completed.observedAt : state?.observedAt };
+  }
+
+  function confirmedHistory(symbol,raw,key='trend'){
+    const state=states.get(symbol),job=state?.completed;
+    if(!job||!raw.bar_c||job.historyKey!==state.latest?.historyKey
+      ||state.confirmedHistoryKeys[key]!==job.historyKey
+      ||JSON.stringify(candle(raw.bar_c))!==state.confirmedKey)return null;
+    const rows=state.confirmed[key];
+    return rows?.length?{historyKey:job.historyKey,bars:job.dataset.bars,rows}:null;
   }
 
   const interval = setInterval(pump, 50);
@@ -188,7 +201,7 @@ function createLocalIndicators({ onError = () => {}, onReady = () => {}, onResul
       return worker?.terminate();
     }));
   }
-  return { reset, observe, snapshot, close };
+  return { reset, observe, snapshot, confirmedHistory, close };
 }
 
 module.exports = { BAR_LIMIT, createLocalIndicators, candle };

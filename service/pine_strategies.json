@@ -70,6 +70,57 @@
         "short_stop": "short_stop"
       },
       "execution_profile": "single_entry"
+    },
+    {
+      "id": "golden_strategy",
+      "name": "黄金策略",
+      "indicator_id": "local:golden_signal",
+      "local_only": true,
+      "realtime_key": "golden",
+      "confirmed_key": "golden_c",
+      "plots": {
+        "entry_signal": "Entry_Signal",
+        "direction": "Direction",
+        "entry_price": "Entry_Price",
+        "long_stop": "Long_Stop",
+        "short_stop": "Short_Stop",
+        "atr": "ATR"
+      },
+      "fields": {
+        "entry_signal": "entry_signal",
+        "direction": "direction",
+        "entry_price": "entry_price",
+        "long_stop": "long_stop",
+        "short_stop": "short_stop"
+      },
+      "execution_profile": "entry_bar_breakeven"
+    },
+    {
+      "id": "vwap_outer_pullback",
+      "name": "VWAP 外沿回踩",
+      "indicator_id": "local:vwap_outer_pullback",
+      "local_only": true,
+      "interval_seconds": 60,
+      "startup_candidate_field": "candidate_direction",
+      "realtime_key": "vwap_pullback",
+      "confirmed_key": "vwap_pullback_c",
+      "plots": {
+        "entry_signal": "Entry_Signal",
+        "direction": "Direction",
+        "entry_price": "Entry_Price",
+        "long_stop": "Long_Stop",
+        "short_stop": "Short_Stop",
+        "atr": "ATR",
+        "candidate_direction": "Candidate_Direction"
+      },
+      "fields": {
+        "entry_signal": "entry_signal",
+        "direction": "direction",
+        "entry_price": "entry_price",
+        "long_stop": "long_stop",
+        "short_stop": "short_stop"
+      },
+      "execution_profile": "single_entry"
     }
   ]
 }

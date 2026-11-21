@@ -1,6 +1,7 @@
 """monitoring application functions and owned state. No console.app dependency."""
 
 from engine.execution_rules import fvg_reverse_action
+from execution.external_guard import is_external_guard_exempt
 from typing import Optional
 from typing import Set
 import asyncio
@@ -87,27 +88,28 @@ class MonitoringService:
             lot["symbol"].split(":")[-1].upper()
             for lot in self.context.order_mgr.list_lots()
         }
-        positions, trades = (
-            await self.context.gateway.positions(),
-            await self.context.gateway.trade_map(),
-        )
+        alerts_only = (not config.EXTERNAL_ORDER_CLEANUP_ENABLED
+                       or getattr(self.context.order_mgr, "external_adoption_enabled", False))
+        positions = await self.context.gateway.positions()
+        trades = (await self.context.gateway.open_orders_snapshot() if alerts_only
+                  else await self.context.gateway.trade_map())
         if positions is None or trades is None:
             logger.warning("外部清理跳过：IBKR 订单或持仓快照不完整")
             stats["failed"] += 1
             return stats
         accounts = set(await self.context.gateway.fa_accounts())
         legacy_ids = self.context.monitoring._legacy_tool_order_ids()
-        if (not config.EXTERNAL_ORDER_CLEANUP_ENABLED
-                or getattr(self.context.order_mgr, "external_adoption_enabled", False)):
+        if alerts_only:
             alerts = []
-            for trade in list(trades.values()):
-                if trade.isDone():
+            for trade in trades:
+                if trade.isDone() or is_external_guard_exempt(trade.contract.symbol):
                     continue
                 order = trade.order
                 order_id = int(order.orderId)
                 if (
                     self.context.gateway.is_tool_order_id(order_id)
                     or order_id in legacy_ids
+                    or getattr(order, "permId", None) in legacy_ids
                 ):
                     continue
                 if not self.context.monitoring._external_account_ok(order, accounts):
@@ -125,9 +127,11 @@ class MonitoringService:
             tool_qty = {
                 g["symbol"]: g["net_qty"] for g in self.context.order_mgr.aggregate()
             }
-            for ticker in sorted(set(positions) | set(tool_qty)):
-                residual = positions.get(ticker, 0) - tool_qty.get(ticker, 0)
-                if abs(residual) < 1:
+            for ticker, broker_qty in sorted(positions.items()):
+                if is_external_guard_exempt(ticker):
+                    continue
+                residual = broker_qty - tool_qty.get(ticker, 0)
+                if abs(residual) < 1 or residual * broker_qty <= 0:
                     continue
                 alerts.append(
                     {
@@ -154,6 +158,9 @@ class MonitoringService:
                 )
             return stats
         for trade in list(trades.values()):
+            if is_external_guard_exempt(trade.contract.symbol):
+                stats["skipped"] += 1
+                continue
             if trade.isDone():
                 continue
             order = trade.order
@@ -217,6 +224,9 @@ class MonitoringService:
             g["symbol"]: g["net_qty"] for g in self.context.order_mgr.aggregate()
         }
         for ticker in sorted(set(positions) | set(tool_qty)):
+            if is_external_guard_exempt(ticker):
+                stats["skipped"] += 1
+                continue
             residual = positions.get(ticker, 0) - tool_qty.get(ticker, 0)
             if abs(residual) < 1:
                 continue
@@ -726,6 +736,25 @@ class MonitoringService:
                     if lot.get("state") != "ACTIVE":
                         continue
                     side = lot.get("side")
+                    if 'candidate_order_policy' in (lot.get('signal_snapshot') or {}):
+                        # Explicit per-order settings supersede the ordinary R guard,
+                        # including when its timer switch is off. Other models retain their rules.
+                        if not trading_hours or now-last_attempt.get(lot_id, 0) < 5:
+                            continue
+                        outcome = await self.context.order_mgr.protect_candidate_order(
+                            lot_id, market.get(lot.get('symbol'), {}), now=now)
+                        if outcome['action'] not in ('waiting',):
+                            last_attempt[lot_id] = now
+                        if outcome['ok'] and outcome['action'] in ('stop_updated','close_submitted'):
+                            self.context.events.record_event('candidate_order_protection',
+                                lot_id=lot_id, symbol=lot.get('symbol'), side=side, **outcome)
+                            logger.info('候选订单保护 %s %s: %s', lot_id, lot.get('symbol'), outcome)
+                        elif not outcome['ok'] and now-last_error.get(lot_id, 0) >= 30:
+                            last_error[lot_id] = now
+                            self.context.events.record_event('candidate_order_protection_failed',
+                                lot_id=lot_id, symbol=lot.get('symbol'), side=side, **outcome)
+                            logger.warning('候选订单保护暂未完成 %s: %s', lot_id, outcome)
+                        continue
                     breakout = bool((lot.get("signal_snapshot") or {}).get("opening_breakout_id"))
                     if breakout and (not lot.get("avg_fill") or not lot.get("filled_qty")):
                         continue

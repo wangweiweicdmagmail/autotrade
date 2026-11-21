@@ -5,7 +5,7 @@ import config
 import json
 import os
 from console.shared import logger
-from console.schemas import SettingsRequest
+from console.schemas import SettingsRequest, CandidateProtectionOptions
 
 
 class SettingsService:
@@ -40,8 +40,18 @@ class SettingsService:
                 encoding="utf-8",
             )
             os.replace(tmp, self.context.settings._SETTINGS_PATH)
+            return True
         except OSError:
             logger.exception("settings.json 落盘失败")
+            return False
+
+    def _candidate_order_protection(self) -> dict:
+        value = self._settings.get('candidate_order_protection')
+        try:
+            return CandidateProtectionOptions(**(value if value is not None else {})).dict()
+        except (ValueError, TypeError):
+            # An invalid persisted policy must never silently enable default exits.
+            return {'version': 0, 'error': '候选订单保护设置损坏，请重新保存'}
 
     def _stop_atr_mult(self) -> float:
         """当前全局止损 ATR 倍数（settings.json 优先，缺省回退 config.STOP_ATR_MULT）。"""
@@ -101,6 +111,7 @@ class SettingsService:
     def _settings_payload(self) -> dict:
         """全局设置当前值（GET /api/settings 与 POST 响应共用）。"""
         return {
+            "candidate_order_protection": self._candidate_order_protection(),
             "stop_atr_mult": self.context.settings._stop_atr_mult(),
             "screen_premarket_filter": self.context.settings._screen_premarket_filter(),
             "screen_opening_range_filter": self.context.settings._screen_opening_range_filter(),
@@ -123,6 +134,19 @@ class SettingsService:
         """修改全局设置并落盘 settings.json（重启后保持）。
         只更新显式传入的字段（None = 不动），至少传一个。"""
         changed = {}
+        if req.candidate_order_protection is not None:
+            if req.__fields_set__ != {'candidate_order_protection'}:
+                raise HTTPException(400, '候选保护设置请单独提交')
+            # Save before exposing the new runtime value. Roll back a disk failure.
+            previous = dict(self._settings)
+            self._settings['candidate_order_protection'] = req.candidate_order_protection.dict()
+            if not self._save_settings():
+                self._settings.clear()
+                self._settings.update(previous)
+                raise HTTPException(500, '候选保护设置保存失败，原设置继续生效')
+            changed['candidate_order_protection'] = self._settings['candidate_order_protection']
+            self.context.events.record_event('candidate_protection_settings_updated', trader=trader, **changed)
+            return {'ok': True, **self._settings_payload()}
         if req.stop_atr_mult is not None:
             if (
                 not self.context.settings._STOP_ATR_MULT_MIN

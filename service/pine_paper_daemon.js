@@ -37,7 +37,7 @@ async function main() {
   const args = parseArgs(process.argv);
   const TradingView = require('@mathieuc/tradingview');
   const { loadIndicatorWithText } = require('./pine_text');
-  const model = loadPineModels().find(m => m.id === args.model);
+  const model = loadPineModels().find(m => m.id === args.model && !m.local_only);
   if (!model) throw new Error('Unregistered Pine model');
   const creds = JSON.parse(fs.readFileSync(path.join(__dirname, 'creds.json'), 'utf8'));
   const indicator = await loadIndicatorWithText(TradingView, model.indicator_id, creds);

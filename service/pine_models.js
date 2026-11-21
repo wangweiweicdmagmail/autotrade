@@ -8,10 +8,12 @@ function loadPineModels(file = path.join(__dirname, 'pine_strategies.json')) {
   if (config.version !== 1 || !Array.isArray(config.strategies)) throw new Error('Invalid Pine model config');
   const ids = new Set(), keys = new Set();
   const reserved = new Set(['bar', 'bar_c', 'bar_c2', 'ts', 'ts_c', 'fvg', 'fvg_c', 'attack', 'attack_c',
-    'ss', 'ss_c', 'ema_9', 'ema_9_c', 'price_observed_at']);
+    'ss', 'ss_c', 'ema_9', 'ema_9_c', 'market_1m', 'price_observed_at']);
   for (const model of config.strategies) {
     if (!/^[a-z][a-z0-9_]*$/.test(model.id) || ids.has(model.id)) throw new Error('Invalid/duplicate Pine model id');
     ids.add(model.id);
+    if (![60, 300].includes(model.interval_seconds ?? 300)) throw new Error('Invalid Pine model timeframe');
+    if (model.startup_candidate_field && !model.plots[model.startup_candidate_field]) throw new Error('Missing Pine candidate plot');
     for (const key of [model.realtime_key, model.confirmed_key]) {
       if (!/^[a-z][a-z0-9_]*$/.test(key) || keys.has(key) || reserved.has(key)) throw new Error('Invalid/duplicate Pine snapshot key');
       keys.add(key);

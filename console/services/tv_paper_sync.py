@@ -4,6 +4,7 @@ import asyncio
 import json
 import math
 import os
+import config
 import re
 from pathlib import Path
 
@@ -18,6 +19,8 @@ _TV_SYMBOL = re.compile(r"[A-Z0-9_.-]+:[A-Z0-9_.!-]+")
 
 def configured_paper_account(data_dir):
     """Explicit environment overrides the local account binding (including blank)."""
+    if not config.TV_PAPER_SYNC_ENABLED:
+        return ""
     override = os.environ.get("TV_PAPER_SYNC_ACCOUNT")
     if override is not None:
         return override
@@ -245,7 +248,7 @@ class TvPaperSync:
                          paper_order_id=str(stop["id"]), paper_stop=paper_stop, live_stop=live_stop)
 
     def start(self):
-        if self.account:
+        if config.TV_PAPER_SYNC_ENABLED and self.account:
             self.context.tasks.start("tv_paper_sync", self.run)
 
     async def run(self):

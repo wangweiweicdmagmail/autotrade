@@ -2,7 +2,7 @@
 
 from fastapi import Depends
 from typing import Optional
-from console.schemas import AutoAdoptRequest, AutoRejectRequest, AutoStartRequest, AutoInstanceBreakevenRequest
+from console.schemas import AutoAdoptRequest, AutoRejectRequest, AutoStartRequest, AutoInstanceBreakevenRequest, GoldenEntryRequest
 from console.dependencies import get_services, require_trader
 from fastapi import APIRouter
 
@@ -32,6 +32,13 @@ async def api_auto_start(
     services=Depends(get_services),
 ) -> dict:
     return await services.automatic.api_auto_start(req=req, trader=trader)
+
+
+@router.post("/api/auto/golden-entry")
+async def api_golden_entry(
+    req: GoldenEntryRequest, trader: str = Depends(require_trader), *, services=Depends(get_services),
+) -> dict:
+    return await services.automatic.api_golden_entry(req, trader)
 
 
 @router.post("/api/auto/stop")

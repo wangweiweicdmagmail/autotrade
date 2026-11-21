@@ -1,0 +1,25 @@
+//@version=6
+indicator("AutoTrade Symbol Watermark", shorttitle="AT Symbol", overlay=true, behind_chart=true)
+
+// Display-only utility: no trading signals, strategy registration or extra data subscriptions.
+int fontSize = input.int(72, "字号", minval=16, maxval=160, step=4)
+int transparency = input.int(80, "文字透明度（越大越淡）", minval=0, maxval=100)
+bool useThemeColor = input.bool(true, "跟随图表主题颜色")
+color customColor = input.color(color.silver, "自定义文字颜色")
+bool boldText = input.bool(true, "粗体")
+bool showExchange = input.bool(false, "显示交易所前缀")
+
+// A table is anchored to the pane, not a bar or price: panning/zooming cannot move it.
+// Do not reset on a new day. TradingView recalculates the script when the symbol changes.
+var table watermark = table.new(position.middle_center, 1, 1, bgcolor=na, frame_width=0, border_width=0)
+
+if barstate.islast
+    string symbolText = showExchange ? syminfo.prefix + ":" + syminfo.ticker : syminfo.ticker
+    color baseColor = useThemeColor ? chart.fg_color : customColor
+    table.cell(watermark, 0, 0, symbolText,
+         text_color=color.new(baseColor, transparency),
+         text_size=fontSize,
+         text_halign=text.align_center,
+         text_valign=text.align_center,
+         text_formatting=boldText ? text.format_bold : text.format_none,
+         bgcolor=na)

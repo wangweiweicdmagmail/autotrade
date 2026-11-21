@@ -61,6 +61,81 @@ def test_local_calculation_does_not_make_an_older_price_look_fresh():
     assert c.data_health(1003, trading=True)["content_age"] == 2
 
 
+def test_rhythm_forming_display_does_not_refresh_the_trading_price_clock():
+    c=_collector();tick=_tick(bar_time=1000)
+    c._accept_tick(tick,now=1001)
+    changed=_tick(bar_time=1000)
+    changed['symbols']['NASDAQ:QQQ']['rhythm_price_1m']={
+        'bar':{'time':1020,'close':110},'price_observed_at':1051}
+    c._accept_tick(changed,now=1051)
+    assert c.latest()['NASDAQ:QQQ']['rhythm_price_1m']['bar']['close']==110
+    assert c.latest()['NASDAQ:QQQ']['price_observed_at']==1001
+    assert c.data_health(1051,trading=True)['content_age']==50
+    assert c.data_health(1051,trading=True)['trade_allowed'] is False
+
+
+def test_vwap_preserves_last_complete_frame_across_incomplete_ticks():
+    collector = RealtimeCollector(["NASDAQ:QQQ"], market_session="24h")
+    frame = {"time": 1020, "rows": [{"symbol": "NASDAQ:QQQ", "time": 1020}]}
+    collector._accept_tick({
+        "symbols": {},
+        "vwap_distribution": {"frame": frame, "progress": {"time": 1020, "ready": 1, "total": 1}},
+    }, now=1021)
+    progress = {"time": 1080, "ready": 0, "total": 1}
+    collector._accept_tick({
+        "symbols": {},
+        "vwap_distribution": {"frame": None, "progress": progress},
+    }, now=1081)
+    assert collector.latest() == {}
+    assert collector.vwap_distribution == {"frame": frame, "progress": progress}
+
+
+def test_vwap_accepts_intrabar_versions_but_never_regresses_or_accepts_partial_frames():
+    collector = RealtimeCollector(["NASDAQ:QQQ", "NASDAQ:NVDA"])
+
+    def accept(minute, revision, rows=None):
+        frame = {"time": minute, "revision": revision, "rows": rows if rows is not None else [
+            {"symbol": symbol, "time": minute, "position": revision}
+            for symbol in ["NASDAQ:QQQ", "NASDAQ:NVDA"]
+        ]}
+        collector._accept_tick({"symbols": {}, "vwap_distribution": {
+            "frame": frame, "progress": {"time": minute, "ready": len(frame["rows"]), "total": 2},
+        }}, now=minute + 5)
+        return frame
+
+    first = accept(1020, 100)
+    assert collector.vwap_distribution["frame"] is first
+    second = accept(1020, 101)
+    assert collector.vwap_distribution["frame"] is second
+    for revision in [101, 99, -1, True, "102"]:
+        accept(1020, revision)
+        assert collector.vwap_distribution["frame"] is second
+    accept(960, 100000)
+    assert collector.vwap_distribution["frame"] is second
+    accept(1080, 102, [{"symbol": "NASDAQ:QQQ", "time": 1080}])
+    assert collector.vwap_distribution["frame"] is second
+    duplicate = [{"symbol": "NASDAQ:QQQ", "time": 1080}] * 2
+    accept(1080, 102, duplicate)
+    assert collector.vwap_distribution["frame"] is second
+    mixed = [{"symbol": "NASDAQ:QQQ", "time": 1080}, {"symbol": "NASDAQ:NVDA", "time": 1020}]
+    accept(1080, 102, mixed)
+    assert collector.vwap_distribution["frame"] is second
+    third = accept(1080, 1)
+    assert collector.vwap_distribution["frame"] is third
+
+
+def test_vwap_only_changes_do_not_renew_the_trading_price_clock():
+    collector = _collector()
+    collector._accept_tick(_tick(), now=1001)
+    changed = _tick()
+    changed["vwap_distribution"] = {
+        "frame": {"time": 1020, "revision": 1000, "rows": [{"symbol": "NASDAQ:QQQ", "time": 1020}]},
+        "progress": {"time": 1020, "ready": 1, "total": 1},
+    }
+    collector._accept_tick(changed, now=1011)
+    assert collector.data_health(1011, trading=True)["content_age"] == 10
+
+
 def test_off_hours_silence_does_not_block_or_restart():
     c = _collector()
     now = time.time()

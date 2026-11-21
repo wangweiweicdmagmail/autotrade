@@ -1,7 +1,7 @@
 """OrderManager 的执行适配；风险和成交事实仍由执行层处理。"""
 
 from typing import Optional
-from domain.contracts import OrderPlan
+from domain.contracts import OrderPlan, EntryAdmissionRejected
 from engine.live_audit import decision_market_frame
 
 
@@ -51,8 +51,12 @@ class LiveBroker:
             entry_order_type=plan.entry_order_type,
             signal_snapshot=signal_snapshot,
             trader="auto",
+            **({"submission_deadline": meta["submission_deadline"], "manual_entry": meta.get("manual_entry", True)}
+               if meta and "submission_deadline" in meta else {}),
         )  # 策略引擎下单归属标记（与人工单区分）
         if lot is None:
+            if err.startswith('候选入场限制：'):
+                raise EntryAdmissionRejected(err)
             raise RuntimeError(err)
         return lot
 

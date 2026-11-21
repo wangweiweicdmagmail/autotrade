@@ -2,6 +2,7 @@ from console import schemas
 """EMA9 金字塔：3-2-1 风险预算、2R 解锁、均价与整组退出。"""
 from types import SimpleNamespace
 import pytest
+import config
 from engine.pyramid_engine import PyramidEngine
 from .conftest import run
 
@@ -357,7 +358,7 @@ def test_api_start_uses_current_risk_and_requires_e9(console_app, monkeypatch):
     market['NASDAQ:NVDA']['e9']['direction'] = -1
     with pytest.raises(app.HTTPException, match='已变化'):
         run(app.automatic.api_auto_start(req, trader='master'))
-    assert calls == [(['NASDAQ:NVDA'], 700.0, {'NASDAQ:NVDA': 1})] * 3
+    assert calls == [(['NASDAQ:NVDA'], config.RISK_PER_TRADE_USD, {'NASDAQ:NVDA': 1})] * 3
     assert result['params']['risk_ratios'] == [1.0, 2.0 / 3.0, 1.0 / 3.0]
 
 def test_api_start_rejects_missing_e9(console_app, monkeypatch):

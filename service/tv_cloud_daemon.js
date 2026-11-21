@@ -1,6 +1,6 @@
 /**
- * 生产路径从 TradingView 分批订阅 5 分钟 K 线和日线，在 PineTS worker
- * 中计算七个指标。stdout 每秒发布原有 Tick JSON。TV Study 只用于显式的
+ * 生产路径从 TradingView 分批订阅 5 分钟 K 线、常规时段 1 分钟 K 线和日线，在 PineTS worker
+ * 中计算指标。stdout 每秒发布原有 Tick JSON。TV Study 只用于显式的
  * --ema7-shadow-only 和 --benchmark-study 诊断入口。
  */
 'use strict';
@@ -8,13 +8,18 @@
 const fs = require('fs');
 const path = require('path');
 const TradingView = require('@mathieuc/tradingview');
+const { createMarketClient } = require('./tv_market_proxy');
 const { loadIndicatorWithText } = require('./pine_text.js');
 const {createPriceUpdater, isPriceUpdate, chartSession, previousRegularRange} = require('./chart_snapshot.js');
 const { chartRetryReason, studyRetryReason, retryDelay } = require('./chart_health.js');
 const { breakoutContext, historicalBreakoutContext } = require('./candle_metrics.js');
 const { loadPineModels, outputFromPeriod, periodFromOutput } = require('./pine_models.js');
 const { BAR_LIMIT, createLocalIndicators, candle } = require('./pinets_live');
+const { calculateVwap1m, candidateProtectionSnapshot, createVwapMinuteBatch, openingVwapSnapshot } = require('./vwap_1m');
+const { BETA, REFERENCES, createMarketRhythm, minuteSubscriptionOptions } = require('./market_rhythm');
+const { startIpoWatch } = require('./ipo_watch');
 const PINE_MODELS = loadPineModels();
+const MINUTE_HISTORY = 850;
 
 const TREND_STATE_ID = 'USER;e577100fe79942b4830783d1ceaad535';
 const FVG_ID = 'USER;5ec7d04179b3429ca9286db452352d85';
@@ -161,6 +166,14 @@ async function main() {
   const marketSession = args['market-session'] || (localMode ? '24h' : 'extended');
   if (!['24h', 'extended'].includes(marketSession)) throw new Error('不支持的 5 分钟行情时段');
   const defaultSessionSymbols = new Set((args['default-session-symbols'] || '').split(',').filter(Boolean));
+  const rhythm = localMode && args['rhythm-cache'] ? createMarketRhythm({
+    symbols: args.symbols.filter(symbol => !defaultSessionSymbols.has(symbol) || BETA.includes(symbol)),
+    cachePath: args['rhythm-cache'],
+  }) : null;
+  let rhythmErrorAt = 0;
+  const vwapMinuteBatch = localMode
+    ? createVwapMinuteBatch(args.symbols.filter(symbol => !defaultSessionSymbols.has(symbol)))
+    : null;
   if (shadowOnly && (!args['ema7-shadow-log'] || benchmarkStudy)) {
     throw new Error('独立 EMA7 影子模式需要 --ema7-shadow-log，并且不使用七合一指标');
   }
@@ -188,7 +201,7 @@ async function main() {
     throw new Error('--benchmark-study requires a saved private Pine ID');
   }
   let loaded = 0;
-  const total = benchmarkStudy || shadowOnly ? 1 : PINE_MODELS.length + 4;
+  const total = benchmarkStudy || shadowOnly ? 1 : PINE_MODELS.filter(model => !model.local_only).length + 4;
   const report = (event) => process.stdout.write(JSON.stringify({
     type: 'indicator_startup', loaded, total, ...event,
   }) + '\n');
@@ -207,6 +220,16 @@ async function main() {
       }
     },
   }) : null;
+  const minuteLocal = localMode ? createLocalIndicators({
+    intervalSeconds: 60, barLimit: MINUTE_HISTORY, minBars: 10, workers: 2,
+    onError(symbol, key, error) {
+      const id = symbol + '/' + key;
+      const now = Date.now();
+      if (now - (localErrors.get(id) || 0) < 30000) return;
+      localErrors.set(id, now);
+      console.error(`[${id}] local_indicator_error: ${error}`);
+    },
+  }) : null;
   async function loadStartupIndicator(id, name) {
     report({ name });
     try {
@@ -220,11 +243,14 @@ async function main() {
     }
   }
 
-  const client = new TradingView.Client({
-    token: creds.sessionid,
-    signature: creds.sessionid_sign,
-  });
+  const client = await createMarketClient(TradingView, creds);
 
+  const connectionTimer = setTimeout(() => {
+    if (client.isOpen && client.isLogged) return;
+    console.error('[connection] TradingView 行情连接或授权超时，退出以重新连接');
+    process.exit(2);
+  }, 20_000);
+  connectionTimer.unref();
   client.onConnected(() => console.error('[connection] TradingView websocket connected'));
   client.onDisconnected(() => {
     console.error('[connection] TradingView websocket disconnected; exit for supervised reconnect');
@@ -232,6 +258,13 @@ async function main() {
   });
   client.onError((...errors) => console.error('[connection] TradingView error:',
     errors.map(String).join(' ').slice(0, 300)));
+
+  // IPOs may have zero bars until their opening auction. This light subscription
+  // shares the socket, but never joins the strategy/indicator readiness counts.
+  if(localMode && args['ipo-watches']) startIpoWatch(client,{
+    watches:JSON.parse(args['ipo-watches']),
+    emit:record=>process.stdout.write(JSON.stringify(record)+'\n'),
+  });
 
   const state = {};
   const entries = {};   // symbol -> {chart, studies, createdAt, rebuilds, rebuilding, gaveUp}
@@ -263,9 +296,10 @@ async function main() {
       } },
   ];
 
+  const cloudDefinitions = definitions.filter(item => !item.model?.local_only);
   const subscriptions = localMode ? [] : shadowOnly ? definitions.filter(item => item.key === 'e7v2') : benchmarkStudy
-    ? [{ id: benchmarkStudy, key: 'combined', name: '七合一验证', outputs: definitions }]
-    : definitions;
+    ? [{ id: benchmarkStudy, key: 'combined', name: '七合一验证', outputs: cloudDefinitions }]
+    : cloudDefinitions;
 
   function clearStudy(snapshot, definition) {
     snapshot[definition.key] = {};
@@ -384,6 +418,7 @@ async function main() {
     const shadowEnabled = shadow && shadowSymbols.has(symbol);
     if (shadowEnabled) shadow.reset(symbol);
     if (local) local.reset(symbol);
+    rhythm?.reset(symbol);
     const submitLocal = () => local?.observe(symbol, chart.periods, chart.infos, snapshot, entry.daily);
     chart.onUpdate((changes) => {
       if (entries[symbol] !== entry || entry.gaveUp || !isPriceUpdate(changes)) return;
@@ -404,6 +439,68 @@ async function main() {
       timeframe: '5', range: local || shadowEnabled ? BAR_LIMIT : 200,
       session: requestedSession === 'default' ? undefined : requestedSession,
     });
+    if (local && (!defaultSessionSymbols.has(symbol) || (rhythm && BETA.includes(symbol)))) {
+      const referenceOnly = defaultSessionSymbols.has(symbol);
+      const minuteSession = referenceOnly ? 'default' : 'regular';
+      // Include prior regular sessions for EMA7/ST warm-up.
+      const minuteRequest = minuteSubscriptionOptions(referenceOnly, MINUTE_HISTORY);
+      const minuteHistory = minuteRequest.range;
+      const subscribeMinute = () => {
+        if (entries[symbol] !== entry || entry.gaveUp) return;
+        const minuteChart = entry.minuteChart = new client.Session.Chart();
+        entry.minuteRaw = null;
+        entry.rhythmPrice1m = null;
+        if (!referenceOnly) minuteLocal.reset(symbol);
+        const current = () => entries[symbol] === entry && entry.minuteChart === minuteChart && !entry.gaveUp;
+        const retry = () => {
+          if (!current()) return;
+          clearTimeout(entry.minuteTimer);
+          entry.minuteChart = null;
+          entry.minuteRaw = null;
+          entry.rhythmPrice1m = null;
+          if (!referenceOnly) minuteLocal.reset(symbol);
+          rhythm?.reset(symbol);
+          entry.vwap1m = null;
+          entry.candidateSt1m = null;
+          entry.candidateStKey = null;
+          entry.vwapOpening = null;
+          try { minuteChart.delete(); } catch (_) { /* socket already closed */ }
+          entry.minuteTimer = setTimeout(subscribeMinute, Math.max(15000, retryDelay(++entry.minuteFailures)));
+        };
+        minuteChart.onError(retry);
+        minuteChart.onUpdate(changes => {
+          if (!current() || !isPriceUpdate(changes) || (referenceOnly
+              ? !chartSession(minuteChart.infos, 'default').accepted
+              : minuteChart.infos?.subsession_id !== minuteSession)) return;
+          const rows = minuteChart.periods.slice(0, minuteHistory).reverse().map(candle);
+          if (rows.length < 2) return;
+          clearTimeout(entry.minuteTimer);
+          entry.minuteFailures = 0;
+          rhythm?.observe(symbol, rows, Date.now() / 1000,
+            previousRegularRange(entry.daily, rows.at(-1).time), entry.daily || []);
+          if (rhythm) entry.rhythmPrice1m = {bar: rows.at(-1), price_observed_at: Date.now() / 1000};
+          if (referenceOnly) return;
+          entry.vwap1m = calculateVwap1m(rows);
+          // Unclosed quote bursts do not recompute the closed ST. Include all
+          // closed OHLCV in the key so a deep TV history correction invalidates it.
+          const candidateNow = Date.now() / 1000;
+          const closedMinutes = rows.filter(bar => bar.time + 60 <= candidateNow);
+          const candidateKey = JSON.stringify(closedMinutes);
+          if (candidateKey !== entry.candidateStKey) {
+            entry.candidateSt1m = candidateProtectionSnapshot(closedMinutes, candidateNow);
+            entry.candidateStKey = candidateKey;
+          }
+          vwapMinuteBatch.observe(symbol, entry.vwap1m);
+          entry.vwapOpening = openingVwapSnapshot(rows, Date.now() / 1000);
+          entry.minuteRaw = {bar: rows.at(-1), bar_c: rows.at(-2)};
+          minuteLocal.observe(symbol, minuteChart.periods, minuteChart.infos, entry.minuteRaw);
+        });
+        entry.minuteTimer = setTimeout(retry, 30000);
+        minuteChart.setMarket(symbol, minuteRequest);
+      };
+      entry.minuteFailures = 0;
+      entry.minuteTimer = setTimeout(subscribeMinute, Math.ceil(args.symbols.length / BATCH_SIZE) * BATCH_DELAY_MS + 5000 + args.symbols.indexOf(symbol) * 1100);
+    }
     if (local) {
       // Daily bars are an input to the attack indicator and have their own
       // lifecycle. A daily subscription failure does not reset the 5m chart.
@@ -425,6 +522,10 @@ async function main() {
           clearTimeout(entry.dailyTimer);
           entry.dailyFailures = 0;
           entry.daily = rows;
+          if (rhythm && BETA.includes(symbol) && entry.minuteChart?.periods?.length) {
+            const minutes=entry.minuteChart.periods.slice(0,4000).reverse().map(candle);
+            rhythm.observe(symbol,minutes,Date.now()/1000,previousRegularRange(rows,minutes.at(-1).time),rows);
+          }
           if (snapshot.bar && chartSession(chart.infos, requestedSession, entry.sessionError).accepted) submitLocal();
         });
         entry.dailyTimer = setTimeout(retry, 25000);
@@ -465,6 +566,8 @@ async function main() {
     e.rebuilding = true;
     const n = e.rebuilds + 1;
     try { e.chart.delete(); } catch (_) { /* 旧 session 可能已死，忽略 */ }
+    clearTimeout(e.minuteTimer);
+    try { e.minuteChart?.delete(); } catch (_) { /* socket already closed */ }
     clearTimeout(e.dailyTimer);
     try { e.dailyChart?.delete(); } catch (_) { /* socket already closed */ }
     if (n > MAX_REBUILDS) {
@@ -483,17 +586,41 @@ async function main() {
 
   // 每秒输出一次最新快照
   setInterval(() => {
+    if (rhythm) void rhythm.flush(Date.now() / 1000).catch(error => {
+      if (Date.now() - rhythmErrorAt >= 30000) {
+        rhythmErrorAt = Date.now();
+        console.error('[market-rhythm] 缓存写入失败:', error.message);
+      }
+    });
     const symbols = {};
     const sessions = {};
+    const vwapOpening = {};
     for (const [sym, raw] of Object.entries(state)) {
       const entry = entries[sym];
+      if (entry.vwapOpening) vwapOpening[sym] = entry.vwapOpening;
       const session = chartSession(entry.chart.infos, entry.requestedSession, entry.sessionError);
       sessions[sym] = { ...session, has_bars: !!raw.bar && session.accepted };
       if (!raw.bar || (entry.requestedSession !== 'extended' && !session.accepted)) continue;
       const s = local ? localSnapshot(sym, raw) : raw;
+      if(rhythm&&!REFERENCES.has(sym)){
+        const history=local?.confirmedHistory(sym,s,'trend');
+        if(history&&entry.rhythmFiveKey!==history.historyKey){
+          entry.rhythmFiveKey=history.historyKey;
+          entry.rhythmFivePeriods=[...history.bars].reverse();
+          entry.rhythmFiveAtr=new Map(history.rows.map(p=>[p.time,finite(p.Atr_Value)]));
+        }else if(!history){
+          entry.rhythmFiveKey=null;entry.rhythmFivePeriods=[];entry.rhythmFiveAtr=null;
+        }
+        rhythm.observeFiveMinute(sym,entry.rhythmFivePeriods||[],entry.rhythmFiveAtr,Date.now()/1000);
+      }
+      const minute = entry.minuteRaw ? minuteLocal.snapshot(sym, entry.minuteRaw) : null;
       // smart_stop（ss/ss_c 独立通道）推送时合并进 ts/ts_c，消费方无感知
       if (s.bar) symbols[sym] = {
         session,
+        vwap_1m: entry.vwap1m || null,
+        candidate_st_1m_c: entry.candidateSt1m || null,
+        market_1m: minute ? { ...minute.base, price_observed_at: minute.observedAt / 1000 } : null,
+        rhythm_price_1m: rhythm ? entry.rhythmPrice1m || null : undefined,
         previous_regular_range: previousRegularRange(entry.daily, s.bar.time),
         opening_breakout_history: (s.breakoutBars || []).flatMap((row, index) => {
           const time = row[0];
@@ -509,10 +636,16 @@ async function main() {
         [model.realtime_key, s[model.realtime_key] || {}],
         [model.confirmed_key, s[model.confirmed_key] || {}],
       ])) };
+      if (symbols[sym] && minute) {
+        symbols[sym].vwap_pullback = minute.outputs.vwap_pullback?.[0] ?? {};
+        symbols[sym].vwap_pullback_c = minute.outputs.vwap_pullback?.[1] ?? {};
+      }
     }
-    if (Object.keys(symbols).length > 0 || marketSession === '24h') {
+    const vwapDistribution = vwapMinuteBatch?.snapshot();
+    if (Object.keys(symbols).length > 0 || marketSession === '24h' || vwapDistribution?.progress.time) {
       process.stdout.write(JSON.stringify({
         type: 'tick', ts: Date.now() / 1000, symbols, sessions,
+        vwap_distribution: vwapDistribution, vwap_opening: vwapOpening,
       }) + '\n');
     }
   }, PUSH_INTERVAL_MS);

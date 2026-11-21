@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "AutoTrade TradingView 联动",
+  "version": "0.8.0",
+  "minimum_chrome_version": "102",
+  "permissions": [
+    "debugger",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://www.tradingview.com/*",
+    "https://cn.tradingview.com/*"
+  ],
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "worker.js"
+  },
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAt6u0bh+xIKPJCbJDHCBkYOzpyXigRDILy47bN2rK/owddgEXmwvcvoT9MgjLisTWEG/njfIc0iJ51nHxESaN4W1q9H2lgQ6RSfL17E1tymDGQyKZ/pusk9jy0JCmpERcK1RDEPbQFwpaK1KVbVR1/OFrkb05aUkVSVFPt7wBdRBO46x5kyNWKx/Hh9b16Nm83eUXmEnisctDo/++uM/QlKhHmdqoRSVBajQ6qWfxPXX0/mRekL2cL31BPlTuO+7J7I5b5CM2j+d08oBPWwwbD/9GjqgNTM6q8uzgfROI9Fdgo4Znx+XK2DZkgPlUs2G1l0WbGKmYL/5SDEwRStlbjQIDAQAB",
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "presence.json"
+      ],
+      "matches": [
+        "http://localhost/*",
+        "http://127.0.0.1/*"
+      ]
+    }
+  ]
+}

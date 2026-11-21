@@ -11,6 +11,7 @@ from engine import shadow_report
 import time
 from console.shared import CONSOLE_FILE, logger
 from console.schemas import BtLoadRequest, BtRunRequest
+from console.services.rhythm import MarketRhythmReader
 
 
 class ResearchService:
@@ -19,6 +20,19 @@ class ResearchService:
         self._backtest_history = OrderedDict()
         self._backtest_history_lock = asyncio.Lock()
         self._local_pine_history = LocalPineHistory(context.paths.data_dir / "backtest_history.sqlite3")
+        self._market_rhythm = MarketRhythmReader(context.paths.data_dir / "market_rhythm.json")
+
+    def entry_candidates(self, now=None):
+        from execution.entry_admission import candidate_snapshot
+        now=time.time() if now is None else now
+        return candidate_snapshot(self._market_rhythm.read(now=now),now,self.context.collector.latest())
+
+    def check_candidate_entry(self, symbol, side, now):
+        from execution.entry_admission import check_candidate
+        return check_candidate(self.entry_candidates(now),symbol,side)
+
+    async def api_market_rhythm(self, symbol: str = "", watch: str = "") -> dict:
+        return await asyncio.to_thread(self._market_rhythm.read, symbol, watch=watch)
 
     async def api_bt_run(self, req: BtRunRequest) -> dict:
         """Reuse historical inputs while running a fresh private simulation."""
@@ -38,7 +52,8 @@ class ResearchService:
             if day and datetime.strptime(day, "%Y-%m-%d").date().isoformat() != day:
                 raise ValueError("交易日格式应为 YYYY-MM-DD")
             registry = PineModelRegistry.load()
-            registry.get(req.strategy)
+            if registry.get(req.strategy).local_only:
+                raise ValueError("该策略尚未接入历史回测")
             for key in ("initial_risk_usd", "equity", "pyramid_breakeven_r", "pyramid_add_unlock_r"):
                 if key in req.params:
                     value = req.params[key]

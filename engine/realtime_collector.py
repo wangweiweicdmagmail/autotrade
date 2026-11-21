@@ -45,11 +45,17 @@ class RealtimeCollector:
     STARTUP_MAX_SECONDS = 180.0
     RESTART_COOLDOWN_SECONDS = 60.0
 
-    def __init__(self, symbols: List[str], *, audit=None, market_session="extended", default_session_symbols=()):
+    def __init__(self, symbols: List[str], *, audit=None, market_session="extended", default_session_symbols=(), ipo_watches=None, on_ipo_trade=None):
         self.audit = audit
         self.market_session = market_session
         self.default_session_symbols = frozenset(default_session_symbols)
         self.market_sessions: dict[str, dict] = {}
+        self.vwap_distribution: dict = {"frame": None, "progress": None}
+        self.vwap_opening: dict = {}
+        self.ipo_watches = dict(ipo_watches or {})
+        self.ipo_trades: dict = {}
+        self.ipo_status: dict = {}
+        self.on_ipo_trade = on_ipo_trade
         self.market_frame_id = None
         self.symbols = [s.strip() for s in symbols if s.strip()]
         self._proc: Optional[asyncio.subprocess.Process] = None
@@ -104,6 +110,8 @@ class RealtimeCollector:
         self.startup_indicators = {}
         self.startup_subscribed = 0
         self.market_sessions = {}
+        self.vwap_opening = {}
+        self.ipo_status = {}
         if self.market_session == "24h":
             self._snapshot = {}
             self._content_key = ""
@@ -113,6 +121,9 @@ class RealtimeCollector:
             "node", str(TV_DAEMON_JS), "--symbols", ",".join(self.symbols),
             "--market-session", self.market_session,
             "--default-session-symbols", ",".join(sorted(self.default_session_symbols)),
+            *(["--ipo-watches", json.dumps(self.ipo_watches)] if self.ipo_watches else []),
+            *(["--rhythm-cache", str(self.audit.path.parent / "market_rhythm.json")]
+              if self.audit is not None else []),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(SERVICE_DIR),
@@ -150,6 +161,31 @@ class RealtimeCollector:
         sessions = msg.get("sessions")
         if isinstance(sessions, dict):
             self.market_sessions = sessions
+        vwap_opening = msg.get("vwap_opening")
+        if isinstance(vwap_opening, dict):
+            self.vwap_opening = vwap_opening
+        vwap = msg.get("vwap_distribution")
+        if isinstance(vwap, dict):
+            frame = vwap.get("frame")
+            previous = self.vwap_distribution["frame"]
+            revision = frame.get("revision", 0) if isinstance(frame, dict) else None
+            rows = frame.get("rows") if isinstance(frame, dict) else None
+            row_symbols = {
+                row["symbol"] for row in rows
+                if isinstance(row, dict) and isinstance(row.get("symbol"), str)
+                and row["symbol"] and row.get("time") == frame.get("time")
+            } if isinstance(rows, list) else set()
+            progress = vwap.get("progress")
+            total = progress.get("total") if isinstance(progress, dict) else None
+            if (not isinstance(frame, dict) or type(frame.get("time")) is not int
+                    or frame["time"] <= 0
+                    or type(revision) is not int or not 0 <= revision <= 9_007_199_254_740_991
+                    or not isinstance(rows, list) or not rows or len(row_symbols) != len(rows)
+                    or (isinstance(total, int) and total > 0 and len(rows) != total)
+                    or (previous and (frame["time"], revision) <=
+                        (previous["time"], previous.get("revision", 0)))):
+                frame = previous
+            self.vwap_distribution = {"frame": frame, "progress": vwap.get("progress")}
         if self.market_session == "24h" or self.default_session_symbols:
             symbols = {
                 symbol: row for symbol, row in symbols.items()
@@ -227,6 +263,8 @@ class RealtimeCollector:
             elif msg.get("type") == "startup_progress":
                 self._last_startup_progress = time.time()
                 self.startup_subscribed = msg["subscribed"]
+            elif msg.get("type") in ("ipo_trade", "ipo_status"):
+                self._accept_ipo(msg)
             elif msg.get("type") == "indicator_startup":
                 self.startup_indicators = {
                     key: msg[key] for key in ("loaded", "total", "name", "source", "tv_study_subscriptions")
@@ -239,6 +277,21 @@ class RealtimeCollector:
                     self.cache_issues[issue["id"]] = issue
                 if loaded_id := msg.get("loaded_id"):
                     self.cache_issues.pop(loaded_id, None)
+
+    def _accept_ipo(self, msg):
+        symbol = msg.get("symbol")
+        if not isinstance(symbol,str) or self.ipo_watches.get(symbol) != msg.get("listing_date") or symbol not in self.ipo_watches:
+            return
+        if msg.get("type") == "ipo_trade":
+            self.ipo_trades[symbol] = dict(msg)
+            if self.on_ipo_trade:
+                try:
+                    self.on_ipo_trade(self.ipo_trades,time.time())
+                except Exception:
+                    logger.exception("IPO提醒处理失败，保留报价供后续重试")
+        elif msg.get("type") == "ipo_status":
+            self.ipo_status[symbol] = dict(msg)
+        # IPO messages never advance normal market freshness or readiness clocks.
 
     async def _cancel_io(self) -> None:
         tasks = [t for t in (self._reader_task, self._drain_task) if t is not None]

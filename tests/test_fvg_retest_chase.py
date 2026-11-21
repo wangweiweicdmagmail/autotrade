@@ -12,6 +12,7 @@ import asyncio
 import time
 
 import pytest
+import config
 
 from fastapi import HTTPException
 from .conftest import run
@@ -168,7 +169,7 @@ def test_chase_normal_pricing(app):
         assert call["limit_type"] == "chase"
         assert call["limit_px"] == 100.5     # 100 × 1.005
         assert call["stop_px"] == 98.0       # 智能止损：max(逻辑0.3, 1×ATR)
-        assert call["risk_usd"] == 700.0 and call["manual_entry"] is True
+        assert call["risk_usd"] == config.RISK_PER_TRADE_USD and call["manual_entry"] is True
         assert call["reprice_bar_time"] == 0 and call["breakout_px"] == 0
     run(go())
 
@@ -208,14 +209,21 @@ def test_chase_atr_missing_rejected(app):
     run(go())
 
 
-@pytest.mark.parametrize(("side", "minute", "stop"), [
-    ("long", 30, 99.7), ("short", 35, 100.3), ("long", 40, 98.0),
+@pytest.mark.parametrize(("side", "hour", "minute", "atr", "stop"), [
+    ("long", 9, 30, 0.1, 99.69),
+    ("short", 9, 30, 0.15, 100.31),
+    ("long", 9, 30, 0.5, 99.0),
+    ("long", 9, 30, None, 99.69),
+    ("short", 9, 35, None, 100.31),
+    ("long", 9, 40, 2.0, 96.0),
+    ("long", 12, 0, 0.1, 99.69),
+    ("short", 18, 5, 0.1, 100.31),
 ])
-def test_manual_market_opening_stop(app, monkeypatch, side, minute, stop):
+def test_manual_market_stop_outside_current_bar(app, monkeypatch, side, hour, minute, atr, stop):
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
-    stamp = datetime(2026, 11, 3, 9, minute, 10, tzinfo=ZoneInfo("America/New_York"))
+    stamp = datetime(2026, 11, 3, hour, minute, 10, tzinfo=ZoneInfo("America/New_York"))
 
     class Clock:
         @staticmethod
@@ -224,16 +232,29 @@ def test_manual_market_opening_stop(app, monkeypatch, side, minute, stop):
 
     monkeypatch.setattr("console.services.trading.datetime", Clock)
     monkeypatch.setattr("config.ALLOW_SHORT", True)
-    chase_market(100, None if minute < 40 else 2.0, side)
+    chase_market(100, atr, side)
     market[SYM_L]["bar"]["time"] = stamp.timestamp() - 10
     req = schemas.LimitStopOrderRequest(
         symbol=SYM_L, side=side, qty=10, limit_px=1, stop_px=1, limit_type="market",
     )
+    if hour >= 16:
+        assert app.trading._market_prices(market[SYM_L], side, now=stamp)[1] == stop
+        with pytest.raises(app.HTTPException, match="常规盘 1 分钟 ST 未就绪"):
+            run(app.trading.api_place_limit_stop(req))
+        assert not app.order_mgr.place_calls
+        return
+    minute_time = stamp.timestamp() - 10
+    market[SYM_L]["market_1m"] = {"bar": {"time": minute_time}}
+    market[SYM_L]["vwap_pullback"] = {"time": minute_time, "direction": 1 if side == "long" else -1}
     assert run(app.trading.api_place_limit_stop(req))["ok"]
     call = app.order_mgr.place_calls[-1]
     assert call["stop_px"] == stop
     assert call["risk_ref_px"] == 100
-    assert (call["signal_snapshot"].get("stop_source") == "opening_bar_extreme") == (minute < 40)
+    assert call["signal_snapshot"].get("stop_source") == "market_2atr_outside_bar"
+    market[SYM_L]["bar"]["time"] -= 300
+    with pytest.raises(app.HTTPException, match="当前 5 分钟 K 线"):
+        run(app.trading.api_place_limit_stop(req))
+    assert len(app.order_mgr.place_calls) == 1
 
 
 @pytest.mark.parametrize(("side", "stop", "close"), [

@@ -141,3 +141,48 @@ def test_zero_budget_unlimited(tmp_path):
         lot2, err = await mgr.place_limit_stop_lot("NASDAQ:III", "long", 100, 100.0, 90.0)
         assert lot2 is not None, f"预算 0 应不限制: {err}"
     run(go())
+
+
+def test_direction_budget_counts_pending_and_releases_after_breakeven(tmp_path):
+    async def go():
+        gate = RiskGate(RiskConfig(max_order_qty=10000, max_open_positions=0,
+            max_total_risk_usd=2200, max_direction_risk_usd=1100), halt_dir=tmp_path)
+        mgr = OrderManager(FakeGateway(False), gate, state_path=tmp_path / 'directions.json')
+        long, err = await mgr.place_limit_stop_lot('AAA', 'long', 100, 100, 90)
+        assert long is not None, err
+        blocked, err = await mgr.place_limit_stop_lot('BBB', 'long', 100, 100, 90)
+        assert blocked is None and '多头风险敞口' in err and '1100' in err
+        short, err = await mgr.place_limit_stop_lot('CCC', 'short', 100, 100, 110)
+        assert short is not None, err
+        assert mgr.risk_exposure()['total'] == 2000
+        assert mgr.risk_exposure()['long'] == mgr.risk_exposure()['short'] == 1000
+        long.state = 'ACTIVE'; long.filled_qty = 100; long.avg_fill = 100; long.stop_px = 100
+        assert mgr.risk_exposure()['long'] == 0
+        again, err = await mgr.place_limit_stop_lot('DDD', 'long', 100, 100, 90)
+        assert again is not None, err
+        short.state = 'ACTIVE'; short.filled_qty = 100; short.avg_fill = 100; short.stop_px = 100
+        assert mgr.risk_exposure()['short'] == 0
+    run(go())
+
+
+def test_direction_budget_boundaries_and_total_are_independent(tmp_path):
+    gate = RiskGate(RiskConfig(max_order_qty=10000, max_open_positions=0,
+        max_total_risk_usd=2200, max_direction_risk_usd=1100), halt_dir=tmp_path)
+    args = dict(symbol='A',side='long',entry=100,stop=99,qty=1000,open_positions=0,
+                open_risk_usd=1200,open_direction_risk_usd=100)
+    assert gate.check_new_order(**args)[0]  # Both exact boundaries allowed.
+    assert '多头' in gate.check_new_order(**{**args,'open_direction_risk_usd':101})[1]
+    assert '总风险' in gate.check_new_order(**{**args,'open_risk_usd':1201})[1]
+
+
+def test_concurrent_same_direction_submissions_cannot_both_spend_1100(tmp_path):
+    import asyncio
+    async def go():
+        gate = RiskGate(RiskConfig(max_order_qty=10000, max_open_positions=0,
+            max_total_risk_usd=2200, max_direction_risk_usd=1100), halt_dir=tmp_path)
+        mgr = OrderManager(FakeGateway(False), gate, state_path=tmp_path / 'concurrent.json')
+        results = await asyncio.gather(*[mgr.place_limit_stop_lot(s,'long',100,100,90) for s in ('AAA','BBB')])
+        assert sum(lot is not None for lot, _ in results) == 1
+        assert mgr.risk_exposure()['long'] == 1000
+        assert any('多头风险敞口' in err for _,err in results)
+    run(go())

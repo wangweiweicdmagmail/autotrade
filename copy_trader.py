@@ -395,7 +395,7 @@ class CopyFollower:
         await self._refresh_equity(force=True)
         if self.equity and self.equity > 0:
             self.baseline_equity = self.equity
-            self.baseline_date = time.strftime("%Y-%m-%d")
+            self.baseline_date = datetime.now(ET).date().isoformat()
         self._event("copy_startup",
                     dry_run=not getattr(self.gateway, "enabled", False),
                     mapped=len(self.map),
@@ -1253,6 +1253,7 @@ class CopyFollower:
                     max_order_qty=config.RISK_MAX_ORDER_QTY,
                     max_open_positions=config.RISK_MAX_OPEN_POSITIONS,
                     max_total_risk_usd=config.RISK_MAX_TOTAL_RISK_USD,
+                    max_direction_risk_usd=config.RISK_MAX_DIRECTION_RISK_USD,
                 ), halt_dir=directory)
                 self.order_manager = OrderManager(self.gateway, risk, directory / "lots.json")
                 self.order_manager._load(allow_recovery=True)

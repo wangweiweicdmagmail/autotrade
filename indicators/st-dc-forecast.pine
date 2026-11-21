@@ -1,0 +1,53 @@
+//@version=6
+indicator("DC 高低点预测价格对比", shorttitle="DC Forecast", overlay=true)
+
+dcLength = input.int(1, "DC 周期", minval=1, group="预测")
+atrOffsetMultiplier = input.float(0.2, "ATR(1) 修正倍数", minval=0, step=0.05, group="预测")
+
+// 最近两根已收盘 K 线的高低点同时抬高为多，同时降低为空。
+// 包含、反包或任一高低点持平时为中性，方向在本根内固定。
+directionReady = not na(high[2]) and not na(low[2])
+higherRange = directionReady and high[1] > high[2] and low[1] > low[2]
+lowerRange = directionReady and high[1] < high[2] and low[1] < low[2]
+int direction = higherRange ? 1 : lowerRange ? -1 : 0
+dcUpper = ta.highest(high, dcLength)
+dcLower = ta.lowest(low, dcLength)
+dcMiddle = (dcUpper + dcLower) / 2.0
+confirmedAtr1 = ta.atr(1)[1]
+atrAdjustment = atrOffsetMultiplier * confirmedAtr1
+
+// 用最近两个已收盘值的变化外推一根，保留速度的正负号。
+// 本根开盘后，预测通道和候选参考价均固定。
+upperVelocity = dcUpper[1] - dcUpper[2]
+lowerVelocity = dcLower[1] - dcLower[2]
+forecastUpper = dcUpper[1] + upperVelocity
+forecastLower = dcLower[1] + lowerVelocity
+
+// 收盘价对比该根实际显示的参考线（包含 ATR 修正）。
+// 破位后，下一根切换到已确认 DC 边沿；若未再次破位，则恢复外推。
+float referencePrice = na
+previousReferenceReady = not na(referencePrice[1])
+longReferenceBroken = previousReferenceReady and direction[1] == 1 and close[1] < referencePrice[1]
+shortReferenceBroken = previousReferenceReady and direction[1] == -1 and close[1] > referencePrice[1]
+useDcEdge = longReferenceBroken or shortReferenceBroken
+
+float basePrice = na
+if direction == 1
+    basePrice := useDcEdge ? dcLower[1] : forecastLower
+else if direction == -1
+    basePrice := useDcEdge ? dcUpper[1] : forecastUpper
+
+// 多头向上偏移、空头向下偏移。ATR(1) 取上一根已收盘真实波幅。
+ready = direction != 0 and not na(basePrice) and basePrice > 0 and not na(confirmedAtr1) and confirmedAtr1 >= 0
+candidatePrice = math.round_to_mintick(basePrice + direction * atrAdjustment)
+referencePrice := ready and candidatePrice > 0 ? candidatePrice : na
+
+plot(dcUpper, "DC_Upper", color=color.new(color.gray, 60), offset=0)
+plot(dcLower, "DC_Lower", color=color.new(color.gray, 60), offset=0)
+plot(dcMiddle, "DC_Middle", color=color.new(color.gray, 75), offset=0)
+plot(referencePrice, "Reference_Price", color=direction == 1 ? color.lime : color.red, style=plot.style_stepline, linewidth=2, offset=0)
+plot(direction, "Direction", display=display.data_window, offset=0)
+plot(not na(referencePrice) ? 1 : 0, "Reference_Valid", display=display.data_window, offset=0)
+plot(confirmedAtr1, "ATR_1_Confirmed", display=display.data_window, offset=0)
+plot(atrAdjustment, "ATR_Adjustment", display=display.data_window, offset=0)
+plot(useDcEdge ? 1 : 0, "Use_DC_Edge", display=display.data_window, offset=0)

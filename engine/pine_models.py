@@ -2,12 +2,13 @@
 
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Optional
 
 # Compatibility names remain available at the original import path.
-from domain.contracts import StrategyOutput as PineOutput, finite_number as number
+from domain.contracts import StrategyOutput as PineOutput
+from domain.contracts import finite_number as number
 
 MODEL_PATH = Path(__file__).resolve().parent.parent / "service" / "pine_strategies.json"
 
@@ -24,10 +25,20 @@ class ExecutionProfile:
     add_unlock_r: float = 2.0
     breakeven_r: float = 3.0
     follow_pine_stop: bool = True
+    breakeven_on_entry_bar_close: bool = False
+    lock_start_direction: bool = True
+    finish_after_trade: bool = False
 
 
 PROFILES = {
     "single_entry": ExecutionProfile(),
+    "entry_bar_breakeven": ExecutionProfile(
+        name="entry_bar_breakeven",
+        follow_pine_stop=False,
+        breakeven_on_entry_bar_close=True,
+        lock_start_direction=False,
+        finish_after_trade=True,
+    ),
     "ema9_legacy_pyramid": ExecutionProfile(
         name="ema9_legacy_pyramid",
         risk_ratios=(1.0, 2 / 3, 1 / 3),
@@ -48,6 +59,9 @@ class PineModel:
     confirmed_key: str
     fields: Mapping[str, str]
     execution_profile: str = "single_entry"
+    local_only: bool = False
+    interval_seconds: int = 300
+    startup_candidate_field: str = ""
 
     @property
     def profile(self):
@@ -89,6 +103,9 @@ class PineModel:
             or {}
         )
 
+    def market_bars(self, data: dict) -> dict:
+        return (data.get("market_1m") or {}) if self.interval_seconds == 60 else data
+
     def describe(self):
         return {
             "id": self.strategy_id,
@@ -98,6 +115,8 @@ class PineModel:
             "confirmed_key": self.confirmed_key,
             "execution_profile": self.execution_profile,
             "fields": dict(self.fields),
+            **({"local_only": True} if self.local_only else {}),
+            **({"interval_seconds": self.interval_seconds} if self.interval_seconds != 300 else {}),
         }
 
 
@@ -114,6 +133,8 @@ class PineModelRegistry:
             raise ValueError(f"重复策略标识: {model.strategy_id}")
         if model.execution_profile not in PROFILES:
             raise ValueError(f"未知执行配置: {model.execution_profile}")
+        if model.interval_seconds not in (60, 300):
+            raise ValueError(f"不支持的策略 K 线周期: {model.interval_seconds}")
         required = {
             "entry_signal",
             "direction",
@@ -139,6 +160,7 @@ class PineModelRegistry:
             "ss_c",
             "ema_9",
             "ema_9_c",
+            "market_1m",
             "price_observed_at",
         }
         if model.realtime_key == model.confirmed_key or any(
@@ -177,6 +199,9 @@ class PineModelRegistry:
                 row["confirmed_key"],
                 row["fields"],
                 row.get("execution_profile", "single_entry"),
+                row.get("local_only", False),
+                row.get("interval_seconds", 300),
+                row.get("startup_candidate_field", ""),
             )
             for row in payload["strategies"]
         )

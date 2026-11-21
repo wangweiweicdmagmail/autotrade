@@ -1,0 +1,54 @@
+//@version=6
+indicator("1M RTH VWAP · EMA7 位置与速度", overlay=true)
+
+bandMultiplier = input.float(1.0, "VWAP 标准差倍数", minval=0.1, step=0.1)
+if not timeframe.isminutes or timeframe.multiplier != 1
+    runtime.error("请使用 1 分钟图表")
+
+if syminfo.session != session.regular
+    runtime.error("请将图表切换到常规交易时段")
+
+// 常规时段图表让内置 EMA 和 ST 使用与控制台相同的行情。
+et = "America/New_York"
+regular = session.ismarket and not na(time("1", "0930-1600:23456", et))
+dayKey = year(time, et) * 10000 + month(time, et) * 100 + dayofmonth(time, et)
+var int regularDay = na
+var float weight = 0.0
+var float mean = 0.0
+var float m2 = 0.0
+ema = ta.ema(close, 7)
+[_, stDirection] = ta.supertrend(4.0, 10)
+
+if regular
+    if na(regularDay) or regularDay != dayKey
+        regularDay := dayKey
+        weight := 0.0
+        mean := 0.0
+        m2 := 0.0
+    if not na(volume) and volume > 0
+        nextWeight = weight + volume
+        delta = hlc3 - mean
+        mean += delta * volume / nextWeight
+        m2 += volume * delta * (hlc3 - mean)
+        weight := nextWeight
+
+center = regular and weight > 0 ? mean : na
+halfWidth = regular and weight > 0 ? bandMultiplier * math.sqrt(math.max(0.0, m2 / weight)) : na
+upper = center + halfWidth
+lower = center - halfWidth
+position = halfWidth > 0 ? (ema - center) / halfWidth : na
+zone = na(position) ? na : position > 1 ? 1 : position < -1 ? -1 : 0
+// A missing minute makes the seven-minute comparison unavailable.
+speed = regular and regular[7] and dayKey == dayKey[7] and time - time[7] == 420000 ? ema - ema[7] : na
+
+plot(center, "VWAP", color=color.orange, style=plot.style_linebr)
+plot(upper, "VWAP_Upper", color=color.green, style=plot.style_linebr)
+plot(lower, "VWAP_Lower", color=color.red, style=plot.style_linebr)
+plot(regular ? ema : na, "EMA7_Close", color=color.aqua, style=plot.style_linebr)
+plot(position, "VWAP_Position", display=display.data_window)
+plot(zone, "VWAP_Zone", display=display.data_window)
+plot(speed, "EMA7_Speed_7m", display=display.data_window)
+plot(regular ? 1 : 0, "RTH_Active", display=display.data_window)
+plot(not na(speed) ? ema[7] : na, "EMA7_7m_Ago", display=display.data_window)
+atrReady = not na(ta.atr(10))
+plot(regular and atrReady ? -stDirection : na, "ST_Direction", display=display.data_window)

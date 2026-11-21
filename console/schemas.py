@@ -1,6 +1,6 @@
 """HTTP request contracts, preserving existing defaults and validation."""
 
-from pydantic import BaseModel
+from pydantic import BaseModel, root_validator, StrictBool, conint
 from pydantic import Field
 from typing import List, Literal
 from typing import Optional
@@ -8,6 +8,21 @@ from typing import Optional
 
 class UpdateTrailRequest(BaseModel):
     stop_px: float = Field(..., gt=0)
+
+
+class CandidateProtectionOptions(BaseModel):
+    version: Literal[1] = 1
+    timed_breakeven_enabled: StrictBool = True
+    breakeven_minutes: conint(strict=True, ge=1, le=120) = 5
+    trailing_enabled: StrictBool = False
+    trailing_source: Literal["ema9_5m", "st_1m_10_3"] = "ema9_5m"
+
+    class Config:
+        extra = 'forbid'
+
+
+class CandidateOrderOptions(CandidateProtectionOptions):
+    vwap_outside_only: StrictBool = True
 
 
 class LimitStopOrderRequest(BaseModel):
@@ -21,6 +36,11 @@ class LimitStopOrderRequest(BaseModel):
     risk_usd: float = 0
     max_position_pct: float = 0
     force: bool = False
+    market_direction_mode: Literal["st", "manual", "candidate"] = "st"
+    manual_stop_mode: Literal["atr_2", "vwap_sigma"] = "atr_2"
+    range_direction_confirmed: bool = False
+    entry_mode: Literal["default", "rhythm_atr", "rhythm_sigma"] = "default"
+    candidate_order: Optional[CandidateOrderOptions] = None
     twap_batches: int = 0
     twap_interval_s: int = 60
 
@@ -31,6 +51,12 @@ class OpeningBreakoutOrderRequest(BaseModel):
 
 
 class OpeningBreakoutPrepareRequest(OpeningBreakoutOrderRequest):
+    side: Literal["long", "short"]
+    cancel: bool = False
+
+
+class OpeningVwapPrepareRequest(BaseModel):
+    signal_id: str = Field(min_length=1, max_length=160)
     side: Literal["long", "short"]
     cancel: bool = False
 
@@ -84,6 +110,7 @@ class CopyCmdRequest(BaseModel):
 
 
 class SettingsRequest(BaseModel):
+    candidate_order_protection: Optional[CandidateProtectionOptions] = None
     stop_atr_mult: Optional[float] = Field(None, description="止损 ATR 倍数（0.2~5.0）")
     screen_premarket_filter: Optional[bool] = Field(
         None, description="选股盘前区间过滤开关"
@@ -108,6 +135,37 @@ class SettingsRequest(BaseModel):
 
 class TvShowRequest(BaseModel):
     symbol: str = Field(..., description="如 NASDAQ:AAPL")
+
+
+class TvViewRequest(TvShowRequest):
+    source_token: str | None = Field(default=None, pattern=r"^[a-f0-9]{32}$")
+
+
+class TvGridRequest(BaseModel):
+    symbols: List[str] = Field(min_items=4, max_items=8)
+    source_token: str = Field(pattern=r"^[a-f0-9]{32}$")
+    layout: Literal['candidates', 'focus'] = 'candidates'
+
+    @root_validator(skip_on_failure=True)
+    def check_layout_size(cls, values):
+        if len(values['symbols']) != (6 if values['layout'] == 'focus' else 8):
+            raise ValueError('focus需要6个标的，candidates需要8个标的')
+        return values
+
+
+class TvMarkerRequest(BaseModel):
+    source_token: str = Field(pattern=r"^[a-f0-9]{32}$")
+
+
+class TvBindRequest(TvMarkerRequest):
+    target_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,80}$")
+
+
+class GoldenEntryRequest(BaseModel):
+    symbol: str = Field(min_length=1, max_length=64)
+    bar_time: int = Field(gt=0)
+    direction: int = Field(ge=-1, le=1)
+    manual_window: bool = False
 
 
 class AutoStartRequest(BaseModel):

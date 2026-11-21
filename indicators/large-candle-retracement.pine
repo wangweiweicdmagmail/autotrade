@@ -1,0 +1,38 @@
+//@version=6
+indicator("gold signal", shorttitle="gold signal", overlay=true, max_lines_count=500)
+
+minBodyPct = input.float(0.6, "最小实体幅度（%）", minval=0, step=0.1)
+showLevels = input.bool(true, "显示回撤线")
+body = math.abs(close - open)
+bodyPct = open > 0 ? body / open * 100 : na
+candleRange = high - low
+bullish = close > open
+extreme = bullish ? high : low
+level = math.round_to_mintick(extreme + (open - extreme) * 0.38)
+closeBeyondRetracement = bullish ? close > level : close < level
+largeCandle = bodyPct > minBodyPct and body > 0 and candleRange > 0 and body > candleRange * 0.5 and closeBeyondRetracement
+
+if showLevels and barstate.isconfirmed and largeCandle
+    line.new(bar_index, level, bar_index + 1, level, xloc=xloc.bar_index,
+         color=bullish ? color.lime : color.red, width=2)
+
+// 只使用上一根已收盘的信号 K 线，入场计划有效期为一根。
+int direction = largeCandle[1] ? (bullish[1] ? 1 : -1) : 0
+entryPrice = level[1]
+initialStop = math.round_to_mintick(direction == 1 ? low[1] : high[1])
+validLong = direction == 1 and initialStop > 0 and entryPrice > initialStop
+validShort = direction == -1 and entryPrice > 0 and initialStop > entryPrice
+longEntry = validLong and open >= entryPrice and low <= entryPrice and low > initialStop
+shortEntry = validShort and open <= entryPrice and high >= entryPrice and high < initialStop
+entrySignal = longEntry or shortEntry
+breakevenSignal = barstate.isconfirmed and entrySignal
+
+plot(entrySignal ? 1 : 0, "Entry_Signal", display=display.data_window, offset=0)
+plot(direction, "Direction", display=display.data_window, offset=0)
+plot(validLong or validShort ? entryPrice : na, "Entry_Price", display=display.data_window, offset=0)
+plot(validLong ? initialStop : na, "Long_Stop", display=display.data_window, offset=0)
+plot(validShort ? initialStop : na, "Short_Stop", display=display.data_window, offset=0)
+float unusedAtr = na
+plot(unusedAtr, "ATR", display=display.data_window, offset=0)
+plot(breakevenSignal ? 1 : 0, "Breakeven_Signal", display=display.data_window, offset=0)
+plot(breakevenSignal ? entryPrice : na, "Breakeven_Reference", display=display.data_window, offset=0)

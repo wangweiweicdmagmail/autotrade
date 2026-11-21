@@ -2,8 +2,8 @@
 
 import logging
 import time
-from domain.contracts import ClosedBar, PriceObservation, finite_number
 
+from domain.contracts import ClosedBar, PriceObservation, finite_number
 from engine.opening_range import opening_entry_block
 
 logger = logging.getLogger(__name__)
@@ -20,16 +20,17 @@ class StrategyRuntime:
 
     async def _confirmed(self, engine, symbol, data, *, force=False):
         model = engine.model
-        raw_bar = data.get("bar_c") or {}
+        prices = model.market_bars(data)
+        raw_bar = prices.get("bar_c") or {}
         raw_output = data.get(model.confirmed_key) or {}
         if not raw_bar or not raw_output:
             return
         key = (model.strategy_id, engine.instance_id, symbol)
         try:
-            bar = ClosedBar.from_mapping(symbol, raw_bar)
+            bar = ClosedBar.from_mapping(symbol, raw_bar, model.interval_seconds)
         except ValueError:
             return
-        current_open = finite_number((data.get("bar") or {}).get("time"))
+        current_open = finite_number((prices.get("bar") or {}).get("time"))
         if current_open and bar.open_time >= current_open:
             return
         stamp = raw_output.get("time")
@@ -61,10 +62,11 @@ class StrategyRuntime:
                     await self._confirmed(engine, symbol, data)
                 except Exception:
                     logger.exception("Pine 收盘管理异常 %s %s", model.strategy_id, symbol)
-                price = (data.get("bar") or {}).get("close")
+                prices = model.market_bars(data)
+                price = (prices.get("bar") or {}).get("close")
                 if trading and price:
                     try:
-                        observation = PriceObservation.from_market(symbol, data, time.time())
+                        observation = PriceObservation.from_market(symbol, prices, time.time())
                         output = model.from_market(data).for_bar(
                             observation.bar_open_time, received_at=observation.received_at,
                         )

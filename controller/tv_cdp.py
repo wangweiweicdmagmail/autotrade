@@ -40,7 +40,9 @@ import asyncio
 import json
 import logging
 import urllib.request
+from inspect import signature
 from typing import Dict, List, Optional
+from urllib.parse import quote, urlsplit
 
 import websockets
 
@@ -142,8 +144,9 @@ _CENTER_JS = r"""
 class TradingViewCDPController:
     """TradingView 多图格 CDP 控制器。"""
 
-    def __init__(self, endpoint: str = config.CDP_HTTP_ENDPOINT):
+    def __init__(self, endpoint: str = config.CDP_HTTP_ENDPOINT, *, target_id: str | None = None):
         self.endpoint = endpoint
+        self.target_id = target_id
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._msg_id = 0
         self._pending: Dict[int, asyncio.Future] = {}
@@ -167,11 +170,21 @@ class TradingViewCDPController:
 
     async def connect(self) -> None:
         """发现 TradingView 图表页 target 并建立 CDP WebSocket 会话。"""
-        ws_url = await asyncio.to_thread(self._find_tv_ws_url)
+        if self.target_id is None:
+            ws_url = await asyncio.to_thread(self._find_tv_ws_url)
+        else:
+            address = urlsplit(self.endpoint)
+            ws_url = f"ws://{address.netloc}/devtools/page/{quote(self.target_id, safe='')}"
         logger.info("连接 CDP target: %s", ws_url[:80])
-        self._ws = await websockets.connect(ws_url, max_size=16 * 1024 * 1024)
+        options = {}
+        if self.target_id is not None and "proxy" in signature(websockets.connect).parameters:
+            options["proxy"] = None  # The scoped CDP endpoint is on the local machine.
+        self._ws = await websockets.connect(ws_url, max_size=16 * 1024 * 1024, **options)
         self._reader_task = asyncio.create_task(self._reader_loop())
         await self._send_cdp("Runtime.enable")
+
+    async def window_id(self) -> int | None:
+        return (await self._send_cdp("Browser.getWindowForTarget")).get("windowId")
 
     async def close(self) -> None:
         if self._reader_task:

@@ -114,11 +114,11 @@ class FakeGW:
         return {"ok": True, "order_id": oid, "stop_order_id": oid,
                 "trade": t}
 
-    async def place_close(self, symbol, side, qty, ref_px, order_ref=""):
+    async def place_close(self, symbol, side, qty, ref_px, order_ref="", market=False):
         oid = self._alloc()
         t = FakeTrade(oid, status="Submitted", qty=qty,
                       action=("SELL" if side == "long" else "BUY"),
-                      order_type="LMT", symbol=symbol.split(":")[-1],
+                      order_type="MKT" if market else "LMT", symbol=symbol.split(":")[-1],
                       lmt=ref_px)
         self.close_calls.append((symbol, side, qty, order_ref, t))
         return {"ok": True, "order_id": oid, "permId": 0, "trade": t}
@@ -824,4 +824,77 @@ def test_j2_concurrent_breakeven_single_modify(tmp_path):
         assert gw.stop_px_calls == [100.0], f"并发保本重复发单: {gw.stop_px_calls}"
         assert gw.max_concurrent_modify == 1
         cancel_watchers(mgr)
+    run(go())
+
+
+def test_symbol_position_cap_counts_pending_and_active_across_batches(tmp_path):
+    mgr = mk_mgr(FakeGW(fills={}), tmp_path, 'symbol_cap')
+    mgr.position_equity = lambda: 10000
+    active = mk_lot('active', state=ACTIVE, qty=80)
+    active.filled_qty = 60
+    active.close_filled_qty = 20
+    attach(mgr, active)
+    attach(mgr, mk_lot('pending', qty=40, side='short', sym='NYSE:QCOM'))
+    attach(mgr, mk_lot('closed', state=CLOSED, qty=10000))
+    assert mgr._symbol_position_block('NASDAQ:QCOM', 40, 100) == ''
+    assert '140%' in mgr._symbol_position_block('NASDAQ:QCOM', 41, 100)
+    assert mgr._symbol_position_block('NASDAQ:OTHER', 140, 100) == ''
+    assert mgr._symbol_position_block('NASDAQ:QCOM', 80, 100, 'pending') == ''
+    mgr.position_equity = lambda: float('nan')
+    assert '净值未就绪' in mgr._symbol_position_block('NASDAQ:QCOM', 1, 100)
+
+
+def test_symbol_cap_blocks_automatic_entry_before_broker_submission(tmp_path):
+    async def go():
+        mgr = mk_mgr(FakeGW(fills={}), tmp_path, 'auto_symbol_cap')
+        mgr.position_equity = lambda: 10000
+        lot, error = await mgr.place_limit_stop_lot(
+            'NASDAQ:QCOM', 'short', 141, 100, 102,
+            limit_type='auto_ema7_autotrade_v2', entry_order_type='MKT')
+        assert lot is None and '140%' in error
+        assert not mgr._lots
+    run(go())
+
+
+def test_manual_market_entry_once_until_existing_batch_is_finished(tmp_path):
+    async def go():
+        for state in (PENDING, ACTIVE, CLOSING):
+            mgr = mk_mgr(FakeGW(fills={}), tmp_path, f'manual_once_{state}')
+            mgr.recovery_status = lambda: {"blocks_entry": False}
+            attach(mgr, mk_lot('first', state=state, qty=10, sym='NYSE:QCOM'))
+            lot, error = await mgr.place_limit_stop_lot(
+                'NASDAQ:QCOM', 'long', 10, 100, 95,
+                limit_type='market', manual_entry=True)
+            assert lot is None and '只允许建仓一次' in error
+            assert len(mgr._lots) == 1
+    run(go())
+
+
+def test_golden_entry_limit_uses_same_direction_fill_and_pending_state(tmp_path):
+    async def go():
+        mgr = mk_mgr(FakeGW(fills={}), tmp_path, "golden_daily")
+        mgr.recovery_status = lambda: {"blocks_entry": False}
+        mgr.market_health = lambda: {"trade_allowed": False, "reason": "test safety stub"}
+        first = mk_lot("first", state=CLOSED, sym="NYSE:QCOM")
+        first.signal_snapshot = {"strategy_id": "golden_strategy", "strategy_instance_id": "first"}
+        first.entry_cumulative_qty = 10
+        first.entry_broker_time = time.time()
+        attach(mgr, first)
+
+        async def submit(side):
+            return (await mgr.place_limit_stop_lot(
+                "NASDAQ:QCOM", side, 10, 100, 95 if side == "long" else 105,
+                signal_snapshot={"strategy_id": "golden_strategy", "strategy_instance_id": "second"},
+            ))[1]
+
+        assert "本日同方向已成交" in await submit("long")
+        assert "行情数据陈旧" in await submit("short")
+        first.entry_broker_time -= 86400
+        assert "行情数据陈旧" in await submit("long")
+        first.entry_submission_pending = True
+        assert "同方向已有未结束订单" in await submit("long")
+        first.entry_submission_pending = False
+        first.state = CANCELLED
+        first.entry_cumulative_qty = 0
+        assert "行情数据陈旧" in await submit("long")
     run(go())

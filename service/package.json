@@ -8,6 +8,7 @@
     "collect": "node tv_cloud.js"
   },
   "dependencies": {
-    "@mathieuc/tradingview": "3.5.2"
+    "@mathieuc/tradingview": "3.5.2",
+    "https-proxy-agent": "^5.0.1"
   }
 }

@@ -44,7 +44,7 @@ class Feed:
         }
 
 
-def setup(tmp_path, monkeypatch, hour=21):
+def make_paper_fixture(tmp_path, monkeypatch, hour=21):
     from console.services import night_test
 
     clock = [datetime(2026, 11, 2, hour, 10, tzinfo=ET).timestamp()]
@@ -75,7 +75,7 @@ def tick(service, clock, price=100):
 def test_manual_start_has_no_warmup_orders_and_never_replays_old_extremes(
     tmp_path, monkeypatch
 ):
-    service, clock = setup(tmp_path, monkeypatch)
+    service, clock = make_paper_fixture(tmp_path, monkeypatch)
     run(service.start_run(100, "20:00", "04:00"))
     run(service.step())
     assert service.broker._lots == {}
@@ -110,7 +110,7 @@ def test_cross_midnight_entry_window(hm, allowed):
 def test_start_requires_fresh_verified_and_aligned_pine_data(
     tmp_path, monkeypatch, problem
 ):
-    service, _clock = setup(tmp_path, monkeypatch)
+    service, _clock = make_paper_fixture(tmp_path, monkeypatch)
     if problem == "stale":
         service.feed.fresh = False
     elif problem == "wrong_session":
@@ -130,7 +130,7 @@ def test_start_requires_fresh_verified_and_aligned_pine_data(
 def test_start_direction_uses_completed_bar_and_profile_override_is_local(
     tmp_path, monkeypatch
 ):
-    service, _clock = setup(tmp_path, monkeypatch)
+    service, _clock = make_paper_fixture(tmp_path, monkeypatch)
     before = copy.deepcopy(service.model.profile)
     service.feed.data["fixture"]["bias"] = -1
     run(service.start_run(100, "20:00", "04:00"))
@@ -143,7 +143,7 @@ def test_start_direction_uses_completed_bar_and_profile_override_is_local(
 def test_heartbeat_does_not_duplicate_market_fill_or_sample(
     tmp_path, monkeypatch
 ):
-    service, clock = setup(tmp_path, monkeypatch)
+    service, clock = make_paper_fixture(tmp_path, monkeypatch)
     run(service.start_run(100, "20:00", "04:00"))
     tick(service, clock)
     sample_count = len(service.samples)
@@ -155,7 +155,7 @@ def test_heartbeat_does_not_duplicate_market_fill_or_sample(
 
 
 def test_stop_protection_still_runs_when_pine_output_is_missing(tmp_path, monkeypatch):
-    service, clock = setup(tmp_path, monkeypatch)
+    service, clock = make_paper_fixture(tmp_path, monkeypatch)
     run(service.start_run(100, "20:00", "04:00"))
     tick(service, clock)
     tick(service, clock)
@@ -166,7 +166,7 @@ def test_stop_protection_still_runs_when_pine_output_is_missing(tmp_path, monkey
 
 
 def test_outside_window_allows_protection_but_no_new_entries(tmp_path, monkeypatch):
-    service, clock = setup(tmp_path, monkeypatch, hour=12)
+    service, clock = make_paper_fixture(tmp_path, monkeypatch, hour=12)
     run(service.start_run(100, "20:00", "04:00"))
     tick(service, clock)
     assert service.broker._lots == {}
@@ -174,7 +174,7 @@ def test_outside_window_allows_protection_but_no_new_entries(tmp_path, monkeypat
 
 
 def test_stale_and_wrong_session_ticks_cannot_drive_orders(tmp_path, monkeypatch):
-    service, clock = setup(tmp_path, monkeypatch)
+    service, clock = make_paper_fixture(tmp_path, monkeypatch)
     run(service.start_run(100, "20:00", "04:00"))
     service.feed.fresh = False
     tick(service, clock)
@@ -188,7 +188,7 @@ def test_stale_and_wrong_session_ticks_cannot_drive_orders(tmp_path, monkeypatch
 def test_stop_settles_only_test_orders_and_prevents_unsettled_switch(
     tmp_path, monkeypatch
 ):
-    service, clock = setup(tmp_path, monkeypatch)
+    service, clock = make_paper_fixture(tmp_path, monkeypatch)
     run(service.start_run(100, "20:00", "04:00"))
     tick(service, clock)
     tick(service, clock)
@@ -210,7 +210,7 @@ def test_stop_settles_only_test_orders_and_prevents_unsettled_switch(
 def test_new_confirmed_bar_is_not_consumed_on_mismatched_pine_timestamp(
     tmp_path, monkeypatch
 ):
-    service, clock = setup(tmp_path, monkeypatch)
+    service, clock = make_paper_fixture(tmp_path, monkeypatch)
     run(service.start_run(100, "20:00", "04:00"))
     previous = service.last_bar
     service.feed.data["bar"]["time"] += 300

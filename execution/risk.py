@@ -43,6 +43,7 @@ class RiskConfig:
     max_total_risk_usd: float = 1500.0  # 总风险敞口预算（0 = 不限制）
     daily_loss_limit_usd: float = 1000.0
     daily_loss_halt_enabled: bool = False  # 日亏损熔断开关（默认关闭）
+    max_direction_risk_usd: float = 0.0  # 兼容离线配置；生产从 config 注入
 
 
 class RiskGate:
@@ -80,7 +81,8 @@ class RiskGate:
                         daily_pnl: Optional[float] = None,
                         risk_usd: float = 0,
                         open_risk_usd: float = 0,
-                        risk_ref_px: float = 0) -> Tuple[bool, str]:
+                        risk_ref_px: float = 0,
+                        open_direction_risk_usd: float = 0) -> Tuple[bool, str]:
         """
         返回 (是否放行, 原因)。daily_pnl 为当日累计盈亏（实时+已实现），
         由调用方从 IBKR 账户摘要取得；None = 取不到（FA 口径未解决时），
@@ -125,6 +127,13 @@ class RiskGate:
                 return False, (f"总风险敞口 {open_risk_usd:.0f}+{planned:.0f}="
                                f"{open_risk_usd + planned:.0f} 超预算 "
                                f"{self.cfg.max_total_risk_usd:.0f}")
+        if self.cfg.max_direction_risk_usd > 0:
+            planned = qty * abs(ref - stop)
+            if open_direction_risk_usd + planned > self.cfg.max_direction_risk_usd + 1e-8:
+                direction = "多头" if side == "long" else "空头"
+                return False, (f"{direction}风险敞口 {open_direction_risk_usd:.0f}+{planned:.0f}="
+                               f"{open_direction_risk_usd + planned:.0f} 超预算 "
+                               f"{self.cfg.max_direction_risk_usd:.0f}")
         return True, "ok"
 
     # ------------------------------------------------------------------
