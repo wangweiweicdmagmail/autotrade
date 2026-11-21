@@ -45,7 +45,7 @@ class RealtimeCollector:
     STARTUP_MAX_SECONDS = 180.0
     RESTART_COOLDOWN_SECONDS = 60.0
 
-    def __init__(self, symbols: List[str], *, audit=None, market_session="extended", default_session_symbols=(), ipo_watches=None, on_ipo_trade=None):
+    def __init__(self, symbols: List[str], *, audit=None, market_session="extended", default_session_symbols=(), ipo_watches=None, on_ipo_trade=None, credentials_path=None):
         self.audit = audit
         self.market_session = market_session
         self.default_session_symbols = frozenset(default_session_symbols)
@@ -56,6 +56,7 @@ class RealtimeCollector:
         self.ipo_trades: dict = {}
         self.ipo_status: dict = {}
         self.on_ipo_trade = on_ipo_trade
+        self.credentials_path = credentials_path
         self.market_frame_id = None
         self.symbols = [s.strip() for s in symbols if s.strip()]
         self._proc: Optional[asyncio.subprocess.Process] = None
@@ -119,6 +120,7 @@ class RealtimeCollector:
             self.bar_update_delay = None
         self._proc = await asyncio.create_subprocess_exec(
             "node", str(TV_DAEMON_JS), "--symbols", ",".join(self.symbols),
+            *(["--creds", str(self.credentials_path)] if self.credentials_path is not None else []),
             "--market-session", self.market_session,
             "--default-session-symbols", ",".join(sorted(self.default_session_symbols)),
             *(["--ipo-watches", json.dumps(self.ipo_watches)] if self.ipo_watches else []),

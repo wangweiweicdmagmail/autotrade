@@ -42,6 +42,13 @@
       font-size: 12px; line-height: 1.65; overflow-wrap: anywhere; }
     .error { display: none; margin-top: 16px; padding: 10px 12px; border-radius: 7px;
       background: #3a151866; color: #f1a1a1; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+    .login-panel { margin: 20px 0; padding: 18px 20px; border: 1px solid #416aa3; border-radius: 10px; background: #213351; }
+    .login-panel[hidden] { display: none; }
+    .login-panel strong { color: #e7efff; font-size: 17px; }
+    .login-panel p { margin: 10px 0; color: #c1cee2; font-size: 13px; line-height: 1.8; }
+    .login-panel button { padding: 9px 16px; border: 0; border-radius: 6px; background: #397be8; color: white; cursor: pointer; font-size: 13px; }
+    .login-panel button:disabled { opacity: .6; cursor: default; }
+    #tv-login-result { margin-top: 10px; color: #c1cee2; font-size: 12px; line-height: 1.6; }
     .market-progress { display: block; width: 100%; height: 8px; margin-top: 6px; accent-color: #6ea8ff; }
     .cache-panel { margin-top: 16px; padding: 12px; border: 1px solid #856538;
       border-radius: 8px; background: #33291e; color: #f4d39b; font-size: 13px; line-height: 1.6; }
@@ -72,7 +79,13 @@
   <main class="loading-card">
     <div class="brand-row"><span class="logo">autotrade</span><span class="mode">STARTING</span></div>
     <h1 id="heading">正在准备交易工作区</h1>
-    <p class="subtitle">全部服务与图表数据就绪后自动进入主页面，请勿关闭此标签页。</p>
+    <p class="subtitle" id="subtitle">行情与图表就绪后自动进入主页面；TWS 可稍后连接。</p>
+    <section id="tv-login-panel" class="login-panel" hidden aria-label="TradingView 登录引导">
+      <strong id="tv-login-title">先登录你自己的 TradingView</strong>
+      <p>请在运行 AutoTrade 的电脑上，使用项目专用 Chrome 完成登录和验证码。登录后会自动保存本机会话、加载行情，无需复制 Cookie 或运行脚本。</p>
+      <button id="tv-login-open" type="button">打开专用 Chrome 登录页</button>
+      <div id="tv-login-result" role="status" aria-live="polite"></div>
+    </section>
     <div class="progress"><div id="progress-bar" class="progress-bar"></div></div>
     <div id="stages" class="stages"></div>
     <div id="error" class="error"></div>
@@ -91,6 +104,33 @@
     const errorEl = document.getElementById('error');
     const statusEl = document.getElementById('status-text');
     const elapsedEl = document.getElementById('elapsed');
+    const loginPanel = document.getElementById('tv-login-panel');
+    const loginButton = document.getElementById('tv-login-open');
+    const loginResult = document.getElementById('tv-login-result');
+    let openingLogin = false;
+    let loginActionResult = '';
+    loginButton.onclick = async () => {
+      if (openingLogin || loginButton.disabled) return;
+      openingLogin = true;
+      loginButton.disabled = true;
+      loginActionResult = '正在打开专用 Chrome…';
+      loginResult.textContent = loginActionResult;
+      try {
+        const response = await fetch('/api/startup/tv-login', {
+          method: 'POST', headers: { 'X-Autotrade-Action': 'tv-login' },
+        });
+        const result = await response.json();
+        loginActionResult = response.ok && result.ok
+          ? '登录页已打开，完成登录后系统将自动继续。'
+          : result.detail || '暂时无法打开登录页，请稍后重试。';
+      } catch (error) {
+        loginActionResult = '暂时无法连接交易服务，请稍后重试。';
+      } finally {
+        openingLogin = false;
+        loginButton.disabled = false;
+        loginResult.textContent = loginActionResult;
+      }
+    };
     const cachePanel = document.getElementById('cache-panel');
     const cacheIssues = document.getElementById('cache-issues');
     const repairButton = document.getElementById('repair-cache');
@@ -121,6 +161,19 @@
     };
 
     function render(data) {
+      const login = data.tv_login || {};
+      const waitingLogin = Boolean(login.required);
+      const loginError = waitingLogin && ['save_error', 'market_error'].includes(login.state);
+      loginPanel.hidden = !waitingLogin;
+      loginButton.hidden = login.local_actions === false || loginError;
+      loginButton.disabled = openingLogin;
+      const loginMessage = (loginError ? login.detail : loginActionResult || login.detail) || '';
+      if (loginResult.textContent !== loginMessage) loginResult.textContent = loginMessage;
+      document.getElementById('tv-login-title').textContent = loginError ? '登录已检测到，正在完成配置' : '先登录你自己的 TradingView';
+      document.getElementById('heading').textContent = waitingLogin ? loginError ? '正在完成行情配置' : '请先完成 TradingView 登录' : '正在准备交易工作区';
+      document.getElementById('subtitle').textContent = waitingLogin
+        ? loginError ? login.detail : '正在等待你的登录操作，行情尚未开始订阅。'
+        : '行情与图表就绪后自动进入主页面；TWS 可稍后连接。';
       stagesEl.replaceChildren();
       const stages = data.stages || [];
       for (const stage of stages) {
@@ -138,7 +191,7 @@
         detail.textContent = stage.detail || '';
         copy.append(label, detail);
         const market = data.market_progress;
-        if (stage.key === 'market' && market && market.total) {
+        if (stage.key === 'market' && market && market.total && !waitingLogin) {
           const progress = document.createElement('progress');
           progress.className = 'market-progress';
           progress.max = market.total;
@@ -171,7 +224,7 @@
       elapsedEl.textContent = (data.elapsed || 0) + 's';
       errorEl.style.display = data.error ? 'block' : 'none';
       errorEl.textContent = data.error || '';
-      statusEl.textContent = data.ready ? '工作区已就绪' : '正在准备，请稍候';
+      statusEl.textContent = waitingLogin ? loginError ? '等待配置恢复，系统将自动重试' : '等待 TradingView 登录，登录后自动继续' : data.ready ? '工作区已就绪' : '正在准备，请稍候';
       const issues = data.cache_issues || [];
       cacheIssues.replaceChildren(...issues.map(issue => {
         const item = document.createElement('li');

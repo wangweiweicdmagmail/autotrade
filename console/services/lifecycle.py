@@ -31,9 +31,14 @@ class LifecycleService:
         confirmed = len(confirmed_symbols)
         expected = len(config.WATCHLIST)
         elapsed = time.time() - self.context.lifecycle._startup_state["started_at"]
+        login = self.context.tv_login.snapshot()
+        waiting_login = login['required']
+        market_started = self.context.tv_login.market_started_at
+        market_elapsed = max(0, time.time() - (
+            market_started if market_started is not None else self._startup_state['started_at']))
         market_ready = collector.running and not pending and confirmed == expected
         allow_session_review = collector.running and session["requested"] == "24h" and (
-            not pending or (collector.startup_subscribed >= expected and elapsed > 120)
+            not pending or (collector.startup_subscribed >= expected and market_elapsed > 120)
         )
         ibkr_required = bool(self.context.gateway.enabled)
         ibkr_ready = bool(self.context.gateway._connected) or not ibkr_required
@@ -62,14 +67,14 @@ class LifecycleService:
                 "label": "行情与指标",
                 "ready": market_ready,
                 "blocking": market_ready or not allow_session_review,
-                "detail": f"确认指标 {confirmed}/{expected}",
+                "detail": "等待 TradingView 登录完成后开始订阅" if waiting_login else f"确认指标 {confirmed}/{expected}",
             },
             {
                 "key": "browser",
                 "label": "图表工作区",
                 "ready": browser_ready,
                 "detail": (
-                    "auto_trade 八格 / auto_trade2 四格 / 控制台独立窗口已就绪"
+                    "auto_trade 八格 / auto_trade2 六格 / 控制台独立窗口已就绪"
                     if self.context.lifecycle._startup_state.get("split_ready")
                     else "浏览器已打开；独立窗口未全部确认："
                     + self.context.lifecycle._startup_state["split_error"]
@@ -81,6 +86,9 @@ class LifecycleService:
                 or "正在准备浏览器标签页",
             },
         ]
+        if login['state'] != 'idle':
+            stages.insert(1, {'key': 'tv_login', 'label': 'TradingView 登录',
+                              'ready': not waiting_login, 'detail': login['detail']})
         errors = []
         if self.context.lifecycle._startup_state["browser_error"] and (
             not browser_ready
@@ -95,10 +103,11 @@ class LifecycleService:
                 f'{symbol}（{info.get("resolved") or "订阅错误"}）'
                 for symbol, info in unavailable.items()
             ))
-        if pending and elapsed > 240:
+        if pending and market_elapsed > 240 and not waiting_login:
             errors.append("行情订阅未完成，等待：" + "、".join(pending))
         return {
-            "market_pending": pending,
+            "market_pending": [] if waiting_login else pending,
+            "tv_login": login,
             "market_session": session,
             "ready": bool(self.context.lifecycle._startup_state["ready"]),
             "stages": stages,
@@ -155,7 +164,7 @@ class LifecycleService:
         await self.context.auto_service.restore(datetime.now(ZoneInfo("America/New_York")).date())
         self.context.automatic._auto_enabled = self.context.auto_service.enabled
         self.context.automatic._auto_strategy_name = self.context.auto_service.strategy_name
-        await self.context.collector.start()
+        await self.context.tv_login.start()
         await self.context.copy_supervisor.start(self.context.copy._load_copy_servers())
         self.context.tv_paper_sync.start()
         self.context.snapshot._broadcast_task = self.context.tasks.start(
@@ -267,6 +276,7 @@ class LifecycleService:
                 await asyncio.gather(task, return_exceptions=True)
             await external.disconnect()
         for stop in (
+            self.context.tv_login.stop,
             self.context.night_test.disconnect,
             self.context.copy_supervisor.stop_all,
             self.context.collector.stop,

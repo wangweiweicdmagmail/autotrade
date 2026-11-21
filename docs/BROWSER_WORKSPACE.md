@@ -2,6 +2,8 @@
 
 局域网客户端的 TradingView 图表在各自电脑上绑定和切换，安装和验收步骤见 [Chrome 扩展](../extensions/autotrade-tv/README.md)。
 
+本机缺少完整 TV 凭据时，工作区准备后会打开独立登录页，加载页明确提示用户登录，后台自动保存会话后继续订阅；登录等待不会重复启动行情进程或占用行情诊断超时。见 [首次登录引导](TRADINGVIEW_LOGIN.md)。
+
 当前默认使用三个独立窗口：`auto_trade` TV八格、`auto_trade2` TV六格、AutoTrade控制台。八格保留第3～10名映射；六格上排为席位1/NAS100/SPX500、下排为席位2/QQQ/SPY；控制台左榜单右订单批次。详细接口和回读规则见[当前工作台说明](MARKET_RHYTHM.md#当前三窗口布局2026-11-20)。
 
 `restart_live.sh`会在停止旧服务前检测可用的Python及项目依赖，避免GUI工具的PATH误选未安装uvicorn的Homebrew环境。可用`AUTOTRADE_PYTHON`指定解释器；`./restart_live.sh --check-python`只检查并打印解释器，不停止或启动服务。正式服务使用独立后台会话、关闭继承的标准输入，启动命令结束后继续运行；行情与连接的就绪检查沿用只读接口。

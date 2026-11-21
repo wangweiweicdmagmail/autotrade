@@ -598,6 +598,10 @@ class MonitoringService:
                 )
             elif not was_connected and connected:
                 await self.context.notifier.recover("tws_down", "TWS 已恢复连接")
+        if self.context.tv_login.waiting:
+            # No subscription exists yet. Login is an explicit startup stage,
+            # not a market outage or a reason to repeatedly restart the daemon.
+            return connected
         health = self.context.collector.data_health()
         if health["trading_hours"]:
             if health["stale"]:

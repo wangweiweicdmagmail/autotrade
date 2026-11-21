@@ -43,6 +43,7 @@ from console.services.copy import CopyService
 from console.services.desktop import DesktopService
 from console.services.events import EventsService
 from console.services.lifecycle import LifecycleService
+from console.services.tv_login import TvLoginService
 from console.services.monitoring import MonitoringService
 from console.services.news import NewsService
 from console.services.precheck import PrecheckService
@@ -61,6 +62,7 @@ from console.services.events import _BufferHandler
 @dataclass(frozen=True)
 class RuntimePaths:
     data_dir: Path = CONSOLE_FILE.parent.parent / "logs"
+    tv_credentials_path: Optional[Path] = None
 
 
 class ConsoleServices:
@@ -165,11 +167,18 @@ class ConsoleServices:
         self.monitoring._external_cleanup_task: Optional[asyncio.Task] = None
         self.trading._midpoint_escalate_attempted: set = set()
         self.market_audit = LiveMarketAudit(self.paths.data_dir / "live_audit.sqlite3")
+        credentials_path = self.paths.tv_credentials_path or (
+            CONSOLE_FILE.parent.parent / 'service' / 'creds.json'
+            if self.paths.data_dir == RuntimePaths().data_dir
+            else self.paths.data_dir / 'tv_credentials.json'
+        )
+        self.tv_login = TvLoginService(self, credentials_path)
         self.collector: RealtimeCollector = RealtimeCollector(
             config.WATCHLIST, audit=self.market_audit, market_session=config.TV_MARKET_SESSION,
             default_session_symbols=config.TV_DEFAULT_SESSION_SYMBOLS,
             ipo_watches=config.IPO_OPENING_WATCHES,
             on_ipo_trade=self.ipo_alerts.refresh,
+            credentials_path=credentials_path,
         )
         self.order_mgr.market_health = self.collector.data_health
         self.order_mgr.entry_admission = self.research.check_candidate_entry

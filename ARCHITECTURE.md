@@ -16,6 +16,8 @@ Python 不用均线或价格形态重新生成 Pine 入场信号。
 
 ## 当前链路
 
+首次启动的 TV 登录由 `TvLoginService` 协调：缺少完整凭据时先准备专用 Chrome、显示登录引导，检测并私密保存本机会话后再启动行情接入。已有完整凭据沿用原有路径。该阶段不修改券商或执行模型，接口与安全边界见 [TradingView 首次登录引导](docs/TRADINGVIEW_LOGIN.md)。
+
 ```text
 service/pine_strategies.json（模型与 plot 映射，共用声明）
   ├─ TradingView K 线 → Node PineTS → 每秒行情快照

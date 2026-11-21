@@ -153,6 +153,12 @@ class DesktopService:
         deadline = t0 + 240.0
         expected = len(config.WATCHLIST)
         while time.time() < deadline:
+            if self.context.tv_login.waiting:
+                # Login can take arbitrarily long; only time actual data loading.
+                t0 = time.time()
+                deadline = t0 + 240.0
+                await asyncio.sleep(5)
+                continue
             health = self.context.collector.study_health()
             if health.get("systemic"):
                 await self.context.notifier.notify(

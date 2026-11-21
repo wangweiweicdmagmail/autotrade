@@ -107,10 +107,22 @@ print(f"  API 上线（{time.time()-t0:.0f}s）")
 ready = expected = 0
 unavailable = {}
 tv_ok = False
-while time.time() - t0 < 300:
+tv_deadline = time.time() + 300
+last_login_state = None
+while time.time() < tv_deadline:
     try:
         startup = get("/api/startup")
     except Exception:
+        time.sleep(3)
+        continue
+    login = startup.get("tv_login", {})
+    if login.get("required"):
+        state = (login.get("state"), login.get("detail"))
+        if state != last_login_state:
+            print("  等待 TradingView 登录：" + (login.get("detail") or "请在专用 Chrome 登录自己的账户，登录后自动继续。"), flush=True)
+            last_login_state = state
+        # The user completing login is not a stalled market subscription.
+        tv_deadline = time.time() + 300
         time.sleep(3)
         continue
     progress = startup["market_progress"]
