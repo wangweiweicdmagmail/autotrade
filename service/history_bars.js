@@ -17,7 +17,7 @@ async function fetchChart(client,symbol,{timeframe='5',range=601,to=0,session='e
         const infos=chart.infos||{};
         if(!chartSession(infos,session).accepted){reject(new Error('TradingView 未确认所请求的行情时段'));return;}
         resolve({metadata:{timezone:infos.timezone,minmove:infos.minmov??infos.minmove,
-          pricescale:infos.pricescale,session:infos.subsession_id},
+          pricescale:infos.pricescale,type:infos.type,session:infos.subsession_id},
           bars:periods.slice(0,range).map(candle).sort((a,b)=>a.time-b.time)});
       });
       chart.setMarket(symbol,{timeframe,range,session:session==='default'?undefined:session,
@@ -27,6 +27,7 @@ async function fetchChart(client,symbol,{timeframe='5',range=601,to=0,session='e
 }
 
 async function fetchDataset(client,symbol,options={}) {
+  options={...options,session:symbolSession(symbol,options)};
   const data=await fetchChart(client,symbol,options);
   // Long RTH histories can cover months; cover their full date span so the
   // attack model's previous-day levels do not become missing in early bars.
@@ -35,4 +36,7 @@ async function fetchDataset(client,symbol,options={}) {
     session:options.session==='default'?'default':'regular',timeout:options.timeout});
   return {symbol,...data,daily:daily.bars};
 }
-module.exports={fetchChart,fetchDataset};
+function symbolSession(symbol,options={}){
+  return (options['default-session-symbols']||'').split(',').includes(symbol)?'default':options.session??'extended';
+}
+module.exports={fetchChart,fetchDataset,symbolSession};

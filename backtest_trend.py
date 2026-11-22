@@ -22,6 +22,7 @@ trend_state 历史回测 (backtest_trend.py)
 
 import argparse
 import asyncio
+import config
 import json
 import logging
 import subprocess
@@ -60,7 +61,8 @@ async def fetch_history(symbol: str, bars: int = 500,
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
         out_path = f.name
     cmd = ["node", str(DUMP_JS), "--symbols", symbol,
-           "--range", str(bars), "--out", out_path]
+           "--range", str(bars), "--out", out_path,
+           "--default-session-symbols", ",".join(sorted(config.TV_DEFAULT_SESSION_SYMBOLS))]
     if day:
         anchor = datetime.fromisoformat(day).replace(
             hour=16, minute=0, tzinfo=ET)

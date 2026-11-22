@@ -40,7 +40,8 @@ def main() -> None:
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
         out_path = f.name
     cmd = ["node", str(DUMP_JS), "--symbols", ",".join(symbols),
-           "--to", str(anchor), "--range", str(RANGE), "--out", out_path]
+           "--to", str(anchor), "--range", str(RANGE), "--out", out_path,
+           "--default-session-symbols", ",".join(sorted(config.TV_DEFAULT_SESSION_SYMBOLS))]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
     if r.returncode != 0:
         print("dump 失败:", r.stderr[-2000:], file=sys.stderr)

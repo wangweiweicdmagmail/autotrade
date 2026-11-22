@@ -96,3 +96,17 @@ test('historical daily inputs cover the actual intraday date span',async()=>{
  assert.equal(requests.length,2);assert.ok(requests[1].range>=span+10);
  assert.equal(requests[1].to,1700000000);assert.equal(data.daily.length,requests[1].range);
 });
+
+test('default-session indices keep their session and instrument type in historical exports',async()=>{
+ const requests=[];
+ class Chart{
+  constructor(){this.infos={full_name:'CAPITALCOM:NAS100',type:'cfd',timezone:'America/New_York',minmov:1,pricescale:100};}
+  onUpdate(fn){this.update=fn;}onError(){}delete(){}
+  setMarket(symbol,options){requests.push(options);this.periods=Array.from({length:options.range},(_,i)=>({time:1700000000-i*300,open:100,max:101,min:99,close:100,volume:1}));this.update(['$prices']);}
+ }
+ const data=await require('../service/history_bars').fetchDataset({Session:{Chart}},'CAPITALCOM:NAS100',{
+  range:2,session:'extended','default-session-symbols':'CAPITALCOM:NAS100,CAPITALCOM:SPX500'});
+ assert.equal(data.metadata.type,'cfd');
+ assert.equal(requests[0].session,undefined);assert.equal(requests[1].session,undefined);
+ assert.equal(require('../service/history_bars').symbolSession('NASDAQ:MSFT',{session:'extended'}),'extended');
+});
