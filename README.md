@@ -7,6 +7,8 @@
 
 当前功能与使用规则见 [近期功能整理（2026-11-21）](docs/FEATURES_2026-11-21.md)：候选与订单工作台、TV 八格与六格联动、趋势评分、开仓准入、候选持仓保护、VWAP 策略及验证边界。
 
+“复盘研究”页可按日期查看逐笔订单和中间动作，直接填写交易思考并保留修订；与离线研究CLI共用现有记录，仅限本机访问。见[研究归档与逐单复盘](docs/AGENT_TRADING_RESEARCH_M1_M2.md)及[影子Agent提示词与方案](docs/AGENT_SHADOW_TRADER.md)。
+
 开发新指标时，先读取 [项目协作约定](AGENTS.md) 和 [Pine 指标长期规范](docs/PINE_INDICATOR_CONTRACT.md)。
 这些规则作为项目上下文沿用，用户只需描述本次策略逻辑，无需再次粘贴通用提示词。
 

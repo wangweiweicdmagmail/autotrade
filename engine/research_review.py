@@ -110,7 +110,7 @@ class ResearchReview:
             rows = db.execute('SELECT payload FROM order_records'+(' WHERE day=?' if day else '')+' ORDER BY day,identity', (day,) if day else ()).fetchall()
         return [json.loads(row[0]) for row in rows]
 
-    def trade(self, identity, *, generate_questions=False):
+    def trade(self, identity, *, generate_questions=False, include_context=True):
         all_rows = self.trades()
         lots = [r for r in all_rows if r['lot_id'] == identity or (r.get('signal_snapshot') or {}).get('group_id') == identity]
         if not lots:
@@ -172,7 +172,7 @@ class ResearchReview:
         metrics = self._metrics(lots)
         legacy_frames = []
         legacy_path = self.data_dir/'live_audit.sqlite3'
-        if legacy_path.exists():
+        if include_context and legacy_path.exists():
             from engine.live_audit import LiveMarketAudit
             audit = LiveMarketAudit(legacy_path)
             for lot in lots:
@@ -187,7 +187,7 @@ class ResearchReview:
                         legacy_frames.append({**{k:v for k,v in record.items() if k!='data'},'lot_id':lot['lot_id'],
                             'data':{k:v for k,v in record['data'].items() if k!='opening_breakout_history'}})
         windows = []
-        for symbol in dict.fromkeys([*[r['symbol'] for r in lots],'CAPITALCOM:NAS100','CAPITALCOM:SPX500']):
+        for symbol in (dict.fromkeys([*[r['symbol'] for r in lots],'CAPITALCOM:NAS100','CAPITALCOM:SPX500']) if include_context else []):
             for series in self.store.series(symbol,'1m'):
                 before = self.store.bars(series['id'],max(0,entry-15*60),entry,as_of=entry,limit=30)
                 after = self.store.bars(series['id'],max(0,entry-5*60),entry+15*60,limit=30)

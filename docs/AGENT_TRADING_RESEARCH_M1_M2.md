@@ -68,7 +68,19 @@ python research.py --data-dir logs backup --to /path/to/new-research-backup.sqli
 
 完整交易组的计数排除分笔成交的重复计算，未结束组不算完成。初始实际风险按真实累计入场数量、成交均价及初始止损估算；缺少可靠数量时保留未知，不用委托数量替代。费用不明时不输出净R。MFE／MAE来自原记录，不能从分钟高低点伪造入场或退出前后的根内路径。超过100组仅提示应进行首次评估，不代表可自动实盘。
 
-## 本机只读接口
+## 控制台复盘研究页
+
+导航新增“复盘研究”，也可从“研究复盘”菜单进入。左侧按美东日期列出交易组，包含方向、状态、开平仓时间、组累计已实现盈亏和未解问题；右侧展示开仓、平仓、减仓、保本及止损调整的时间线。券商与执行回报默认折叠，可勾选展开。
+
+首次进入或点击“刷新订单”会增量同步研究投影；选择日期时整理该日的未解问题，不启动实盘服务、不改执行账本或复盘进度。跨日交易组在相关活动日可见，盈亏按完整组累计展示，不能将这些日期简单相加当作逐日盈亏。
+
+每条问题可直接填写、保存、确认或修订交易思考，仍追加写入同一个`questions.jsonl`，来源为`console:master`；保留原始问题、每次答复和版本，不自动升级成已验证方法。草稿在当前页面会话内保留，刷新离开前提示未保存内容；跨会话更新发生冲突时拒绝覆盖，先展示最新解释，再由用户处理草稿。
+
+本页沿用本机研究访问范围；远程客户端不因此取得全部交易思考的读取或编辑权限。保存接口核对本机来源和版本，长度受限，没有任何订单操作入口。新增后端须重启控制台加载，之后刷新页面即可进入。
+
+隔离验收：Python完整998项、Node／前端239项通过；Python另有13项条件跳过和4项live排除，保留既有FakeProc.wait警告。浏览器用合成订单验证填写、保存和重载，解释仍可读回；测试未连接TV／TWS或写生产数据。[界面预览](screenshots/research-review-preview-2026-11-23.jpg)仅含合成订单。
+
+## 本机研究接口
 
 控制台加载新版本后提供：
 
@@ -78,7 +90,15 @@ python research.py --data-dir logs backup --to /path/to/new-research-backup.sqli
 - `GET /api/research/trades/{交易组或批次身份}`
 - `GET /api/research/questions?status=pending`
 
-仅允许回环连接。用户答复通过离线CLI保存；这些接口没有开平仓或修改生产配置的能力。现有`/api/market`额外报告`research_archive`健康状态，原行情与交易接口保留。
+仅允许回环连接。原有查询保持只读，新增工作台接口：
+
+- `POST /api/research/workbench/refresh`：增量同步订单研究投影，返回可用日期。
+- `GET /api/research/workbench/days`、`GET /api/research/workbench/day?day=YYYY-MM-DD`：日期与逐笔摘要。
+- `POST /api/research/workbench/day?day=YYYY-MM-DD`：整理当日未解问题并返回摘要。
+- `POST /api/research/workbench/trades/{identity}`：查看时间线及问题。
+- `POST /api/research/workbench/trades/{identity}/questions/{question_id}`：提交`text/revision/confirmed`，仅追加解释；版本冲突返回409。
+
+用户也可继续通过离线CLI保存答复。接口没有开平仓或修改生产配置的能力。现有`/api/market`额外报告`research_archive`健康状态，原行情与交易接口保留。交易影子Agent的提示词与待开发方案见[影子研究员](AGENT_SHADOW_TRADER.md)；本页上线不代表已启用影子交易。
 
 ## 验证范围
 

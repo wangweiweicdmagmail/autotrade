@@ -10,6 +10,10 @@ import uuid
 from engine.research_store import encode, digest
 
 
+class ResearchNoteConflict(ValueError):
+    """Another writer updated the explanation after it was displayed."""
+
+
 class ResearchNotes:
     def __init__(self, root):
         self.root = Path(root)
@@ -62,7 +66,7 @@ class ResearchNotes:
         return [r for r in latest.values() if status is None or r['status'] == status
                 or (status == 'pending' and r['status'] in ('pending', 'asked'))]
 
-    def update_question(self, question_id, *, status, text=None, source=None):
+    def update_question(self, question_id, *, status, text=None, source=None, expected_id=None):
         if status not in ('asked', 'answered', 'confirmed', 'revised'):
             raise ValueError('问题状态无效')
         if status in ('answered', 'confirmed', 'revised') and (not text or not source):
@@ -71,6 +75,8 @@ class ResearchNotes:
             records = [r for r in self._read('questions.jsonl') if r['question_id'] == question_id]
             if not records:
                 raise ValueError('问题不存在')
+            if expected_id is not None and records[-1]['id'] != expected_id:
+                raise ResearchNoteConflict('这条思考已被其他会话更新，请先读取最新版本；你的草稿仍保留')
             allowed = {'pending': {'asked','answered','confirmed'}, 'asked': {'asked','answered','confirmed'},
                        'answered': {'answered','confirmed','revised'}, 'confirmed': {'confirmed','revised'},
                        'revised': {'revised','answered','confirmed'}}

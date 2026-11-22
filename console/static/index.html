@@ -10,6 +10,7 @@
   <link rel="stylesheet" href="/static/style.css?v=candidate-policy-live-v11" />
   <link rel="stylesheet" href="/static/vwap-distribution.css?v=vwap-display-grace" />
   <link rel="stylesheet" href="/static/market-rhythm.css?v=candidate-protection-live-v9" />
+  <link rel="stylesheet" href="/static/research-review.css?v=1" />
 </head>
 <body>
   <div id="app" v-cloak>
@@ -156,6 +157,7 @@
       <button :aria-pressed="bottomTab === 'screen'" @click="selectWorkspace('execution', 'screen')">选股</button>
       <button :aria-pressed="bottomTab === 'momentum'" @click="selectWorkspace('execution', 'momentum')">推进力</button>
       <button :aria-pressed="bottomTab === 'backtest'" @click="selectWorkspace('validation', 'backtest')">回测验证</button>
+      <button :aria-pressed="bottomTab === 'review'" @click="selectWorkspace('research', 'review')">复盘研究</button>
       <button :aria-pressed="bottomTab === 'night'" @click="selectWorkspace('validation', 'night')">夜盘模拟</button>
       <el-dropdown trigger="click" @command="tab => selectWorkspace('research', tab)"><button :aria-pressed="workspaceGroup === 'research'">研究复盘{{ workspaceGroup === 'research' ? ' · ' + workspaceTabNames[bottomTab] : '' }} ▾</button><template #dropdown><el-dropdown-menu><el-dropdown-item v-for="tab in workspaceTabs.research" :key="tab" :command="tab">{{ workspaceTabNames[tab] }}</el-dropdown-item></el-dropdown-menu></template></el-dropdown>
       <el-dropdown trigger="click" @command="tab => selectWorkspace('operations', tab)"><button :aria-pressed="workspaceGroup === 'operations'">系统运维{{ workspaceGroup === 'operations' ? ' · ' + workspaceTabNames[bottomTab] : '' }} ▾</button><template #dropdown><el-dropdown-menu><el-dropdown-item v-for="tab in workspaceTabs.operations" :key="tab" :command="tab">{{ workspaceTabNames[tab] }}</el-dropdown-item></el-dropdown-menu></template></el-dropdown>
@@ -385,6 +387,9 @@
         <!-- 底部面板：选股 / 运行日志（tab 切换，与订单表格平分高度） -->
         <div v-show="bottomTab !== 'instances'" class="log-panel" :style="logPanelStyle">
           <el-tabs v-model="bottomTab" class="bottom-tabs" @tab-change="onBottomTabChange">
+            <el-tab-pane class="workspace-pane pane-review" v-if="workspaceGroup === 'research'" label="复盘研究" name="review" lazy>
+              <research-review-panel :active="bottomTab === 'review'"></research-review-panel>
+            </el-tab-pane>
             <el-tab-pane class="workspace-pane pane-rhythm" v-if="workspaceGroup === 'execution'" label="候选与订单" name="rhythm" lazy>
               <market-rhythm ref="rhythmPanel" :active="bottomTab === 'rhythm'" :market="market" :now="now" :lots="lots" :positions-ready="lotsReady" :trader="traderName" :tv-sync-status="tvGridStatus+' · '+tvMarkerStatus" @select="selectRhythmStock" @manage="manageRhythmPosition" @grid="syncRhythmGrid" @open="openRhythmTrade" @frame="rhythmFrame=$event">
               <template #protection-controls>
@@ -1858,6 +1863,7 @@
   <script src="/static/range-distribution.js?v=13"></script>
   <script src="/static/vwap-distribution.js?v=vwap-display-grace"></script>
 <script src="/static/market-rhythm.js?v=holdings-reference-slots-v2"></script>
-  <script src="/static/app.js?v=candidate-policy-live-v9"></script>
+  <script src="/static/research-review.js?v=1"></script>
+  <script src="/static/app.js?v=research-review-v1"></script>
 </body>
 </html>

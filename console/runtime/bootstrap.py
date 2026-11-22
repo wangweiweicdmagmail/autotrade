@@ -50,6 +50,7 @@ from console.services.news import NewsService
 from console.services.precheck import PrecheckService
 from console.services.reports import ReportsService
 from console.services.research import ResearchService
+from console.services.agent_research import AgentResearchService
 from console.services.settings import SettingsService
 from console.services.signals import SignalsService
 from console.services.opening_vwap import OpeningVwapService
@@ -94,6 +95,7 @@ class ConsoleServices:
         self.precheck = PrecheckService(self)
         self.reports = ReportsService(self)
         self.research = ResearchService(self)
+        self.agent_research = AgentResearchService(self)
         self.settings = SettingsService(self)
         self.signals = SignalsService(self)
         self.opening_vwap = OpeningVwapService(self)

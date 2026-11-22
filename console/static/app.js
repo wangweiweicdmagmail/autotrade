@@ -38,7 +38,8 @@ function calcPosition(equity, riskUsd, limitPx, stopPx, maxPositionPct, maxOrder
 
 createApp({
   components: { ...(typeof VwapDistribution === "undefined" ? {} : { VwapDistribution }),
-    ...(typeof MarketRhythm === "undefined" ? {} : { MarketRhythm }) },
+    ...(typeof MarketRhythm === "undefined" ? {} : { MarketRhythm }),
+    ...(typeof ResearchReviewPanel === "undefined" ? {} : { ResearchReviewPanel }) },
   directives: {
     rangeWidth: {
       mounted(element, binding) {
@@ -112,12 +113,12 @@ createApp({
       executionParamsOpen: false,
       workspaceTabs: {
         execution: ['rhythm', 'vwap1m', 'openingBreakouts', 'instances', 'fvg', 'screen', 'momentum'], validation: ['backtest', 'night'],
-        research: ['reports', 'news', 'shadow', 'returns', 'perf'],
+        research: ['reports', 'review', 'news', 'shadow', 'returns', 'perf'],
         operations: ['log', 'events', 'copy'],
       },
       workspaceNames: { execution: '执行监控', validation: '回测验证', research: '研究复盘', operations: '系统运维' },
       workspaceTabNames: { instances: '执行监控', orders: '订单批次', fvg: 'FVG 监控', backtest: '回测验证', night: '夜盘模拟',
-        screen: '选股', momentum: '推进力', reports: '盘前报告', news: '盘前新闻', shadow: '影子', returns: '收益对比', perf: '绩效',
+        screen: '选股', momentum: '推进力', review: '复盘研究', reports: '盘前报告', news: '盘前新闻', shadow: '影子', returns: '收益对比', perf: '绩效',
         openingBreakouts: '区间分布图', vwap1m: 'VWAP 分布图', rhythm: '候选与订单', log: '运行日志', events: '事件', copy: '跟单管理' },
       bottomPanelHeight: (() => {
         try { const v = parseInt(localStorage.getItem('bottom_panel_height'), 10); return v >= 180 && v <= 800 ? v : 420; } catch (e) { return 420; }
