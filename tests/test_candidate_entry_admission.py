@@ -68,15 +68,15 @@ def test_production_policy_reads_the_confirmed_cache_and_expires_without_rewriti
         app.collector._snapshot=market()
         data=frame();row={**data['tracks'][0],'last_closed':STAMP-60}
         raw={'version':1,'as_of':STAMP,'day':data['day'],'columns':['time'],'beta':[],
-             'scoring':{'model':'ema9_15m_v1','version':1,'pending':[],'ready':1,'eligible':1},
+             'scoring':{'model':'ema9_15m_v2','version':2,'pending':[],'ready':1,'eligible':1},
              'ranks':data['ranks'],'series':{SYM:row},'coverage':{}}
-        raw['ranks'][0].update(score=88,score_parts={'vwap':33,'slope':35,'classification':20},
+        raw['ranks'][0].update(score=88,score_parts={'vwap':28,'slope':40,'classification':20},
                                classification_rate=1,classification_samples=15,ema9_slope_atr=.5)
         path=tmp_path/'market_rhythm.json';path.write_text(json.dumps(raw));saved=path.read_bytes()
         allowed=app.order_mgr.entry_admission(SYM,'long',NOW)
         assert allowed['ok'] and allowed['evidence']['sigma']==2
         evidence=allowed['evidence']['ranking_evidence']
-        assert evidence['model']=='ema9_15m_v1' and evidence['score']==88
+        assert evidence['model']=='ema9_15m_v2' and evidence['score']==88
         assert evidence['classification_samples']==15 and evidence['score_parts']['classification']==20
         assert not app.order_mgr.entry_admission(SYM,'short',NOW)['ok']
         assert not app.order_mgr.entry_admission(SYM,'long',NOW+121)['ok']
@@ -89,7 +89,7 @@ def test_pending_scoring_batch_cannot_grant_new_entry_from_a_partial_top_ten(tmp
     try:
         data=frame();row={**data['tracks'][0],'last_closed':STAMP-60}
         raw={'version':1,'as_of':STAMP,'day':data['day'],'columns':['time'],'beta':[],
-             'scoring':{'model':'ema9_15m_v1','version':1,'pending':[{'symbol':'NASDAQ:MSFT'}],'ready':1,'eligible':2},
+             'scoring':{'model':'ema9_15m_v2','version':2,'pending':[{'symbol':'NASDAQ:MSFT'}],'ready':1,'eligible':2},
              'ranks':data['ranks'],'series':{SYM:row},'coverage':{}}
         (tmp_path/'market_rhythm.json').write_text(json.dumps(raw));app.collector._snapshot=market()
         assert not app.order_mgr.entry_admission(SYM,'long',NOW)['ok']
@@ -163,6 +163,7 @@ def test_temporary_admission_rejection_does_not_consume_a_pine_signal_bar():
 def test_confirmed_td_must_reach_the_same_side_threshold(direction,td,allowed):
     data=frame();data['ranks'][0]['direction_sign']=direction
     data['tracks'][0]['points'][0][10]=direction;data['tracks'][0]['td']['counts'][0][1]=td
+    data['tracks'][0]['points'][0][2]=99 if direction==1 else 101
     snapshot=candidate_snapshot(data,NOW)
     assert len(snapshot['rows'])==1  # Below-threshold candidates remain visible.
     result=check_candidate(snapshot,SYM,'long' if direction==1 else 'short')
@@ -263,5 +264,37 @@ def test_crossing_ema9_before_broker_submission_blocks_without_sending(tmp_path,
         mgr._save=changed
     lot,reason=run(mgr.place_limit_stop_lot(SYM,'long',10,100,99,entry_order_type='MKT'))
     assert lot is None and 'EMA9' in reason
+    mgr._gw.place_market_with_stop.assert_not_awaited()
+    assert all(not row.entry_submission_pending for row in mgr._lots.values())
+
+
+@pytest.mark.parametrize('direction,vwap,allowed',[(1,99,True),(1,100,False),(1,101,False),
+                                                (-1,101,True),(-1,100,False),(-1,99,False),
+                                                (1,None,False),(1,float('nan'),False),(1,True,False)])
+def test_vwap_midline_is_mandatory_for_all_entries_even_without_the_optional_outer_band_filter(direction,vwap,allowed):
+    data=frame();data['ranks'][0]['direction_sign']=direction
+    data['tracks'][0]['points'][0][10]=direction;data['tracks'][0]['points'][0][2]=vwap
+    data['tracks'][0]['td']['counts'][0][1]=direction
+    result=check_candidate(candidate_snapshot(data,NOW),SYM,'long' if direction==1 else 'short')
+    assert result['ok'] is allowed
+    if allowed:assert result['evidence']['vwap_direction_allowed']
+    else:assert 'VWAP' in result['reason']
+
+
+@pytest.mark.parametrize('stage',['risk_wait','after_intent'])
+def test_vwap_midline_crossing_before_submission_never_reaches_the_broker(tmp_path,stage):
+    mgr=make_mgr(tmp_path);data=frame();live=market()
+    mgr.entry_admission=lambda symbol,side,now:check_candidate(candidate_snapshot(data,NOW,live),symbol,side)
+    mgr._gw.place_market_with_stop=AsyncMock(return_value={})
+    def cross():data['tracks'][0]['points'][0][2]=101
+    if stage=='risk_wait':
+        async def pnl():cross();return 0
+        mgr._gw.realized_pnl=pnl
+    else:
+        save=mgr._save
+        def changed():save();cross()
+        mgr._save=changed
+    lot,reason=run(mgr.place_limit_stop_lot(SYM,'long',10,100,99,entry_order_type='MKT'))
+    assert lot is None and 'VWAP' in reason
     mgr._gw.place_market_with_stop.assert_not_awaited()
     assert all(not row.entry_submission_pending for row in mgr._lots.values())

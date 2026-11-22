@@ -76,20 +76,31 @@ def candidate_snapshot(frame, now, market=None):
         td_reason = ('等待当前分钟TD收盘确认数据' if td_count is None else
                      f'当前TD {td_count:+d}，'+(f'做多要求TD ≥ {TD_THRESHOLD}' if direction == 1 else f'做空要求TD ≤ −{TD_THRESHOLD}'))
         ema = ema9_entry_state((market or {}).get(ranked['symbol']), 'long' if direction == 1 else 'short', now)
-        ranking = {'model': scoring.get('model'),
+        vwap = finite_number(point[2])
+        vwap_ready = bool(ema['ema9_ready'] and vwap is not None and vwap > 0)
+        vwap_allowed = bool(vwap_ready and direction * (ema['ema9_price'] - vwap) > 0)
+        vwap_reason = '' if vwap_allowed else ('等待有效VWAP中线与新鲜价格' if not vwap_ready else
+                      f'当前价 {ema["ema9_price"]:g}，VWAP中线 {vwap:g}，'+
+                      ('做多要求价格 > VWAP中线' if direction == 1 else '做空要求价格 < VWAP中线'))
+        ranking = {'model': scoring.get('model'), 'version': scoring.get('version'), 'weights': scoring.get('weights'),
                    **{key: ranked.get(key) for key in ('score', 'score_parts', 'vwap_score', 'ema9_5m',
                       'ema9_known_at', 'ema9_slope_atr', 'classification_rate', 'classification_correct',
-                      'classification_samples', 'classification_start_bar', 'classification_end_bar', 'ema9_bias_atr')}}
+                      'classification_samples', 'classification_start_bar', 'classification_end_bar', 'ema9_bias_atr',
+                      'direction_price', 'direction_vwap')}}
         rows.append({'symbol': ranked['symbol'], 'rank': ranked['rank'], 'direction': direction,
                      'candidate_st': confirmed_candidate_st((market or {}).get(ranked['symbol']) or {}, now),
                      'side': 'long' if direction == 1 else 'short', 'sigma': finite_number(point[3]),
-                     'vwap': finite_number(point[2]), 'ema3': finite_number(point[1]),
-                     'td_count': td_count, 'td_ready': td_count is not None, 'entry_allowed': td_allowed and ema['ema9_allowed'],
+                     'vwap': vwap, 'ema3': finite_number(point[1]),
+                     'vwap_direction_ready': vwap_ready, 'vwap_direction_allowed': vwap_allowed,
+                     'vwap_direction_block_reason': vwap_reason,
+                     'td_count': td_count, 'td_ready': td_count is not None,
+                     'entry_allowed': td_allowed and ema['ema9_allowed'] and vwap_allowed,
                      **ema, 'ranking_evidence': ranking,
-                     'entry_block_reason': td_reason if not td_allowed else ema['ema9_block_reason'],
+                     'entry_block_reason': td_reason if not td_allowed else ema['ema9_block_reason'] or vwap_reason,
                      'bar_time': point[0], 'confirmed_at': stamp})
     return {'ready': not reason, 'reason': reason, 'day': frame.get('day'), 'as_of': stamp,
-            'td_threshold': TD_THRESHOLD, 'ema9_period': 9, 'ema9_interval_seconds': 300, 'rows': rows}
+            'td_threshold': TD_THRESHOLD, 'ema9_period': 9, 'ema9_interval_seconds': 300,
+            'vwap_direction_required': True, 'rows': rows}
 
 
 def check_candidate(snapshot, symbol, side):
@@ -108,4 +119,6 @@ def check_candidate(snapshot, symbol, side):
         return {'ok': False, 'reason': PREFIX + (row.get('entry_block_reason') or '等待TD确认数据')}
     if snapshot.get('ema9_period') != 9 or snapshot.get('ema9_interval_seconds') != 300 or not row.get('ema9_allowed'):
         return {'ok': False, 'reason': PREFIX + (row.get('ema9_block_reason') or '等待五分钟EMA9过滤数据')}
+    if snapshot.get('vwap_direction_required') is not True or not row.get('vwap_direction_allowed'):
+        return {'ok': False, 'reason': PREFIX + (row.get('vwap_direction_block_reason') or '等待VWAP中线方向过滤数据')}
     return {'ok': True, 'evidence': dict(row, day=snapshot['day'], as_of=snapshot['as_of'])}

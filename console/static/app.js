@@ -3249,6 +3249,18 @@ createApp({
         '当前价 '+format(price)+'，五分钟EMA9 '+format(ema)+'，'+(side==='long'?'做多要求价格 > EMA9':'做空要求价格 < EMA9')};
     },
 
+    vwapDirectionState(symbol,side,now=Date.now()/1000) {
+      const snapshot=this.entryCandidates,candidate=(snapshot.rows||[]).find(r=>r.symbol===symbol);
+      const ema=this.ema9EntryState(symbol,side,now),vwap=candidate?.vwap;
+      const ready=!!(snapshot.vwap_direction_required===true&&snapshot.ready&&Number.isFinite(snapshot.as_of)
+        &&0<=now-snapshot.as_of&&now-snapshot.as_of<=120&&candidate?.bar_time+60===snapshot.as_of
+        &&candidate?.confirmed_at===snapshot.as_of&&ema.ready&&Number.isFinite(vwap)&&vwap>0);
+      const ok=!!(ready&&(side==='long'?ema.price>vwap:side==='short'?ema.price<vwap:false));
+      const format=v=>Number.isFinite(v)?String(+v.toFixed(5)):'—';
+      return {ready,ok,price:ema.price,vwap,reason:ok?'':!ready?'等待VWAP中线方向过滤数据':
+        '当前价 '+format(ema.price)+'，VWAP中线 '+format(vwap)+'，'+(side==='long'?'做多要求价格 > VWAP中线':'做空要求价格 < VWAP中线')};
+    },
+
     candidateAdmissionReason(symbol, side = null) {
       if(!this.status.candidate_entry_required)return '';
       const snapshot=this.entryCandidates,row=(snapshot.rows||[]).find(r=>r.symbol===symbol);
@@ -3265,7 +3277,7 @@ createApp({
       if(!Number.isSafeInteger(td)||!row.td_ready)return '等待当前分钟TD收盘确认数据';
       if(!sign||sign*td<TD_ENTRY_THRESHOLD)return '当前TD '+(td>0?'+':'')+td+'，'+(sign===1?'做多要求TD ≥ '+TD_ENTRY_THRESHOLD:'做空要求TD ≤ −'+TD_ENTRY_THRESHOLD);
       if(snapshot.ema9_period!==9||snapshot.ema9_interval_seconds!==300)return '请重启控制台加载五分钟EMA9过滤';
-      return this.ema9EntryState(symbol,side||row.side,now).reason;
+      return this.ema9EntryState(symbol,side||row.side,now).reason||this.vwapDirectionState(symbol,side||row.side,now).reason;
     },
 
     candidateOrderOptions(slot) {
@@ -3320,7 +3332,7 @@ createApp({
       if(!this.status.candidate_entry_required)return [];
       const snapshot=this.entryCandidates,candidate=(snapshot.rows||[]).find(r=>r.symbol===slot.symbol);
       const side=slot.side||candidate?.side,sign=side==='long'?1:side==='short'?-1:0,now=Date.now()/1000;
-      const data=this.market[slot.symbol]||{},ema=this.ema9EntryState(slot.symbol,side,now);
+      const data=this.market[slot.symbol]||{},ema=this.ema9EntryState(slot.symbol,side,now),vwapDirection=this.vwapDirectionState(slot.symbol,side,now);
       const format=v=>Number.isFinite(v)?String(+v.toFixed(5)):'—';
       const confirmed=!!(snapshot.ready&&Number.isFinite(snapshot.as_of)&&0<=now-snapshot.as_of&&now-snapshot.as_of<=120
         &&candidate?.bar_time+60===snapshot.as_of&&candidate?.confirmed_at===snapshot.as_of);
@@ -3347,6 +3359,8 @@ createApp({
         {key:'td',label:'一分钟收盘TD',ok:!!(tdReady&&sign*td>=TD_ENTRY_THRESHOLD),detail:tdReady?'TD '+(td>0?'+':'')+td+' · '+(sign===1?'要求 ≥ 1':'要求 ≤ −1'):'等待有效收盘TD / 新规则'},
         {key:'ema9',label:'五分钟EMA9',ok:emaVersion&&ema.ok,detail:!emaVersion?'等待后端加载过滤规则':!ema.ready?ema.reason:
           '现价 '+format(ema.price)+' / EMA9 '+format(ema.ema)+' · 要求'+(side==='long'?'高于':'低于')},
+        {key:'vwap_direction',label:'VWAP中线方向',ok:vwapDirection.ok,detail:!vwapDirection.ready?vwapDirection.reason:
+          '现价 '+format(vwapDirection.price)+' / 中线 '+format(vwapDirection.vwap)+' · 要求'+(side==='long'?'高于':'低于')},
         {key:'vwap',label:'VWAP区间过滤',ok:!vwap||vwap.ok,detail:vwap?vwap.detail:'本笔已关闭区间过滤'},
         {key:'policy',label:'候选订单设置',ok:policyReady,detail:policyReady?'使用页面顶部的实时保护设置':'请重启控制台或检查保本分钟数（1–120）'},
         ...(options?.trailing_enabled&&options.trailing_source==='st_1m_10_3'?

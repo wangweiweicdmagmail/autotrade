@@ -356,7 +356,7 @@ test('VWAP selection updates the manual trade candidate and preview while the pa
   ui.status.candidate_order_policy_version=1;
   ui.status.candidate_protection_live_version=1;
   ui.slots[0].vwapOutsideOnly=false; // This case isolates selection; policy gates have separate tests.
-  ui.entryCandidates={ready:true,td_threshold:1,ema9_period:9,ema9_interval_seconds:300,as_of:now,rows:[symbol,target].map((symbol,i)=>({symbol,side:i?'short':'long',direction:i?-1:1,sigma:2,td_count:i?-3:3,td_ready:true,bar_time:now-60,confirmed_at:now}))};
+  ui.entryCandidates={ready:true,vwap_direction_required:true,td_threshold:1,ema9_period:9,ema9_interval_seconds:300,as_of:now,rows:[symbol,target].map((symbol,i)=>({symbol,side:i?'short':'long',direction:i?-1:1,vwap:i?204:108,sigma:2,td_count:i?-3:3,td_ready:true,bar_time:now-60,confirmed_at:now}))};
   ui.market[symbol].market_1m = {bar: {time: minute}};
   ui.market[symbol].ts.ema_9=108;
   ui.market[symbol].vwap_pullback = {time: minute, direction: 1};

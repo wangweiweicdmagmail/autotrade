@@ -76,7 +76,7 @@ test('rhythm card uses the ordinary market stop outside the five-minute candle o
 
 test('manual entries take only candidate direction and can choose sigma without changing the ATR default',async()=>{
  const {ui,symbol,requests}=setup();ui.status.candidate_entry_required=true;
- ui.entryCandidates={ready:true,td_threshold:1,ema9_period:9,ema9_interval_seconds:300,as_of:minute,rows:[{symbol,side:'long',direction:1,sigma:2,rank:1,td_count:3,td_ready:true,bar_time:minute-60,confirmed_at:minute}]};
+ ui.entryCandidates={ready:true,vwap_direction_required:true,td_threshold:1,ema9_period:9,ema9_interval_seconds:300,as_of:minute,rows:[{symbol,side:'long',direction:1,vwap:99,sigma:2,rank:1,td_count:3,td_ready:true,bar_time:minute-60,confirmed_at:minute}]};
  ui.slots[0].symbol=symbol;ui.slots[0].limitType='market';
  ui.market[symbol].ts.direction=-1; // ST cannot reverse the selected candidate trend.
  ui.market[symbol].bar.low=95;ui.market[symbol].bar.high=105;
@@ -89,7 +89,7 @@ test('manual entries take only candidate direction and can choose sigma without 
 
 test('candidate reversal during confirmation cancels a manual order',async()=>{
  const {ui,symbol,requests}=setup();ui.status.candidate_entry_required=true;
- ui.entryCandidates={ready:true,td_threshold:1,ema9_period:9,ema9_interval_seconds:300,as_of:minute,rows:[{symbol,side:'long',direction:1,sigma:2,td_count:3,td_ready:true,bar_time:minute-60,confirmed_at:minute}]};ui.slots[0].symbol=symbol;
+ ui.entryCandidates={ready:true,vwap_direction_required:true,td_threshold:1,ema9_period:9,ema9_interval_seconds:300,as_of:minute,rows:[{symbol,side:'long',direction:1,vwap:99,sigma:2,td_count:3,td_ready:true,bar_time:minute-60,confirmed_at:minute}]};ui.slots[0].symbol=symbol;
  ui.confirmSlowMarketEntry=async()=>{ui.entryCandidates.rows[0].side='short';return true;};
  await ui.placeOrder(ui.calcSlot(ui.slots[0]));assert.equal(requests.length,0);
 });
@@ -104,7 +104,7 @@ function productionAdmission(ui,symbol,td=1,direction=1){
  ui.market[symbol].candidate_st_1m_c.direction=direction;
  ui.market[symbol].ts.ema_9=direction===1?99:101;
  ui.status.candidate_entry_required=true;ui.slots[0].symbol=symbol;
- ui.entryCandidates={ready:true,td_threshold:1,ema9_period:9,ema9_interval_seconds:300,as_of:minute,rows:[{symbol,rank:1,side:direction===1?'long':'short',direction,sigma:2,
+ ui.entryCandidates={ready:true,vwap_direction_required:true,td_threshold:1,ema9_period:9,ema9_interval_seconds:300,as_of:minute,rows:[{symbol,rank:1,side:direction===1?'long':'short',direction,vwap:direction===1?99:101,sigma:2,
    td_count:td,td_ready:td!=null,bar_time:minute-60,confirmed_at:minute}]};
 }
 
@@ -218,7 +218,7 @@ test('EMA9 admission uses the existing five-minute nine-period value and mirrors
   const {ui,symbol}=setup();productionAdmission(ui,symbol,direction,direction);
   ui.market[symbol].ts.ema_9=ema;ui.market[symbol].e9={ema_9:999};
   const row=ui.calcSlot(ui.slots[0]);assert.equal(row.ready,allowed);
-  const checks=ui.manualEntryChecks(row);assert.equal(checks.length,11);
+  const checks=ui.manualEntryChecks(row);assert.equal(checks.length,12);
   assert.equal(checks.find(c=>c.key==='ema9').ok,allowed);
   if(!allowed){assert.equal(row.qty,0);assert.match(row.blockReason,/EMA9/);}
  }
@@ -264,4 +264,23 @@ test('the checklist cannot mark stale or absent EMA9 as a pass and does not borr
   const row=ui.calcSlot(ui.slots[0]);assert(!row.ready);assert.equal(row.qty,0);
   assert(!ui.manualEntryChecks(row).find(c=>c.key==='ema9').ok);
  }
+});
+
+test('VWAP midline direction is mandatory with outer-band filtering disabled, and both references must agree',()=>{
+ for(const [direction,vwap,allowed] of [[1,99,true],[1,100,false],[1,101,false],[-1,101,true],[-1,100,false],[-1,99,false]]){
+  const {ui,symbol}=setup();productionAdmission(ui,symbol,direction,direction);
+  ui.slots[0].vwapOutsideOnly=false;ui.entryCandidates.rows[0].vwap=vwap;
+  const row=ui.calcSlot(ui.slots[0]);assert.equal(row.ready,allowed);
+  assert.equal(ui.manualEntryChecks(row).find(c=>c.key==='vwap_direction').ok,allowed);
+  if(!allowed)assert.match(row.blockReason,/VWAP中线/);
+ }
+});
+
+test('VWAP crossing during confirmation and missing direction capability both prevent a manual request',async()=>{
+ const {ui,symbol,requests}=setup();productionAdmission(ui,symbol);
+ ui.confirmSlowMarketEntry=async()=>{ui.market[symbol].bar.close=98.5;return true;};
+ ui.market[symbol].ts.ema_9=98; // Price still above EMA9 after crossing VWAP 99.
+ await ui.placeOrder(ui.calcSlot(ui.slots[0]));assert.equal(requests.length,0);
+ delete ui.entryCandidates.vwap_direction_required;
+ assert(!ui.manualEntryChecks(ui.calcSlot(ui.slots[0])).find(c=>c.key==='vwap_direction').ok);
 });

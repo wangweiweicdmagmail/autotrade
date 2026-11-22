@@ -155,19 +155,26 @@ function buildFrame(series, symbols, now, fiveMinute={}) {
       issue,last_closed:points.at(-1)?.[0]??null});
   }
   const fresh=current.filter(s=>s.last_closed+60===asOf), candidates=[],ranks=[],pending=[];
-  for (const row of fresh) if (row.metrics && !REFERENCES.has(row.symbol)) candidates.push({symbol:row.symbol,...row.metrics});
+  for (const row of fresh) if (row.metrics && !REFERENCES.has(row.symbol)) {
+    const facts=scoreInputs(row.points,fiveMinute[row.symbol],row.metrics.direction_sign,asOf);
+    if(!facts.ready){pending.push({symbol:row.symbol,reason:facts.reason});continue;}
+    const point=row.points.at(-1),price=point[7],vwap=point[2],ema=facts.ema9_5m;
+    const direction=price>vwap&&price>ema?1:price<vwap&&price<ema?-1:0;
+    // Keep the breakout episode for continuity, but only rank a confirmed price
+    // on the same side of both references. Mixed/equal positions are neutral.
+    if(direction!==row.metrics.direction_sign)continue;
+    candidates.push({symbol:row.symbol,...row.metrics,direction_price:price,direction_vwap:vwap,facts});
+  }
   const speeds=candidates.map(r=>Math.max(0,r.rail_speed)), accelerations=candidates.map(r=>Math.max(0,r.rail_acceleration||0));
-  for (const row of candidates) {
+  for (const {facts,...row} of candidates) {
     row.rail_component=.75*percentile(Math.max(0,row.rail_speed),speeds)+.25*percentile(Math.max(0,row.rail_acceleration||0),accelerations);
     const base=100*(.4*row.outer_fraction+.2*row.confidence+.2*row.rail_component+.2*row.drawdown_quality);
-    const facts=scoreInputs(series[row.symbol].points,fiveMinute[row.symbol],row.direction_sign,asOf);
-    if(!facts.ready){pending.push({symbol:row.symbol,reason:facts.reason});continue;}
     ranks.push({...row,...applyScore(base,facts)});
   }
   ranks.sort(compareScores);
   ranks.forEach((r,i)=>r.rank=i+1);
   return {version:1,generated_at:now,as_of:asOf,day,columns:COLUMNS,beta:BETA,ranks:ranks.slice(0,10),
-    scoring:{...SCORE_CONTRACT,pending,eligible:candidates.length,ready:ranks.length},
+    scoring:{...SCORE_CONTRACT,pending,eligible:candidates.length+pending.length,ready:ranks.length},
     coverage:{received:current.length,aligned:fresh.length,ready:fresh.filter(s=>!s.issue).length,total:symbols.length,
       missing:symbols.filter(s=>!fresh.some(row=>row.symbol===s)),
       excluded:fresh.filter(s=>s.issue).map(s=>({symbol:s.symbol,reason:s.issue}))},

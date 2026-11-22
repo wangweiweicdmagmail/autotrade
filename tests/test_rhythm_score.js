@@ -50,10 +50,17 @@ test('opening partial sample is explicit, while missing minutes, ATR, stale EMA 
 });
 test('bias changes neither score nor tie-breaking, and the declared weights match the score',()=>{
   const f=scoreInputs(points(),history(),1,OPEN+900),a={symbol:'A',...applyScore(80,f)};
-  assert.equal(a.score_parts.vwap,32);assert.equal(a.score_parts.classification,20);
-  assert.equal(a.score,32+.4*f.ema9_slope_score+20);assert.equal(SCORE_CONTRACT.bias_scored,false);
+  assert.equal(a.score_parts.vwap,24);assert.equal(a.score_parts.classification,20);
+  assert.equal(a.score,24+.5*f.ema9_slope_score+20);assert.equal(SCORE_CONTRACT.bias_scored,false);
   assert.equal(applyScore(80,{...f,ema9_bias_atr:99999}).score,a.score);
   assert(compareScores({...a,ema9_bias_atr:-999},{...a,symbol:'B',ema9_bias_atr:999})<0);
+});
+test('stronger EMA9 slope wins against a higher VWAP structure score under the 30/50/20 weights',()=>{
+  const a={symbol:'A',...applyScore(100,{ema9_slope_score:40,classification_score:100})};
+  const b={symbol:'B',...applyScore(50,{ema9_slope_score:80,classification_score:100})};
+  assert.equal(a.score,70);assert.equal(b.score,75);
+  assert.deepEqual([a,b].sort(compareScores).map(r=>r.symbol),['B','A']);
+  assert.equal(applyScore(100,{ema9_slope_score:100,classification_score:100}).score,100);
 });
 test('EMA9 history reuses the nine-period close helper and Pine ATR mapping, excluding future five-minute prices',()=>{
   const {periods,atr}=rawFive(),past=fiveMinuteHistory(periods,atr,OPEN+900);
@@ -89,9 +96,27 @@ test('incomplete 5m facts mark a scoring barrier, then late confirmed ATR revise
 });
 test('production frame publishes score evidence and never ranks a reference instrument',()=>{
   const a=calculateSeries('NASDAQ:A',minuteBars(),OPEN+900),q=calculateSeries('NASDAQ:QQQ',minuteBars(),OPEN+900);
-  const f=buildFrame({'NASDAQ:A':a,'NASDAQ:QQQ':q},['NASDAQ:A','NASDAQ:QQQ'],OPEN+900,{'NASDAQ:A':history()});
+  const {periods,atr}=rawFive();
+  const f=buildFrame({'NASDAQ:A':a,'NASDAQ:QQQ':q},['NASDAQ:A','NASDAQ:QQQ'],OPEN+900,{'NASDAQ:A':fiveMinuteHistory(periods,atr,OPEN+900)});
   assert.deepEqual(f.ranks.map(r=>r.symbol),['NASDAQ:A']);assert.equal(f.scoring.pending.length,0);
   const r=f.ranks[0];assert.equal(r.score,r.score_parts.vwap+r.score_parts.slope+r.score_parts.classification);
+});
+
+test('ranking requires the confirmed close on the same side of VWAP and five-minute EMA9, with neutral mixed/equal positions',()=>{
+  const now=OPEN+900,{periods,atr}=rawFive(),hs=fiveMinuteHistory(periods,atr,now);
+  for(const d of [1,-1]){
+    const bars=minuteBars().map(b=>d===1?b:{...b,open:400-b.open,high:400-b.low,low:400-b.high,close:400-b.close});
+    const row=calculateSeries('NASDAQ:A',bars,now),history=hs.map(p=>({...p,ema9:d===1?p.ema9:400-p.ema9}));
+    const frame=()=>buildFrame({'NASDAQ:A':row},['NASDAQ:A'],now,{'NASDAQ:A':history});
+    let f=frame();assert.equal(f.ranks.length,1);assert.equal(f.ranks[0].direction_sign,d);
+    assert.equal(f.scoring.direction_rule,'close_vs_vwap_and_ema9');
+    const p=row.points.at(-1),close=p[7];assert.equal(f.ranks[0].direction_price,close);
+    history.at(-1).ema9=close+d;f=frame();assert.equal(f.ranks.length,0);assert.deepEqual(f.scoring.pending,[]);
+    history.at(-1).ema9=close;assert.equal(frame().ranks.length,0);
+    history.at(-1).ema9=close-d;p[2]=close;assert.equal(frame().ranks.length,0);
+    p[2]=close+d;assert.equal(frame().ranks.length,0);
+    p[2]=close-d;assert.equal(frame().ranks.length,1);
+  }
 });
 
 test('pre-open and overnight scoring keeps the previous RTH close rather than only the newest night bars',async()=>{

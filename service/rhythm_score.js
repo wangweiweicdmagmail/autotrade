@@ -1,10 +1,11 @@
 'use strict';
 
 const {emaFromPeriods}=require('./ema');
-const SCORE_MODEL='ema9_15m_v1';
-const SCORE_CONTRACT=Object.freeze({model:SCORE_MODEL,version:1,ema_period:9,ema_interval_seconds:300,
+const SCORE_MODEL='ema9_15m_v2';
+const SCORE_CONTRACT=Object.freeze({model:SCORE_MODEL,version:2,ema_period:9,ema_interval_seconds:300,
   classification_interval_seconds:60,classification_window_seconds:900,
-  weights:Object.freeze({vwap:.4,slope:.4,classification:.2}),bias_scored:false});
+  weights:Object.freeze({vwap:.3,slope:.5,classification:.2}),bias_scored:false,
+  direction_rule:'close_vs_vwap_and_ema9'});
 const positive=n=>Number.isFinite(n)&&n>0;
 
 // Raw TV periods are newest first. ATR is the existing confirmed PineTS output.
@@ -64,8 +65,10 @@ function scoreInputs(points,history,d,asOf){
     ema9_bias_atr:(latest[7]-b.ema9)/b.atr,ema9_bias_pct:100*(latest[7]/b.ema9-1)};
 }
 function applyScore(baseScore,facts){
-  return {...facts,vwap_score:baseScore,score:.4*baseScore+.4*facts.ema9_slope_score+.2*facts.classification_score,
-    score_parts:{vwap:.4*baseScore,slope:.4*facts.ema9_slope_score,classification:.2*facts.classification_score}};
+  const weights=SCORE_CONTRACT.weights;
+  const parts={vwap:weights.vwap*baseScore,slope:weights.slope*facts.ema9_slope_score,
+    classification:weights.classification*facts.classification_score};
+  return {...facts,vwap_score:baseScore,score:parts.vwap+parts.slope+parts.classification,score_parts:parts};
 }
 function compareScores(a,b){return b.score-a.score||b.ema9_aligned_slope-a.ema9_aligned_slope
   ||b.classification_rate-a.classification_rate||b.vwap_score-a.vwap_score||a.symbol.localeCompare(b.symbol);}
