@@ -61,8 +61,8 @@ class MarketRhythmReader:
             if as_of > now:
                 return {"status": "error", "message": "联动行情确认时间晚于当前时间", "tracks": [], "ranks": []}
             scoring = frame.get("scoring")
-            if (not isinstance(scoring, dict) or scoring.get("model") != "ema9_15m_v2"
-                    or type(scoring.get("version")) is not int or scoring["version"] != 2):
+            if (not isinstance(scoring, dict) or scoring.get("model") != "ema9_15m_v3"
+                    or type(scoring.get("version")) is not int or scoring["version"] != 3):
                 return {"status": "waiting", "message": "等待重建EMA9／15分钟分类评分缓存", "tracks": [], "ranks": []}
             pending = scoring.get("pending")
             if not isinstance(pending, list):

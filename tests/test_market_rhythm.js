@@ -4,7 +4,8 @@ const assert=require('node:assert/strict');
 const fs=require('node:fs/promises');
 const os=require('node:os');
 const path=require('node:path');
-const {calculateSeries,buildFrame,createMarketRhythm}=require('../service/market_rhythm');
+const {calculateSeries: calculateSessionSeries,buildFrame,createMarketRhythm}=require('../service/market_rhythm');
+const calculateSeries=(symbol,bars,now,daily=[])=>calculateSessionSeries(symbol,bars,now,daily,{marketSession:'regular'});
 const {rhythmChartModel,rhythmFormingPoint}=require('../console/static/market-rhythm');
 const OPEN=Date.parse('2026-11-18T14:30:00Z')/1000;
 const prior=OPEN-86400;
@@ -73,7 +74,7 @@ test('prior-day proximity is a factual beta event and frame rebuilding is idempo
 test('atomic local cache is revised by closed bars, not live current-minute ticks',async()=>{
   const dir=await fs.mkdtemp(path.join(os.tmpdir(),'market-rhythm-'));
   try{
-    const file=path.join(dir,'frame.json'),feed=createMarketRhythm({symbols:['NASDAQ:TEST'],cachePath:file});
+    const file=path.join(dir,'frame.json'),feed=createMarketRhythm({marketSession:'regular',symbols:['NASDAQ:TEST'],cachePath:file});
     feed.observe('NASDAQ:TEST',[...warm,...rising],OPEN+840);
     await feed.flush(OPEN+844);
     const original=await fs.readFile(file,'utf8');
@@ -247,7 +248,7 @@ test('index minute requests omit session and preload enough overnight history fo
   assert.equal(index.timeframe,'1');
   assert.equal('session' in index,false);
   assert(index.range>=3000);
-  assert.deepEqual(minuteSubscriptionOptions(false),{timeframe:'1',range:850,session:'regular'});
+  assert.deepEqual(minuteSubscriptionOptions(false),{timeframe:'1',range:4000,session:'extended'});
 });
 
 test('premarket historical curves are distinct from stale RTH data',()=>{

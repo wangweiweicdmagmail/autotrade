@@ -4,7 +4,7 @@ from console.services.rhythm import MarketRhythmReader
 
 def fixture():
     return {"version": 1, "as_of": 180, "generated_at": 184, "day": "2026-11-18", "columns": ["time"],
-            "scoring": {"model": "ema9_15m_v2", "version": 2, "pending": [], "ready": 1, "eligible": 1},
+            "scoring": {"model": "ema9_15m_v3", "version": 3, "pending": [], "ready": 1, "eligible": 1},
             "beta": ["NAS", "SPX"], "ranks": [{"symbol": "A"}], "coverage": {},
             "series": {"A": {"symbol": "A", "points": [[120, 1, 1, 1, 1, 1, 1, 1, 0, "waiting", 0],
                 [180, 99, 99, 1, 99, 100, 98, 99, 0, "waiting", 0]], "events": [], "last_closed": 120}}}
@@ -99,11 +99,12 @@ def test_old_score_cache_waits_for_rebuild_and_pending_five_minute_facts_are_not
     value=fixture();path=tmp_path/'rhythm.json';reader=MarketRhythmReader(path)
     value.pop('scoring');path.write_text(json.dumps(value))
     assert reader.read(now=200)['status']=='waiting'
-    value['scoring']={'model':'ema9_15m_v1','version':1,'pending':[],'ready':1,'eligible':1}
-    path.write_text(json.dumps(value))
-    result=reader.read(now=200)
-    assert result['status']=='waiting' and result['ranks']==[]
-    value['scoring']={'model':'ema9_15m_v2','version':2,'pending':[{'symbol':'A','reason':'score_5m_pending'}], 'ready':0,'eligible':1}
+    for version in (1,2):
+        value['scoring']={'model':f'ema9_15m_v{version}','version':version,'pending':[],'ready':1,'eligible':1}
+        path.write_text(json.dumps(value))
+        result=reader.read(now=200)
+        assert result['status']=='waiting' and result['ranks']==[]
+    value['scoring']={'model':'ema9_15m_v3','version':3,'pending':[{'symbol':'A','reason':'score_5m_pending'}], 'ready':0,'eligible':1}
     path.write_text(json.dumps(value));result=reader.read(now=200)
     assert result['status']=='waiting' and result['ranks']==[]
     assert '0/1' in result['message'] and 'A' in result['message']

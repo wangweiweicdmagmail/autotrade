@@ -47,7 +47,7 @@ function createPriceUpdater(atr) {
 function chartSession(infos, requested, error = null) {
   const resolved = infos?.subsession_id || null;
   const symbol = infos?.full_name || infos?.name || null;
-  const accepted = requested === 'default' ? Boolean(symbol) : requested !== '24h' || resolved === '24h';
+  const accepted = requested === 'default' ? Boolean(symbol) : resolved === requested;
   return {
     requested, resolved, error,
     symbol,

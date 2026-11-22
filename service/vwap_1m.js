@@ -1,12 +1,14 @@
 'use strict';
 
+const {STOCK_SESSION,stockSession,hasSessionPrefix}=require('./market_session');
+
 // Read-only counterpart of indicators/vwap-ema7-position-1m.pine.
 const eastern = new Intl.DateTimeFormat('en-CA', {
   timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
   weekday: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
 });
 
-function calculateVwap1m(bars, { stMultiplier = 4 } = {}) {
+function calculateVwap1m(bars, { stMultiplier = 4, marketSession=STOCK_SESSION } = {}) {
   if (!Number.isFinite(stMultiplier) || stMultiplier <= 0) throw new Error('Invalid ST multiplier');
   let previousClose, atr, upperBand, lowerBand, line;
   let samples = 0, sumTR = 0;
@@ -17,10 +19,9 @@ function calculateVwap1m(bars, { stMultiplier = 4 } = {}) {
   let result = null;
   for (const bar of bars) {
     if (![bar.time, bar.open, bar.high, bar.low, bar.close].every(Number.isFinite)) continue;
-    const parts = Object.fromEntries(eastern.formatToParts(bar.time * 1000).map(({ type, value }) => [type, value]));
-    const minute = +parts.hour * 60 + +parts.minute;
-    if (minute < 570 || minute >= 960 || ['Sat', 'Sun'].includes(parts.weekday)) continue;
-    const day = `${parts.year}-${parts.month}-${parts.day}`;
+    const scope=stockSession(bar.time,marketSession);
+    if (!scope.active) continue;
+    const day = scope.day;
     if (day !== date) {
       date = day;
       complete = false;
@@ -29,7 +30,10 @@ function calculateVwap1m(bars, { stMultiplier = 4 } = {}) {
       recent = [];
       vwapHistory.clear();
     }
-    if (minute === 570) { complete = true; openingTime = bar.time; }
+    if (openingTime==null) {
+      complete=hasSessionPrefix(bars[0]?.time,bar.time,marketSession);
+      openingTime=bar.time;
+    }
     const tr = previousClose == null ? bar.high - bar.low :
       Math.max(bar.high - bar.low, Math.abs(bar.high - previousClose), Math.abs(bar.low - previousClose));
     let direction = null;
@@ -73,7 +77,7 @@ function calculateVwap1m(bars, { stMultiplier = 4 } = {}) {
     for (const time of vwapHistory.keys()) {
       if (vwapReferenceTime != null && time < vwapReferenceTime) vwapHistory.delete(time);
     }
-    result = { time: bar.time, date, ema, st_direction: direction, st_price: line ?? null,
+    result = { time: bar.time, date, session:marketSession, ema, st_direction: direction, st_price: line ?? null,
       vwap: hasVwap ? mean : null,
       upper: width == null ? null : mean + width, lower: width == null ? null : mean - width,
       position, speed: prior ? ema - prior.ema : null,
@@ -87,7 +91,7 @@ function calculateVwap1m(bars, { stMultiplier = 4 } = {}) {
   return result;
 }
 
-function candidateProtectionSnapshot(bars, now) {
+function candidateProtectionSnapshot(bars, now, {marketSession=STOCK_SESSION}={}) {
   // Independent closed-only ST(10,3); distribution ST(10,4) is unchanged.
   const closed = bars.filter(bar => Number.isInteger(bar.time) && bar.time % 60 === 0 && bar.time + 60 <= now);
   const last = closed.at(-1);
@@ -101,10 +105,10 @@ function candidateProtectionSnapshot(bars, now) {
   // regular minutes still warm ATR/ST, including the first minutes after open.
   if ((tail.length<11 && tail[0]?.time!==opening) ||
       tail.some((bar, i) => i && bar.time !== tail[i-1].time+60)) return null;
-  const result = calculateVwap1m(closed, {stMultiplier: 3});
+  const result = calculateVwap1m(closed, {stMultiplier: 3,marketSession});
   if (!result || result.time !== last.time || !Number.isFinite(result.st_price) || ![-1,1].includes(result.st_direction)) return null;
   return {version: 1, time: result.time, price: result.st_price, direction: result.st_direction,
-    atr_period: 10, multiplier: 3, interval_seconds: 60, session: 'regular'};
+    atr_period: 10, multiplier: 3, interval_seconds: 60, session: marketSession};
 }
 
 function createVwapMinuteBatch(symbols) {
@@ -172,7 +176,7 @@ function createVwapMinuteBatch(symbols) {
   return { observe, snapshot };
 }
 
-function openingVwapSnapshot(bars, observedAt) {
+function openingVwapSnapshot(bars, observedAt, {marketSession=STOCK_SESSION}={}) {
   const last = bars.at(-1);
   if (!last || !Number.isInteger(last.time) || !Number.isFinite(last.close)) return null;
   const parts = Object.fromEntries(eastern.formatToParts(last.time * 1000)
@@ -193,7 +197,7 @@ function openingVwapSnapshot(bars, observedAt) {
     const recent = prefix.slice(-3);
     const before = prefix.slice(0, -1);
     const previous = before.at(-1);
-    const bands = calculateVwap1m(prefix);
+    const bands = calculateVwap1m(bars.filter(row=>row.time<=bar.time),{marketSession});
     if (!(bands?.upper > bands?.lower)) continue;
     const bodyPct = Math.abs(bar.close - bar.open) / bar.open * 100;
     if (!(bodyPct > 0.5)) continue;

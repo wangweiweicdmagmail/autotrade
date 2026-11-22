@@ -258,7 +258,7 @@ class TradingService:
         return limit, stop
 
     def _market_direction(self, data: dict, now: datetime) -> dict:
-        """手动市价单用常规盘一分钟 ST(10, 4)，确认输出优先。"""
+        """手动市价单读取盘前盘后预热的一分钟ST(10,4)，交易窗口独立检查，确认输出优先。"""
         minute_market = data.get("market_1m") or {}
         current = finite_number((minute_market.get("bar") or {}).get("time"))
         if current is None or not current <= now.timestamp() < current + 60:

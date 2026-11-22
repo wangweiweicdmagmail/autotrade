@@ -248,8 +248,8 @@ SLOW_BREAK_SECONDS = 900
 AUTO_BREAKEVEN_R = 2.0
 
 
-# 主行情的 5 分钟 TradingView 会话。
-TV_MARKET_SESSION = _os.environ.get("TV_MARKET_SESSION", "24h")
+# 股票的一分钟与五分钟统一使用真实盘前盘后行情；交易窗口独立检查。
+TV_MARKET_SESSION = _os.environ.get("TV_MARKET_SESSION", "extended")
 # 这些报价使用数据商的默认时段，不请求美股的 24h 子时段。
 TV_DEFAULT_SESSION_SYMBOLS = ("BLACKBULL:WTI", "CAPITALCOM:NAS100", "CAPITALCOM:SPX500")
 

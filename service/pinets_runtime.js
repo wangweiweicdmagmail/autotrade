@@ -6,7 +6,7 @@ const { loadPineModels, outputFromPeriod } = require('./pine_models');
 
 const versions = {
   e9: '12.0', e20: '1.0', e7v2: '3.0', golden: '1.0', trend: '27.0', fvg: '7.0',
-  smart: '1.0', attack: '17.0', vwap_pullback: '1.1',
+  smart: '1.0', attack: '17.0', vwap_pullback: '1.2',
 };
 const sourceFiles = { golden: 'large-candle-retracement.pine', vwap_pullback: 'vwap-outer-pullback-1m.pine' };
 const supplementalPlots = {

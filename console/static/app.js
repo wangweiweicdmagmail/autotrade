@@ -3320,7 +3320,7 @@ createApp({
     candidateStState(slot) {
       const data=this.market[slot.symbol]||{},st=data.candidate_st_1m_c,now=Date.now()/1000;
       const ready=st?.version===1&&st.atr_period===10&&st.multiplier===3&&st.interval_seconds===60
-        &&st.session==='regular'&&[-1,1].includes(st.direction)&&Number.isFinite(st.price)&&st.price>0
+        &&['regular','extended','24h'].includes(st.session)&&[-1,1].includes(st.direction)&&Number.isFinite(st.price)&&st.price>0
         &&Number.isInteger(st.time)&&st.time%60===0&&0<=now-(st.time+60)&&now-(st.time+60)<105
         &&data.market_1m?.bar_c?.time===st.time;
       const ok=!!(ready&&st.direction===(slot.side==='long'?1:-1));

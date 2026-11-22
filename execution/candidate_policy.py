@@ -70,7 +70,7 @@ def confirmed_candidate_st(data, now):
     stamp, value = finite_number(row.get('time')), finite_number(row.get('price'))
     if (type(row.get('version')) is not int or row['version'] != 1
             or row.get('atr_period') != 10 or row.get('multiplier') != 3
-            or row.get('interval_seconds') != 60 or row.get('session') != 'regular'
+            or row.get('interval_seconds') != 60 or row.get('session') not in ('regular','extended','24h')
             or isinstance(row.get('direction'), bool) or row.get('direction') not in (-1,1)
             or stamp is None or stamp % 60 or not 0 <= now-(stamp+60) < 105
             or value is None or value <= 0

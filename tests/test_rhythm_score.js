@@ -3,7 +3,8 @@ const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const fs=require('node:fs/promises'),os=require('node:os'),path=require('node:path');
 const {SCORE_CONTRACT,fiveMinuteHistory,scoreInputs,applyScore,compareScores}=require('../service/rhythm_score');
-const {createMarketRhythm,buildFrame,calculateSeries}=require('../service/market_rhythm');
+const {createMarketRhythm,buildFrame,calculateSeries: calculateSessionSeries}=require('../service/market_rhythm');
+const calculateSeries=(symbol,bars,now,daily=[])=>calculateSessionSeries(symbol,bars,now,daily,{marketSession:'regular'});
 const OPEN=Date.parse('2026-11-18T14:30:00Z')/1000;
 function history(){return Array.from({length:9},(_,i)=>{const known=OPEN+(i-3)*300;return{time:known-300,known_at:known,ema9:100+i*10,atr:2};});}
 function points(start=OPEN,end=OPEN+900,hs=history()){
@@ -80,7 +81,7 @@ test('EMA slope counts three actual five-minute bar steps even when premarket ba
 test('incomplete 5m facts mark a scoring barrier, then late confirmed ATR revises the same minute to ready',async()=>{
   const dir=await fs.mkdtemp(path.join(os.tmpdir(),'rhythm-score-'));
   try{
-    const cache=path.join(dir,'frame.json'),feed=createMarketRhythm({symbols:['NASDAQ:A'],cachePath:cache}),{periods,atr}=rawFive();
+    const cache=path.join(dir,'frame.json'),feed=createMarketRhythm({marketSession:'regular',symbols:['NASDAQ:A'],cachePath:cache}),{periods,atr}=rawFive();
     feed.observe('NASDAQ:A',minuteBars(),OPEN+900);
     feed.observeFiveMinute('NASDAQ:A',periods,null,OPEN+900);await feed.flush(OPEN+904);
     let frame=JSON.parse(await fs.readFile(cache,'utf8'));assert.equal(frame.scoring.pending.length,1);assert.equal(frame.ranks.length,0);
@@ -122,7 +123,7 @@ test('ranking requires the confirmed close on the same side of VWAP and five-min
 test('pre-open and overnight scoring keeps the previous RTH close rather than only the newest night bars',async()=>{
   const dir=await fs.mkdtemp(path.join(os.tmpdir(),'rhythm-overnight-'));
   try{
-    const file=path.join(dir,'frame.json'),feed=createMarketRhythm({symbols:['NASDAQ:A'],cachePath:file});
+    const file=path.join(dir,'frame.json'),feed=createMarketRhythm({marketSession:'regular',symbols:['NASDAQ:A'],cachePath:file});
     const now=OPEN+86400-1800,close=OPEN+23400;
     const bar=(time,price)=>({time,open:price,high:price+.1,low:price-.1,close:price,volume:100});
     const bars=[...Array.from({length:40},(_,i)=>bar(OPEN-86400+i*60,100)),...Array.from({length:390},(_,i)=>bar(OPEN+i*60,100+i*.02))];

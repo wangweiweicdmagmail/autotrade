@@ -1,31 +1,20 @@
 //@version=6
 indicator("VWAP 外沿回踩", overlay=true)
 
-// Use this model on a one-minute chart with the regular session selected.
+// 一分钟盘前盘后图表：标准EMA/ST/ATR连续预热，VWAP按交易日累计。
+// 交易窗口独立保留常规盘，盘前盘后不发布入场信号。
 et = "America/New_York"
 minuteOfDay = hour(time, et) * 60 + minute(time, et)
-regular = timeframe.isminutes and timeframe.multiplier == 1 and syminfo.session == session.regular and minuteOfDay >= 570 and minuteOfDay < 960
-opening = regular and minuteOfDay == 570
-dayKey = year(time, et) * 10000 + month(time, et) * 100 + dayofmonth(time, et)
-var int sessionDay = na
-var float weight = 0.0
-var float vwap = 0.0
-var float m2 = 0.0
-if opening
-    sessionDay := dayKey
-    weight := 0.0
-    vwap := 0.0
-    m2 := 0.0
-complete = regular and sessionDay == dayKey
-if complete and not na(volume) and volume > 0
-    nextWeight = weight + volume
-    delta = hlc3 - vwap
-    vwap += delta * volume / nextWeight
-    m2 += volume * delta * (hlc3 - vwap)
-    weight := nextWeight
+regular = timeframe.isminutes and timeframe.multiplier == 1 and not na(time("1", "0930-1600:23456", et))
+inSession = timeframe.isminutes and timeframe.multiplier == 1 and not na(time("1", "0400-2000:23456", et))
+newSession = timeframe.change("D") or barstate.isfirst
+[vwap, rawUpper, rawLower] = ta.vwap(hlc3, newSession, 1.0)
+var int positiveSamples = 0
+positiveSamples := newSession ? (volume > 0 ? 1 : 0) : nz(positiveSamples[1], 0) + (volume > 0 ? 1 : 0)
+complete = inSession and not na(vwap)
 
 ema = ta.ema(close, 7)
-width = complete and weight > 0 ? math.sqrt(math.max(0.0, m2 / weight)) : na
+width = complete ? (positiveSamples >= 2 ? math.max(0.0, rawUpper - vwap) : 0.0) : na
 upper = width > 0 ? vwap + width : na
 lower = width > 0 ? vwap - width : na
 [st, stSign] = ta.supertrend(4.0, 10)

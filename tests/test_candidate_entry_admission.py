@@ -68,7 +68,7 @@ def test_production_policy_reads_the_confirmed_cache_and_expires_without_rewriti
         app.collector._snapshot=market()
         data=frame();row={**data['tracks'][0],'last_closed':STAMP-60}
         raw={'version':1,'as_of':STAMP,'day':data['day'],'columns':['time'],'beta':[],
-             'scoring':{'model':'ema9_15m_v2','version':2,'pending':[],'ready':1,'eligible':1},
+             'scoring':{'model':'ema9_15m_v3','version':3,'pending':[],'ready':1,'eligible':1},
              'ranks':data['ranks'],'series':{SYM:row},'coverage':{}}
         raw['ranks'][0].update(score=88,score_parts={'vwap':28,'slope':40,'classification':20},
                                classification_rate=1,classification_samples=15,ema9_slope_atr=.5)
@@ -76,7 +76,7 @@ def test_production_policy_reads_the_confirmed_cache_and_expires_without_rewriti
         allowed=app.order_mgr.entry_admission(SYM,'long',NOW)
         assert allowed['ok'] and allowed['evidence']['sigma']==2
         evidence=allowed['evidence']['ranking_evidence']
-        assert evidence['model']=='ema9_15m_v2' and evidence['score']==88
+        assert evidence['model']=='ema9_15m_v3' and evidence['score']==88
         assert evidence['classification_samples']==15 and evidence['score_parts']['classification']==20
         assert not app.order_mgr.entry_admission(SYM,'short',NOW)['ok']
         assert not app.order_mgr.entry_admission(SYM,'long',NOW+121)['ok']
@@ -89,7 +89,7 @@ def test_pending_scoring_batch_cannot_grant_new_entry_from_a_partial_top_ten(tmp
     try:
         data=frame();row={**data['tracks'][0],'last_closed':STAMP-60}
         raw={'version':1,'as_of':STAMP,'day':data['day'],'columns':['time'],'beta':[],
-             'scoring':{'model':'ema9_15m_v2','version':2,'pending':[{'symbol':'NASDAQ:MSFT'}],'ready':1,'eligible':2},
+             'scoring':{'model':'ema9_15m_v3','version':3,'pending':[{'symbol':'NASDAQ:MSFT'}],'ready':1,'eligible':2},
              'ranks':data['ranks'],'series':{SYM:row},'coverage':{}}
         (tmp_path/'market_rhythm.json').write_text(json.dumps(raw));app.collector._snapshot=market()
         assert not app.order_mgr.entry_admission(SYM,'long',NOW)['ok']

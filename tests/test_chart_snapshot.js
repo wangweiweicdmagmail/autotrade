@@ -41,7 +41,9 @@ test('24h requires the exact session reported by TradingView', () => {
   }
   assert.equal(chartSession({subsession_id: '24h'}, '24h').accepted, true);
   assert.equal(chartSession({subsession_id: '24h'}, '24h', 'series error').accepted, false);
-  assert.equal(chartSession({}, 'extended').accepted, true);
+  assert.equal(chartSession({}, 'extended').accepted, false);
+  assert.equal(chartSession({subsession_id:'regular'}, 'extended').accepted, false);
+  assert.equal(chartSession({subsession_id:'extended'}, 'extended').accepted, true);
 });
 
 test('provider default does not require a named subsession, but requires a resolved symbol', () => {

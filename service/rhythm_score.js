@@ -1,8 +1,8 @@
 'use strict';
 
 const {emaFromPeriods}=require('./ema');
-const SCORE_MODEL='ema9_15m_v2';
-const SCORE_CONTRACT=Object.freeze({model:SCORE_MODEL,version:2,ema_period:9,ema_interval_seconds:300,
+const SCORE_MODEL='ema9_15m_v3';
+const SCORE_CONTRACT=Object.freeze({model:SCORE_MODEL,version:3,ema_period:9,ema_interval_seconds:300,
   classification_interval_seconds:60,classification_window_seconds:900,
   weights:Object.freeze({vwap:.3,slope:.5,classification:.2}),bias_scored:false,
   direction_rule:'close_vs_vwap_and_ema9'});

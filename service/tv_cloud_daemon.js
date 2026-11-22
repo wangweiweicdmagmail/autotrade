@@ -1,5 +1,5 @@
 /**
- * 生产路径从 TradingView 分批订阅 5 分钟 K 线、常规时段 1 分钟 K 线和日线，在 PineTS worker
+ * 生产路径从 TradingView 分批订阅同一时段的 5 分钟、1 分钟 K 线和日线，在 PineTS worker
  * 中计算指标。stdout 每秒发布原有 Tick JSON；不提供 TV 指标注册或订阅模式。
  */
 'use strict';
@@ -16,7 +16,7 @@ const { BAR_LIMIT, createLocalIndicators, candle } = require('./pinets_live');
 const { calculateVwap1m, candidateProtectionSnapshot, createVwapMinuteBatch, openingVwapSnapshot } = require('./vwap_1m');
 const { BETA, REFERENCES, createMarketRhythm, minuteSubscriptionOptions } = require('./market_rhythm');
 const { startIpoWatch } = require('./ipo_watch');
-const MINUTE_HISTORY = 850;
+const {STOCK_SESSION,MINUTE_HISTORY}=require('./market_session');
 
 const PUSH_INTERVAL_MS = 1000;      // 输出节流：每秒一次
 const HEARTBEAT_MS = 30000;         // 心跳：每 30s
@@ -68,12 +68,12 @@ async function main() {
     throw new Error('TV 云指标对照入口已退役；当前仅支持 K 线订阅与 PineTS 本地计算');
   const creds = JSON.parse(fs.readFileSync(args.creds, 'utf8'));
 
-  const marketSession = args['market-session'] || '24h';
+  const marketSession = args['market-session'] || STOCK_SESSION;
   if (!['24h', 'extended'].includes(marketSession)) throw new Error('不支持的 5 分钟行情时段');
   const defaultSessionSymbols = new Set((args['default-session-symbols'] || '').split(',').filter(Boolean));
   const rhythm = args['rhythm-cache'] ? createMarketRhythm({
     symbols: args.symbols.filter(symbol => !defaultSessionSymbols.has(symbol) || BETA.includes(symbol)),
-    cachePath: args['rhythm-cache'],
+    cachePath: args['rhythm-cache'],marketSession,
   }) : null;
   let rhythmErrorAt = 0;
   const vwapMinuteBatch = createVwapMinuteBatch(args.symbols.filter(symbol => !defaultSessionSymbols.has(symbol)));
@@ -167,9 +167,9 @@ async function main() {
     });
     if (local && (!defaultSessionSymbols.has(symbol) || (rhythm && BETA.includes(symbol)))) {
       const referenceOnly = defaultSessionSymbols.has(symbol);
-      const minuteSession = referenceOnly ? 'default' : 'regular';
-      // Include prior regular sessions for EMA7/ST warm-up.
-      const minuteRequest = minuteSubscriptionOptions(referenceOnly, MINUTE_HISTORY);
+      const minuteSession = referenceOnly ? 'default' : marketSession;
+      // Both resolutions use real extended-session prices for indicator warm-up.
+      const minuteRequest = minuteSubscriptionOptions(referenceOnly, MINUTE_HISTORY,marketSession);
       const minuteHistory = minuteRequest.range;
       const subscribeMinute = () => {
         if (entries[symbol] !== entry || entry.gaveUp) return;
@@ -206,18 +206,18 @@ async function main() {
             previousRegularRange(entry.daily, rows.at(-1).time), entry.daily || []);
           if (rhythm) entry.rhythmPrice1m = {bar: rows.at(-1), price_observed_at: Date.now() / 1000};
           if (referenceOnly) return;
-          entry.vwap1m = calculateVwap1m(rows);
+          entry.vwap1m = calculateVwap1m(rows,{marketSession});
           // Unclosed quote bursts do not recompute the closed ST. Include all
           // closed OHLCV in the key so a deep TV history correction invalidates it.
           const candidateNow = Date.now() / 1000;
           const closedMinutes = rows.filter(bar => bar.time + 60 <= candidateNow);
           const candidateKey = JSON.stringify(closedMinutes);
           if (candidateKey !== entry.candidateStKey) {
-            entry.candidateSt1m = candidateProtectionSnapshot(closedMinutes, candidateNow);
+            entry.candidateSt1m = candidateProtectionSnapshot(closedMinutes, candidateNow,{marketSession});
             entry.candidateStKey = candidateKey;
           }
           vwapMinuteBatch.observe(symbol, entry.vwap1m);
-          entry.vwapOpening = openingVwapSnapshot(rows, Date.now() / 1000);
+          entry.vwapOpening = openingVwapSnapshot(rows, Date.now() / 1000,{marketSession});
           entry.minuteRaw = {bar: rows.at(-1), bar_c: rows.at(-2)};
           minuteLocal.observe(symbol, minuteChart.periods, minuteChart.infos, entry.minuteRaw);
         });
@@ -305,7 +305,7 @@ async function main() {
       if (entry.vwapOpening) vwapOpening[sym] = entry.vwapOpening;
       const session = chartSession(entry.chart.infos, entry.requestedSession, entry.sessionError);
       sessions[sym] = { ...session, has_bars: !!raw.bar && session.accepted };
-      if (!raw.bar || (entry.requestedSession !== 'extended' && !session.accepted)) continue;
+      if (!raw.bar || !session.accepted) continue;
       const s = localSnapshot(local, sym, raw);
       if(rhythm&&!REFERENCES.has(sym)){
         const history=local?.confirmedHistory(sym,s,'trend');

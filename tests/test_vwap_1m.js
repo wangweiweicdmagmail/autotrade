@@ -1,6 +1,10 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { calculateVwap1m, candidateProtectionSnapshot, createVwapMinuteBatch, openingVwapSnapshot } = require('../service/vwap_1m');
+const { calculateVwap1m: calculateSessionVwap, candidateProtectionSnapshot: candidateSessionSnapshot, createVwapMinuteBatch, openingVwapSnapshot: openingSessionSnapshot } = require('../service/vwap_1m');
+// Retain isolated coverage of existing RTH-only historical inputs explicitly.
+const calculateVwap1m=(bars,options={})=>calculateSessionVwap(bars,{marketSession:'regular',...options});
+const candidateProtectionSnapshot=(bars,now)=>candidateSessionSnapshot(bars,now,{marketSession:'regular'});
+const openingVwapSnapshot=(bars,now)=>openingSessionSnapshot(bars,now,{marketSession:'regular'});
 const { createCalculator, getDefinition } = require('../service/pinets_runtime');
 const fs = require('node:fs');
 const path = require('node:path');

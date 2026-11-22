@@ -4,61 +4,51 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const {SCORE_CONTRACT,fiveMinuteHistory,scoreInputs,applyScore,compareScores}=require('./rhythm_score');
-const ET = new Intl.DateTimeFormat('en-CA', {timeZone: 'America/New_York', year: 'numeric',
-  month: '2-digit', day: '2-digit', weekday: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23'});
+const {STOCK_SESSION,MINUTE_HISTORY,stockSession,hasSessionPrefix}=require('./market_session');
 const BETA = ['CAPITALCOM:NAS100', 'CAPITALCOM:SPX500'];
 const REFERENCES = new Set([...BETA, 'BLACKBULL:WTI', 'NASDAQ:QQQ', 'AMEX:SPY', 'NASDAQ:SMH',
   'AMEX:XLB', 'AMEX:XLP', 'AMEX:XLU', 'AMEX:XLV']);
 const COLUMNS = ['time', 'ema3', 'vwap', 'sigma', 'open', 'high', 'low', 'close', 'z', 'phase', 'direction'];
-function minuteSubscriptionOptions(referenceOnly, stockHistory=850) {
+function minuteSubscriptionOptions(referenceOnly, stockHistory=MINUTE_HISTORY,marketSession=STOCK_SESSION) {
   // Overnight, yesterday's full RTH needs its preceding RTH for EMA warm-up.
   // Indices must omit session entirely; regular/24h can return no prices.
-  return referenceOnly ? {timeframe:'1',range:4000} : {timeframe:'1',range:stockHistory,session:'regular'};
+  return referenceOnly ? {timeframe:'1',range:4000} : {timeframe:'1',range:stockHistory,session:marketSession};
 }
 function session(t) {
-  const p = Object.fromEntries(ET.formatToParts(t * 1000).map(p => [p.type, p.value]));
-  const minute = +p.hour * 60 + +p.minute;
-  return {day: `${p.year}-${p.month}-${p.day}`, minute,
-    regular: minute >= 570 && minute < 960 && !['Sat', 'Sun'].includes(p.weekday)};
+  return stockSession(t);
 }
 const round = n => Number.isFinite(n) ? +n.toFixed(7) : null;
 const valid = b => [b.time,b.open,b.high,b.low,b.close,b.volume].every(Number.isFinite)
   && b.time % 60 === 0 && b.low > 0 && b.low <= Math.min(b.open,b.close)
   && b.high >= Math.max(b.open,b.close) && b.volume >= 0;
 
-function calculateSeries(symbol, bars, now, daily=[]) {
+function calculateSeries(symbol, bars, now, daily=[],{marketSession=STOCK_SESSION}={}) {
   const beta=BETA.includes(symbol), anchors=daily.filter(b=>Number.isFinite(b.time)).sort((a,b)=>a.time-b.time);
   const input = [...new Map(bars.filter(b => Number.isFinite(b.time) && b.time + 60 <= now)
     .map(b => [b.time, b])).values()].sort((a,b) => a.time-b.time);
-  let day, ema, weight=0, mean=0, m2=0, positive=0, opened=false, last, warmup=0, priorCount=0;
+  let day,calculationDay, ema, weight=0, mean=0, m2=0, positive=0, opened=false,calculationReady=false,
+    calculationInvalid=false,last, warmup=0, priorCount=0;
   let points=[], events=[], episode=null, number=0, previous=null, gap=null;
   // Confirmed TD for coloring and shared entry admission, aligned with indicators/td-price-line.pine defaults.
   // Carry the close history and count across daily VWAP resets.
   let tdCount=0, tdCounts=[]; const tdCloses=[];
   for (const bar of input) {
-    const s = session(bar.time);
-    if (!beta && !s.regular) continue;
+    const s = stockSession(bar.time,marketSession);
+    if (!beta && !s.active) continue;
     const anchor=beta?anchors.findLast(d=>d.time<=bar.time):null;
     const key=beta?(anchor?.time??'missing_anchor'):s.day;
-    if (key !== day) {
-      day=key; weight=mean=m2=positive=0; opened=false; last=null;
-      warmup=priorCount; if(!beta){points=[];events=[];tdCounts=[];} episode=previous=null; number=0; gap=null;
+    if (key !== calculationDay) {
+      calculationDay=key;weight=mean=m2=positive=0;calculationInvalid=false;
+      calculationReady=beta?!!(anchor&&(bar.time===anchor.time||input[0].time<anchor.time))
+        :hasSessionPrefix(input[0]?.time,bar.time,marketSession);
     }
     const reference=tdCloses.length===4?tdCloses[0]:null;
     tdCount=!Number.isFinite(bar.close)||!Number.isFinite(reference)?0
       :bar.close>reference?(tdCount>0?tdCount+1:1)
       :bar.close<reference?(tdCount<0?tdCount-1:-1):0;
     tdCloses.push(bar.close);if(tdCloses.length>4)tdCloses.shift();
-    // Default CFD sessions can have a maintenance break at the daily boundary.
-    // A loaded prefix reaching before the anchor covers that break; an input
-    // starting mid-session does not prove a complete anchored accumulation.
-    if (beta ? anchor&&(bar.time===anchor.time||input[0].time<anchor.time) : s.minute === 570) opened=true;
-    if (!valid(bar) || !opened || (!beta && last != null && bar.time !== last+60)) {
-      gap ||= !opened ? (beta?'missing_session_anchor':'missing_open') : !valid(bar) ? 'invalid_bar' : 'minute_gap';
-      episode=null; previous=null;
-    }
-    last=bar.time;
-    if (!valid(bar)) continue;
+    if (!valid(bar)){calculationInvalid=true;continue;}
+    const warmBefore=priorCount;
     priorCount++;
     ema = ema == null ? bar.close : ema + .5*(bar.close-ema);
     if (bar.volume > 0) {
@@ -67,6 +57,20 @@ function calculateSeries(symbol, bars, now, daily=[]) {
       if (positive===1) {mean=value; m2=0;}
     }
     const sigma=positive >= 2 && weight>0 ? Math.sqrt(Math.max(0,m2/weight)) : 0;
+    // Warm indicators on the entire extended session; stock ranking episodes
+    // and their displayed clock still start at the regular open.
+    if(!beta&&!s.regular)continue;
+    if(key!==day){
+      day=key;opened=false;last=null;warmup=warmBefore;
+      if(!beta){points=[];events=[];tdCounts=[];}
+      episode=previous=null;number=0;gap=null;
+    }
+    if(beta?calculationReady:s.minute===570)opened=true;
+    if(!opened||!calculationReady||calculationInvalid||(!beta&&last!=null&&bar.time!==last+60)){
+      gap ||= !calculationReady?'missing_session_anchor':!opened?'missing_open':calculationInvalid?'invalid_bar':'minute_gap';
+      episode=previous=null;
+    }
+    last=bar.time;
     const z=!gap && sigma>Math.max(1e-10,Math.abs(mean)*1e-12) ? (ema-mean)/sigma : null;
     const point={time:bar.time,ema3:ema,vwap:gap||!weight?null:mean,sigma:gap?null:sigma,
       open:bar.open,high:bar.high,low:bar.low,close:bar.close,z};
@@ -180,7 +184,7 @@ function buildFrame(series, symbols, now, fiveMinute={}) {
       excluded:fresh.filter(s=>s.issue).map(s=>({symbol:s.symbol,reason:s.issue}))},
     series:Object.fromEntries(current.map(s=>[s.symbol,{...s,metrics:undefined,events:referenceEvents(s)}]))};
 }
-function createMarketRhythm({symbols,cachePath}) {
+function createMarketRhythm({symbols,cachePath,marketSession=STOCK_SESSION}) {
   const series={},signatures=new Map(),fiveMinute={},fiveKeys=new Map(); let dirty=false,busy=false,changedAt=0;
   function changed(now){if(!dirty)changedAt=now;dirty=true;}
   return {
@@ -199,8 +203,8 @@ function createMarketRhythm({symbols,cachePath}) {
       const signature=closed.map(b=>[b.time,b.open,b.high,b.low,b.close,b.volume].join(',')).join(';')+JSON.stringify([previousRange,daily.map(b=>b.time)]);
       if (!closed.length || signatures.get(symbol)===signature) return;
       signatures.set(symbol,signature);
-      series[symbol]={...calculateSeries(symbol,closed,now,daily),previous_range:previousRange,
-        source:{interval_seconds:60,session:BETA.includes(symbol)?'default':'regular',
+      series[symbol]={...calculateSeries(symbol,closed,now,daily,{marketSession}),previous_range:previousRange,
+        source:{interval_seconds:60,session:BETA.includes(symbol)?'default':marketSession,
           last_bar_time:bars.at(-1)?.time??null,last_closed_bar_time:closed.at(-1)?.time??null,
           received_at:now,bar_count:bars.length}};
       changed(now);

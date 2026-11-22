@@ -33,7 +33,7 @@ const VwapDistribution = {
     vwapSpeedWaiting() {
       if (!this.rows.length) return '等待完整行情';
       if (!this.rows.some(row => Object.prototype.hasOwnProperty.call(row, 'vwap_speed_30m'))) return '等待加载新版行情数据';
-      return '等待开盘参考 VWAP 与有效标准差';
+      return '等待时段参考 VWAP 与有效标准差';
     },
     vwapSpeedGroups() {
       const highest = this.vwapSpeedRows.slice(0, 5);
@@ -171,7 +171,7 @@ const VwapDistribution = {
         timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
       }).format(row.vwap_reference_time * 1000) : '—';
       return `${row.ticker} · 当前 VWAP ${price(row.vwap)} · 参考 ${reference} ${price(row.vwap_reference)}`
-        + `${row.vwap_reference_mode === 'opening' ? '（开盘第 1 分钟）' : ''} · 当前 σ ${price(row.sigma)}`;
+        + `${row.vwap_reference_mode === 'opening' ? '（扩展时段首根）' : ''} · 当前 σ ${price(row.sigma)}`;
     },
     isReference(row) { return ['QQQ', 'NVDA', 'SPY'].includes(row.ticker); },
     paintOrder(rows) {
@@ -204,7 +204,7 @@ const VwapDistribution = {
   template: `
     <section class="vwap-distribution">
       <header>
-        <div class="vwap-heading-main"><strong>VWAP 分布图</strong><span>1 分钟 · EMA7(close) · ST（10，4）</span></div>
+        <div class="vwap-heading-main"><strong>VWAP 分布图</strong><span>1 分钟 · 盘前盘后 · EMA7(close) · ST（10，4）</span></div>
         <div class="vwap-update-line" role="status">
           <span>{{ latest ? '美东 ' + timestamp + ' · ' + rows.length + ' 个标的' : '等待完整行情' }}</span>
           <span class="vwap-refresh-status" :class="{'has-delayed': frame?.display_only}"
@@ -282,7 +282,7 @@ const VwapDistribution = {
         </svg>
       </div>
       <aside class="vwap-speed-ranking" :class="{'is-compact': plotHeight < 270}" aria-label="VWAP 三十分钟归一化速度排名">
-        <header class="vwap-speed-heading" :title="'(当前 VWAP − 参考 VWAP) ÷ 当前标准差；未满 30 分钟取开盘第 1 分钟，否则取 30 分钟前。已就绪 ' + vwapSpeedRows.length + '/' + rows.length">
+        <header class="vwap-speed-heading" :title="'(当前 VWAP − 参考 VWAP) ÷ 当前标准差；扩展时段未满 30 分钟取首根，否则取 30 分钟前。已就绪 ' + vwapSpeedRows.length + '/' + rows.length">
           <strong>VWAP 速度排名</strong><small>Δ30m/σ</small>
         </header>
         <p v-if="!vwapSpeedRows.length" class="vwap-speed-empty">{{ vwapSpeedWaiting }}</p>
