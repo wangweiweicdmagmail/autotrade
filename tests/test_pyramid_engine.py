@@ -285,6 +285,16 @@ def test_fill_and_flat_events_describe_actual_execution():
     assert flat['side'] == 'long'
 
 def test_auto_notices_cover_key_events_and_skip_unfilled_flat(console_app, monkeypatch):
+    from types import SimpleNamespace
+    import console.services.automatic as automatic_service
+
+    # Event ordering must not depend on real wall-clock adjustments or precision.
+    clock = {'ns': 1_800_000_000_000_000_000}
+    def next_ns():
+        clock['ns'] += 1_000_000
+        return clock['ns']
+    monkeypatch.setattr(automatic_service, 'time', SimpleNamespace(
+        time_ns=next_ns, time=lambda: clock['ns']/1_000_000_000))
     app = console_app
     monkeypatch.setattr(app.automatic, '_auto_notices', {})
     monkeypatch.setattr(app.events, 'record_event', lambda *args, **kwargs: None)
