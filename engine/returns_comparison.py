@@ -9,7 +9,6 @@ import asyncio
 import json
 import math
 import sqlite3
-import tempfile
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -169,19 +168,22 @@ def save_qqq_daily(logs_dir: Path, bars: list) -> None:
 
 
 async def fetch_qqq_daily(project_root: Path, range_days: int) -> list:
-    """从 TradingView 拉 QQQ 日线；空指标表避免加载四个策略 Study。"""
+    """仅从 TradingView 拉 QQQ 日线，不加载或注册指标。"""
     service_dir = project_root / "service"
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", encoding="utf-8") as f:
-        json.dump([], f)
-        f.flush()
-        proc = await asyncio.create_subprocess_exec(
-            "node", str(service_dir / "tv_cloud.js"),
-            "--symbols", QQQ_SYMBOL, "--timeframe", "1D",
-            "--range", str(max(30, min(5000, range_days + 20))),
-            "--session", "regular", "--indicators", f.name,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            cwd=str(service_dir))
+    proc = await asyncio.create_subprocess_exec(
+        "node", str(service_dir / "tv_cloud.js"),
+        "--symbols", QQQ_SYMBOL, "--timeframe", "D",
+        "--range", str(max(30, min(5000, range_days + 20))),
+        "--session", "regular",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        cwd=str(service_dir))
+    try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+    except BaseException:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.communicate()
+        raise
     if proc.returncode != 0:
         raise RuntimeError(stderr.decode("utf-8", "ignore")[-300:] or "QQQ 日线拉取失败")
     try:

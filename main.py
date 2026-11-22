@@ -299,6 +299,8 @@ async def scheduler(stop_event: asyncio.Event) -> None:
 
 
 def main() -> None:
+    if config.DATA_SOURCE != "mock":
+        raise RuntimeError("历史main.py入口已退役；请使用 run_console.sh 的本地PineTS链路")
     logging.basicConfig(
         level=getattr(logging, config.LOG_LEVEL, logging.INFO),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",

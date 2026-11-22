@@ -113,14 +113,9 @@ flowchart LR
 
 ### 验证与诊断
 
-七个原始脚本已完成 53 个标的的历史对照，每个指标覆盖 4,134 根常规盘 K 线。生产默认路径使用同一份本地源码和映射。EMA7 独立对照命令：
+原始七个脚本的历史对照已完成，后续新增模型也使用本地PineTS。2026-11-22已移除云指标注册、正文缓存修复及EMA7／七合一云端对照入口，旧诊断参数不再可执行。当前主采集、夜盘模拟和历史导出均只向TV请求K线；实时／确认输出和执行契约保留。具体退役范围、兼容标识和验证边界见[本地计算链路](docs/LOCAL_INDICATOR_ONLY.md)。
 
-```sh
-node service/tv_cloud_daemon.js --symbols NASDAQ:MSFT,NASDAQ:NVDA,NASDAQ:QQQ \
-  --ema7-shadow-only 1 --ema7-shadow-log logs/ema7-shadow.jsonl
-```
-
-独立模式仅订阅所选标的的 K 线和 TV EMA7，并用同一份 K 线在后台 worker 计算本地实时值和确认值。JSONL 记录版本、就绪状态、输入至结果延迟、合并次数及差异。TV 的 Study 和行情消息各自到达，实时对照标记为同根 K 线对照，并记录两边接收时间；收盘对照按确认 K 线时间配对。
+离线源码与依赖诊断可运行`python3 service/tv_diag.py`，它不访问私有指标translate接口，不验证或修复云端正文。生产运行仍需TV K线授权，首次登录引导保持有效。
 
 相关入口：[现有行情采集](service/tv_cloud_daemon.js)、[回测 PineTS 调用](service/pinets_backtest.js)、[模型注册表](service/pine_strategies.json)、[Python 执行编排](console/runtime/strategy.py)、[策略输出契约](docs/PINE_INDICATOR_CONTRACT.md)。
 

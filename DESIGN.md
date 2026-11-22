@@ -1,5 +1,8 @@
 # autotrade 交易控制台 — 详细设计文档
 
+> 2026-11-22：旧TV云指标注册及正文修复已退役，下文相关描述只作历史记录；当前以[本地PineTS链路](docs/LOCAL_INDICATOR_ONLY.md)为准。
+
+
 > 当前代码组织与 Pine 模型接入规范见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 > 2026-11-02 第一阶段已将控制台拆为应用工厂、路由、服务和运行组件。
 > 本文下方保留历史设计演进；当前第一个模型为用户的 EMA9-ST-ATR Pine 指标，Python 为公共执行模型。

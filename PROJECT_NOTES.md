@@ -1,5 +1,8 @@
 # autotrade — Pine 策略驱动的自动化量化执行系统
 
+> 2026-11-22：旧TV云指标注册及正文修复已退役，下文相关描述只作历史记录；当前以[本地PineTS链路](docs/LOCAL_INDICATOR_ONLY.md)为准。
+
+
 > 当前交接基线：2026-11-02 第三阶段本地事务账本与故障恢复，见 [第三阶段成果记录](docs/milestones/2026-11-02-phase3.md)、[第二阶段成果记录](docs/milestones/2026-11-02-phase2.md)、[第一阶段里程碑](docs/milestones/2026-11-02-phase1.md) 和 [当前架构](ARCHITECTURE.md)。安装交付暂不在范围内。
 > Pine 指标实现策略，Python 实现公共执行。首个模型是用户的 EMA9-ST-ATR；`ema9_pyramid` 是保留的兼容标识。
 > 生产入口为 `console.app:app`；`main.py` 和 `auto_runner.py` 保留为历史入口。

@@ -1,10 +1,7 @@
 """lifecycle application functions and owned state. No console.app dependency."""
 
 import asyncio
-import sys
-from pathlib import Path
 
-from fastapi import HTTPException
 from execution.writer_lock import acquire_writer_lock
 import config
 import time
@@ -14,7 +11,6 @@ from console.shared import logger
 class LifecycleService:
     def __init__(self, context):
         self.context = context
-        self._cache_repair_running = False
 
     def _startup_status(self) -> dict:
         collector = self.context.collector
@@ -96,7 +92,7 @@ class LifecycleService:
             errors.append(self.context.lifecycle._startup_state["browser_error"])
         if self.context.collector.study_health().get("systemic") and (not market_ready):
             errors.append(
-                "TradingView 指标通道异常，请运行 python3 service/tv_diag.py 检查"
+                "PineTS 本地指标计算异常，请运行 python3 service/tv_diag.py 检查"
             )
         if unavailable:
             errors.append("行情时段未确认：" + "、".join(
@@ -122,8 +118,6 @@ class LifecycleService:
                 "confirmed": confirmed,
                 "total": expected,
             },
-            "cache_issues": list(self.context.collector.cache_issues.values()),
-            "cache_repair_running": self._cache_repair_running,
         }
 
     async def on_startup(self) -> None:
@@ -290,32 +284,3 @@ class LifecycleService:
 
     async def api_startup(self) -> dict:
         return self.context.lifecycle._startup_status()
-
-    async def repair_pine_cache(self) -> dict:
-        if self._cache_repair_running:
-            raise HTTPException(409, "缓存修复正在进行")
-        ids = list(self.context.collector.cache_issues)
-        if not ids:
-            raise HTTPException(409, "当前没有待修复的指标正文缓存")
-        self._cache_repair_running = True
-        script = Path(__file__).resolve().parents[2] / "service" / "refresh_pine_texts.py"
-        args = [arg for indicator_id in ids for arg in ("--indicator", indicator_id)]
-        proc = None
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable, str(script), *args,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await proc.communicate()
-            if proc.returncode:
-                detail = stderr.decode(errors="replace").strip().splitlines()
-                logger.warning("指标正文缓存修复失败: %s", detail[-1] if detail else proc.returncode)
-                if detail and "官方帧正文不完整或布局版本落后" in detail[-1]:
-                    raise HTTPException(502, "请在专用 TradingView 图表加载上方所列指标的最新版本，再点修复。")
-                raise HTTPException(502, "缓存修复验证失败，请查看控制台日志后重试。")
-            return {"ok": True}
-        finally:
-            if proc is not None and proc.returncode is None:
-                proc.terminate()
-                await proc.wait()
-            self._cache_repair_running = False

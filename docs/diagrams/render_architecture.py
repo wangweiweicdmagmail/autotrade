@@ -41,31 +41,31 @@ def edge(points,label='',lx=0,ly=0,dash=False,feedback=False):
         text(lx,ly,label,'label')
 
 text(60,80,'Pine 驱动的量化交易执行系统','title')
-text(60,128,'当前实现架构 · 策略模型生成决策，执行模型管理交易 · 2026-11-02','sub')
+text(60,128,'当前实现架构 · 策略模型生成决策，执行模型管理交易 · 2026-11-22','sub')
 text(60,200,'声明与执行配置','lane')
 text(690,200,'主链路：策略输出 → 交易执行 → 券商','lane')
 text(2000,200,'运维与运行保障','lane')
 
 box(690,230,1220,160,'01  策略模型  /  Strategy Model',[
- 'TradingView Pine 指标：生成方向、入场条件、参考价和策略止损',
- '当前：EMA9-ST-ATR；后续策略复用相同输出契约'],kind='pine')
+ '本地 Pine 源码：由 PineTS 计算方向、入场、参考价和止损',
+ '首个模型：EMA9-ST-ATR；已接入模型复用相同输出契约'],kind='pine')
 box(690,450,1220,160,'02  策略输出契约  /  Strategy Output Contract',[
  '入场信号 · 方向 · 入场参考价 · 多头止损 · 空头止损',
  'ATR 为辅助输出；信号出现不代表已下单或已成交'],code='StrategyOutput (PineOutput) / domain/contracts.py')
 box(690,670,1220,170,'03  行情与信号接入层',[
- '订阅指标与行情，依据字段映射形成带时间信息的快照',
- '实时快照 + 确认快照 + 最新行情价格'],code='service/tv_cloud*.js  /  行情采集模块')
+ '只订阅 TradingView K线，PineTS worker 本地计算指标',
+ '实时快照 + 确认快照 + 最新行情价格'],code='tv_cloud_daemon.js / pinets_live.js / realtime_collector.py')
 box(690,900,1220,170,'04  执行编排服务',[
  '启停执行实例、检查容量，按模型 / 实例 / 标的分发快照',
  '校验时间对齐和输出，分别推进实时与确认处理'],code='AutoService  /  StrategyRuntime')
 box(690,1130,1220,230,'05  交易执行引擎  /  执行模型的运行组件',[
  '实时快照 → 入场校验、去重、风险定量、申请建仓',
- '确认快照 → 止损收紧、方向反转退出',
+ '确认快照 → 止损收紧、方向转向提示及已授权退出',
  '依据执行配置管理交易组；不重新计算 Pine 行情信号'],code='engine/pine_execution.py  /  PineExecutionEngine',kind='core')
 box(690,1420,1220,150,'06  交易通道适配层  /  实盘路径',[
  '将引擎操作转换为订单管理调用：建仓、撤单、平仓、移止损'],code='LiveBroker  /  engine/broker_protocols.py')
 box(690,1630,1220,170,'07  订单管理模块',[
- '维护订单生命周期，管理限价入场单与保护止损单',
+ '维护订单生命周期，管理市价入场与保护止损单',
  '提交前调用账户风险检查；接收成交与订单状态'],code='execution/order_lot.py  /  OrderManager')
 box(690,1860,1220,140,'08  券商连接网关',[
  '传递委托、撤改单，接收订单 / 成交 / 账户信息'],code='execution/ibkr.py  /  IBKRGateway')
@@ -83,11 +83,11 @@ box(60,1010,540,300,'执行配置',[
  '保留原金字塔、保本及时段规则',
  '新策略不自动继承旧规则'],code='execution_profile',kind='core')
 box(60,1430,540,340,'回测与夜盘模拟验证',[
- '历史行情与已导出策略值',
+ 'K线缓存 + 本地计算结果',
  '→ 独立的同类执行引擎',
  '→ SimBroker 模拟成交',
  '→ 交易记录与回测结果',
- '实时夜盘：独立数据与模拟通道'],code='BacktestSession / NightTestService\nSimBroker / PinePaperFeed')
+ '夜盘：独立K线 / PineTS / 模拟通道'],code='BacktestSession / NightTestService\nSimBroker / PinePaperFeed')
 box(60,1870,540,300,'执行实例与交易归属',[
  'strategy_id：策略模型',
  'strategy_instance_id：执行实例',
@@ -135,7 +135,7 @@ text(95,2230,'实线箭头：主数据 / 订单流      青色实线：券商回
 text(95,2290,'阅读要点：策略模型决定“是否交易、方向和价格”；执行模型决定“如何安全、可恢复地完成交易”。','body')
 text(95,2340,'范围说明：本图为当前 Pine 主执行链路的逻辑架构；职责模块不等于独立进程或微服务。','code')
 text(95,2380,'回测限制：OHLC 无法还原真实根内成交顺序；图中未表示第二个真实策略已注册。','code')
-text(95,2420,'兼容说明：既有 API、模型标识与持久化字段保留；历史入口、独立跟单及研究辅助流程未展开。','code')
+text(95,2420,'兼容说明：既有 API、模型标识与持久化字段保留；旧云指标入口已退役，跟单及研究辅助流程未展开。','code')
 parts.append('</svg>')
 (OUT/'system-architecture.svg').write_text('\n'.join(parts),encoding='utf-8')
 print(OUT/'system-architecture.svg')

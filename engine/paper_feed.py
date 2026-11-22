@@ -54,7 +54,7 @@ class PinePaperFeed:
     async def _errors(self):
         while await self.process.stderr.readline():
             # Do not reflect upstream diagnostic text or credentials to API responses.
-            self.error = "数据服务有诊断信息；若无数据，请核对网络、登录及指标权限"
+            self.error = "数据服务有诊断信息；若无数据，请核对网络、登录及本地PineTS环境"
 
     def health(self, now=None):
         now = now or time.time()

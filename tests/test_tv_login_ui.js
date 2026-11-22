@@ -19,7 +19,6 @@ function loadingPage() {
     if (!elements.has(id)) elements.set(id, new Element());
     return elements.get(id);
   };
-  get('cache-panel').hidden = true;
   const context = vm.createContext({document: {getElementById: get, createElement: tag => new Element(tag)},
     fetch: () => new Promise(() => {}), setTimeout: () => {}, location: {replace() {}}, console});
   const html = fs.readFileSync(path.join(__dirname, '../console/static/loading.html'), 'utf8');

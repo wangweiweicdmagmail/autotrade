@@ -1,6 +1,6 @@
 # 系统架构图
 
-采用 [项目统一术语](../TERMINOLOGY.md)，展示当前 Pine 主执行链路及支撑模块。
+采用 [项目统一术语](../TERMINOLOGY.md)，展示当前 Pine 主执行链路及支撑模块。2026-11-22已同步标明TV仅提供K线，指标由本地PineTS计算，云指标注册不再属于运行链路。
 
 - [PNG 图片](system-architecture.png)：2600 × 2470，适合查看和分享。
 - [SVG 矢量图](system-architecture.svg)：适合放大查看和编辑。

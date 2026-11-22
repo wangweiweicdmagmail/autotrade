@@ -12,22 +12,22 @@ test('night session is explicit and never silently falls back', () => {
   assert.throws(() => parseArgs(['node', 'x', '--symbol', 'NVDA']));
 });
 
-test('Pine and OHLC align by timestamp and retain actual resolved source', () => {
-  const data = snapshot({ infos: { subsession_id: 'extended', full_name: 'BATS:NVDA' }, periods: [
-    { time: 1300, open: 101, max: 103, min: 100, close: 102 },
-    { time: 1000, open: 100, max: 102, min: 99, close: 101 },
-  ] }, { periods: [{ $time: 1600, Touch_EMA9: 1 },
-    { $time: 1300, Direction: 1, Touch_EMA9: 0, EMA_9: 101, Long_Stop: 99 },
-    { $time: 1000, Direction: -1, Touch_EMA9: 1, EMA_9: 101, Short_Stop: 103 },
-  ] }, model, '24h', 1500);
-  assert.equal(data.session.requested, '24h');
-  assert.equal(data.session.resolved, 'extended');
-  assert.equal(data.session.symbol, 'BATS:NVDA');
-  assert.equal(data.bar.high, 103);
-  assert.equal(data.e9.time, 1300);
-  assert.equal(data.e9.touch, 0);
-  assert.equal(data.e9_c.time, 1000);
-  assert.equal(data.e9_c.direction, -1);
+test('local Pine and OHLC align by timestamp and retain actual resolved source', () => {
+  const data = snapshot({infos:{subsession_id:'extended',full_name:'BATS:NVDA'}}, {
+    base:{bar:{time:1300,high:103},bar_c:{time:1000},paperBars:[]},observedAt:1500000,
+    outputs:{e9:[{time:1600,touch:1},{time:1300,direction:1,touch:0,ema_9:101,long_stop:99},
+      {time:1000,direction:-1,touch:1,ema_9:101,short_stop:103}]},
+  },model,'24h');
+  assert.equal(data.session.requested,'24h');
+  assert.equal(data.session.resolved,'extended');
+  assert.equal(data.session.symbol,'BATS:NVDA');
+  assert.equal(data.session.source,'pinets');
+  assert.equal(data.session.tv_study_subscriptions,0);
+  assert.equal(data.bar.high,103);
+  assert.equal(data.e9.time,1300);
+  assert.equal(data.e9.touch,0);
+  assert.equal(data.e9_c.time,1000);
+  assert.equal(data.e9_c.direction,-1);
 });
 
 test('night UI submits only to the independent paper service and blocks double clicks', async () => {

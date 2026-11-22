@@ -10,7 +10,6 @@
 - Pine Script 自定义指标注册表
 """
 
-from dataclasses import dataclass, field
 from typing import Dict, List
 
 # ---------------------------------------------------------------------------
@@ -30,16 +29,6 @@ CDP_TIMEOUT = 10.0
 # ---------------------------------------------------------------------------
 # 计算模块 (Data & Strategy Engine) 配置
 # ---------------------------------------------------------------------------
-
-# TradingView 私有 WebSocket 协议端点（tradingview-ws 方案）
-# 实测校准：必须带 ?&type=chart 参数，否则 create_study 一律被服务端
-# 拒绝（"Study not allowed in this connection"，2023-03 后的服务端变更）
-TV_WS_URL = "wss://data.tradingview.com/socket.io/websocket?&type=chart"
-TV_WS_ORIGIN = "https://www.tradingview.com"
-
-# 未登录游客令牌；如需订阅私有指标（Script$USER;...），
-# 请替换为浏览器登录后 Cookie 中的 sessionid 对应 token
-TV_AUTH_TOKEN = "unauthorized_user_token"
 
 # 单次采集快照的整体超时（秒）
 COLLECT_TIMEOUT = 15.0
@@ -134,55 +123,6 @@ STRATEGY_MIN_ATR = 0.0
 STRATEGY_MIN_VOLUME = 0.0
 # 额外过滤：要求 5M 进攻区域方向值 == 1（None 表示不过滤）
 STRATEGY_REQUIRE_ATTACK_ZONE = None
-
-# ---------------------------------------------------------------------------
-# Pine Script 自定义指标注册表
-# ---------------------------------------------------------------------------
-# 说明：
-#   TradingView 私有协议通过 create_study 订阅指标输出。
-#   pine_id 形如：
-#     - 公开指标:  "PUB;<indicator_id>"
-#     - 私有指标:  "USER;<script_id>"（需登录 token）
-#     - 内置指标:  "STD;Supertrend" 等
-#   version 后缀形如 "@tv-scripting-101!"，留空表示使用最新版本。
-#   plot_map 将策略字段名映射到指标返回值中的 plot 索引，
-#   需要按你的 Pine Script 中 plot() 声明顺序填写。
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class PineIndicatorConfig:
-    """单个 Pine 指标的订阅配置。"""
-
-    name: str                       # 人类可读名称，仅用于日志
-    pine_id: str                    # 例如 "PUB;xxxxxxxx" / "STD;Supertrend"
-    version: str = ""               # 例如 "@tv-scripting-101!"
-    inputs: Dict[str, object] = field(default_factory=dict)
-    # plot 索引映射：StockSignalData 字段名 -> 指标第 N 个 plot（0 起）
-    plot_map: Dict[str, int] = field(default_factory=dict)
-
-
-# TODO: 替换为你自己的 Pine Script 指标 ID 与 plot 映射
-PINE_INDICATORS: List[PineIndicatorConfig] = [
-    PineIndicatorConfig(
-        name="SuperTrend",
-        pine_id="STD;Supertrend",
-        inputs={"Factor": 3.0, "ATR Length": 10},
-        plot_map={"supertrend": 1},      # plot 1 = 方向（1 多 / -1 空）
-    ),
-    PineIndicatorConfig(
-        name="BreakoutRejectionScore",
-        pine_id="PUB;YOUR_INDICATOR_ID",  # <-- 替换为实际指标 ID
-        inputs={},
-        plot_map={"rejection_score": 0},  # plot 0 = 拒绝得分 0~100
-    ),
-    PineIndicatorConfig(
-        name="ATR",
-        pine_id="STD;ATR",
-        inputs={"length": 14},
-        plot_map={"atr": 0},
-    ),
-]
 
 # ---------------------------------------------------------------------------
 # IBKR 执行层配置（实战经验继承自同级项目 nautilus_ibkr_helloworld）
@@ -335,12 +275,10 @@ def validate_config() -> None:
         raise RuntimeError("工具订单号段配置无效")
 
 
-# 数据源选择：
-#   "mock"  - 内置模拟数据源，无需任何外部连接，跑通全流程用
-#   "cloud" - TradingView 云端数据服务（service/tv_cloud.js，
-#             基于 TradingView-API，后台无界面取 K线/指标/信号，推荐）
-#   "ws"    - 手写 TradingView 私有 WS 协议（早期 PoC，仅保留参考）
-DATA_SOURCE = "cloud"
+# 仅供历史 main.py PoC；旧 cloud/ws 指标采集入口已退役。
+# 当前控制台固定使用 TV K线 + PineTS，本项不影响控制台。
+# 如需纯内存PoC可显式设为 mock；禁止静默回落模拟数据。
+DATA_SOURCE = "retired"
 
 # 日志级别
 LOG_LEVEL = "INFO"

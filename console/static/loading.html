@@ -50,12 +50,6 @@
     .login-panel button:disabled { opacity: .6; cursor: default; }
     #tv-login-result { margin-top: 10px; color: #c1cee2; font-size: 12px; line-height: 1.6; }
     .market-progress { display: block; width: 100%; height: 8px; margin-top: 6px; accent-color: #6ea8ff; }
-    .cache-panel { margin-top: 16px; padding: 12px; border: 1px solid #856538;
-      border-radius: 8px; background: #33291e; color: #f4d39b; font-size: 13px; line-height: 1.6; }
-    .cache-panel ul { margin: 6px 0 10px; padding-inline-start: 20px; }
-    .cache-panel button { padding: 6px 12px; border: 1px solid #856538; border-radius: 6px;
-      background: #453521; color: inherit; cursor: pointer; margin: 0 6px 4px 0; }
-    .cache-panel button:disabled { opacity: .6; cursor: default; }
     .footer { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px 16px; margin-top: 22px;
       color: #959cab; font-size: 12px; }
     #status-text { min-width: 0; overflow-wrap: anywhere; }
@@ -89,13 +83,6 @@
     <div class="progress"><div id="progress-bar" class="progress-bar"></div></div>
     <div id="stages" class="stages"></div>
     <div id="error" class="error"></div>
-    <section id="cache-panel" class="cache-panel" hidden>
-      <strong>指标正文缓存需要处理</strong>
-      <ul id="cache-issues"></ul>
-      <button id="repair-cache" type="button">修复指标缓存</button>
-      <button id="continue-startup" type="button" hidden>进入控制台</button>
-      <div id="cache-result" role="status"></div>
-    </section>
     <div class="footer"><span id="status-text">正在连接交易服务…</span><span id="elapsed">0s</span></div>
   </main>
   <script>
@@ -131,35 +118,6 @@
         loginResult.textContent = loginActionResult;
       }
     };
-    const cachePanel = document.getElementById('cache-panel');
-    const cacheIssues = document.getElementById('cache-issues');
-    const repairButton = document.getElementById('repair-cache');
-    const continueButton = document.getElementById('continue-startup');
-    const cacheResult = document.getElementById('cache-result');
-    let repairing = false;
-    let repaired = false;
-    continueButton.onclick = () => location.replace('/');
-
-    repairButton.onclick = async () => {
-      repairing = true;
-      repairButton.disabled = true;
-      cacheResult.textContent = '正在获取并验证 TradingView 指标正文…';
-      try {
-        const response = await fetch('/api/startup/repair-pine-cache', {
-          method: 'POST', headers: { 'X-Autotrade-Action': 'repair-pine-cache' },
-        });
-        const data = await response.json();
-        if (!response.ok || !data.ok) throw new Error(data.detail || '修复失败');
-        repaired = true;
-        cacheResult.textContent = '缓存已修复并通过验证。请重启 AutoTrade，使行情采集器重新加载指标。';
-      } catch (error) {
-        cacheResult.textContent = error.message || '修复失败，请重试。';
-      } finally {
-        repairing = false;
-        repairButton.disabled = repaired;
-      }
-    };
-
     function render(data) {
       const login = data.tv_login || {};
       const waitingLogin = Boolean(login.required);
@@ -203,7 +161,7 @@
           steps.textContent = [
             data.market_session?.requested === '24h' && `行情时段 ${data.market_session.confirmed}/${market.total}`,
             `K 线已到 ${market.bars_ready ?? 0}/${market.total}`,
-            indicators.total && `指标正文 ${indicators.loaded}/${indicators.total}`,
+            indicators.total && `本地指标 ${indicators.loaded}/${indicators.total}`,
             indicators.name && `当前指标 ${indicators.name}`,
             `已发起订阅 ${market.subscribed}/${market.total}`,
           ].filter(Boolean).join(' · ');
@@ -225,17 +183,7 @@
       errorEl.style.display = data.error ? 'block' : 'none';
       errorEl.textContent = data.error || '';
       statusEl.textContent = waitingLogin ? loginError ? '等待配置恢复，系统将自动重试' : '等待 TradingView 登录，登录后自动继续' : data.ready ? '工作区已就绪' : '正在准备，请稍候';
-      const issues = data.cache_issues || [];
-      cacheIssues.replaceChildren(...issues.map(issue => {
-        const item = document.createElement('li');
-        item.textContent = issue.cached_version
-          ? `${issue.name} 缓存 v${issue.cached_version} 与 TradingView v${issue.remote_version} 不匹配`
-          : `${issue.name} 缺少 TradingView v${issue.remote_version} 的正文缓存`;
-        return item;
-      }));
-      cachePanel.hidden = !issues.length && !repairing && !repaired;
-      repairButton.disabled = !issues.length || repairing || repaired || data.cache_repair_running;
-      continueButton.hidden = !data.ready;
+
     }
 
     async function check() {
@@ -244,7 +192,7 @@
         if (!response.ok) throw new Error('HTTP ' + response.status);
         const data = await response.json();
         render(data);
-        if (data.ready && cachePanel.hidden && !data.cache_repair_running) {
+        if (data.ready) {
           document.getElementById('heading').textContent = '交易工作区已就绪';
           statusEl.textContent = '正在进入主页面…';
           statusEl.className = 'ready-text';

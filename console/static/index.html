@@ -1194,7 +1194,7 @@
             <el-tab-pane class="workspace-pane pane-night" v-if="workspaceGroup === 'validation'" label="夜盘模拟" name="night">
               <div class="night-workspace">
                 <div class="section-heading"><h3>夜盘模拟测试</h3><a href="/static/architecture.html#night-test" target="_blank" rel="noopener">使用说明 ↗</a><el-tag type="warning">独立模拟 · 5M · 美东时间</el-tag><a href="/api/night-test/report" download="night-paper-test.json" v-if="night.run_id">导出测试报告 JSON</a></div>
-                <p class="muted">先连接数据核对 TV 的标的、24h 时段、复权和指标参数，再人工启动模拟。预载历史仅供查看，不产生订单；指标使用注册脚本默认输入。</p>
+                <p class="muted">先连接数据核对 TV 的标的、24h 时段、复权和指标参数，再人工启动模拟。预载历史仅供查看，不产生订单；指标由本地 PineTS 使用本地源码默认输入计算。</p>
                 <div class="shadow-bt-form">
                   <label>策略模型 <el-select v-model="nightForm.strategy" style="width:190px" :disabled="night.running"><el-option v-for="model in autoModels.filter(model => !model.local_only)" :key="model.id" :label="model.name" :value="model.id" ></el-option></el-select></label>
                   <label>标的 <el-input v-model="nightForm.symbol" style="width:180px" :disabled="night.running" placeholder="NASDAQ:NVDA" ></el-input></label>

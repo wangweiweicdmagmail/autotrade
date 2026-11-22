@@ -51,22 +51,18 @@ def test_startup_status_requires_full_confirmed_watchlist(console_app, monkeypat
     assert ibkr["ready"] is True       # dry-run 不强制等待 TWS
 
 
-def test_startup_reports_cache_mismatch_before_first_market_tick(console_app, monkeypatch):
+def test_startup_reports_local_indicators_without_cloud_cache_actions(console_app, monkeypatch):
     monkeypatch.setattr(console_app.config, "WATCHLIST", ["NASDAQ:QQQ"])
     monkeypatch.setattr(console_app.collector, "latest", lambda: {})
-    issue = {"id": "USER;example", "name": "EMA20-ST-ATR",
-             "cached_version": "1.0", "remote_version": "2.0"}
-    monkeypatch.setattr(console_app.collector, "cache_issues", {issue["id"]: issue})
-    monkeypatch.setattr(console_app.collector, "startup_indicators", {"loaded": 3, "total": 7})
+    local = {"loaded": 3, "total": 8, "source": "pinets", "tv_study_subscriptions": 0}
+    monkeypatch.setattr(console_app.collector, "startup_indicators", local)
     client = TestClient(console_app.app)
-
     status = client.get("/api/startup").json()
-    assert status["cache_issues"] == [issue]
-    assert status["market_progress"] == {
-        "indicators": {"loaded": 3, "total": 7},
-        "subscribed": 0, "bars_ready": 0, "confirmed": 0, "total": 1,
-    }
-    assert client.post("/api/startup/repair-pine-cache").status_code == 403
+    assert status["market_progress"]["indicators"] == local
+    assert "cache_issues" not in status and "cache_repair_running" not in status
+    assert client.post("/api/startup/repair-pine-cache").status_code == 404
+    page = client.get("/").text
+    assert "repair-pine-cache" not in page and "cache-panel" not in page
 
 
 def test_live_startup_opens_workspace_with_tws_offline(console_app, monkeypatch):

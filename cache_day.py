@@ -4,7 +4,7 @@
     python3 cache_day.py --day 2026-10-23                 # 全部自选
     python3 cache_day.py --day 2026-10-23 --symbols NASDAQ:NVDA,NYSE:TSM
 
-流程：dump_trend_state.js（extended session，3 指标全套，锚定目标日 16:00 ET）
+流程：dump_trend_state.js（extended K线 + PineTS本地指标，锚定目标日16:00 ET）
 → research_db.upsert_bars 幂等入库。重复执行安全（同 symbol+time 覆盖）。
 """
 

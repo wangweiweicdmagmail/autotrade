@@ -2,7 +2,7 @@
 """TV study 通道健康监测回归（engine/realtime_collector.py study_health）。
 
 守的口径（2026-10-27 协议故障教训：K线正常、指标全灭，data_stale 检测不到）：
-- 错误风暴：60s 内 study_error > 20 条 → systemic（协议级故障是全体刷屏，
+- 错误风暴：60s 内 local_indicator_error > 20 条 → systemic（协议级故障是全体刷屏，
   单标的自愈重建每分钟几条不会误触）；61s 前的旧错误自动滑出窗口。
 - 持续死亡：快照已建立但 ts_c 就绪率 < 50% 且持续 > 120s 才 systemic
   （daemon 冷启动 54 标的加载约 60-90s，宽限期内不误报）。
@@ -86,7 +86,14 @@ def test_recovery_clears_dead_state():
 
 
 def test_stderr_counting():
-    """stderr 排空循环对 study_error / Can't parse pine 行计数。"""
+    """Only local computation failures contribute; legacy protocol text is ignored."""
+    import asyncio
+    from types import SimpleNamespace
     c = _make()
-    assert "study_error" in "[NASDAQ:X] study_error: [...]"
-    assert "Can't parse pine" in '["Can\'t parse pine","..."]'
+    async def exercise():
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"local_indicator_error: calculation failed\nstudy_error: retired\n")
+        reader.feed_eof()
+        await c._stderr_drain(SimpleNamespace(stderr=reader))
+    asyncio.run(exercise())
+    assert len(c._study_errors) == 1

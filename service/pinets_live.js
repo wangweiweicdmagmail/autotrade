@@ -17,6 +17,7 @@ function candle(row) {
 
 function createLocalIndicators({ onError = () => {}, onReady = () => {}, onResult = () => {},
   intervalSeconds = 300, barLimit = BAR_LIMIT, minBars = MIN_BARS,
+  indicatorKeys = null, historyTail = null,
   workers = Math.min(8, Math.max(1, os.availableParallelism() - 2)),
   makeWorker = () => new Worker(path.join(__dirname, 'pinets_live_worker.js')) } = {}) {
   const states = new Map();
@@ -55,7 +56,8 @@ function createLocalIndicators({ onError = () => {}, onReady = () => {}, onResul
     state.key = key;
     const urgent = !state.latest || state.latest.raw.bar_c?.time !== raw.bar_c?.time;
     const job = { symbol, state, revision: ++state.revision, historyKey, dailyKey, urgent,
-      observedAt: state.observedAt, raw: { ...raw }, dataset: { symbol, bars, daily, metadata, intervalSeconds } };
+      observedAt: state.observedAt, raw: { ...raw }, dataset: { symbol, bars, daily, metadata, intervalSeconds,
+        ...(indicatorKeys ? { indicatorKeys, historyTail } : {}) } };
     state.latest = job;
     pending.set(symbol, job);
     pump();
@@ -94,7 +96,7 @@ function createLocalIndicators({ onError = () => {}, onReady = () => {}, onResul
       state.busy = true;
       state.nextAt = now + REFRESH_MS;
       slot.job = candidate;
-      const missing = intervalSeconds === 60 ? !state.history.vwap_pullback :
+      const missing = indicatorKeys ? indicatorKeys.some(key => !state.history[key]) : intervalSeconds === 60 ? !state.history.vwap_pullback :
         !state.history.e9 || !state.history.trend || (candidate.dataset.daily.length > 0 && !state.history.attack);
       candidate.history = state.historyKey !== candidate.historyKey || missing;
       const previous = state.completed;

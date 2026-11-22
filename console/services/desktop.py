@@ -131,7 +131,7 @@ class DesktopService:
         """启动首要任务：TV 数据源就绪检查，正常/异常都给出提示确认（一次性）。
 
         就绪 = 快照标的数达到股票池且全部 ts_c 有 trend_state；
-        异常 = study 通道系统性故障（collector.study_health().systemic，
+        异常 = PineTS 本地指标系统性故障（collector.study_health().systemic，
         覆盖 2026-10-27 的 pine 协议故障模式）或 240s 超时未就绪。
         正常 → info（前端横幅 + 事件，不打扰手机）；异常 → critical（含 iMessage）。
         """

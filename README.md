@@ -1,7 +1,9 @@
 # autotrade
 
-读取 TradingView Pine 策略模型的输出，执行风控、下单、止损同步和订单恢复。
+接收 TradingView K线，用本地 PineTS 计算策略模型输出，执行风控、下单、止损同步和订单恢复。
 第一个已接入模型是用户自定义的 **EMA9-ST-ATR**。
+
+指标统一由本地 PineTS 计算，TradingView 只提供K线。旧云指标注册、正文缓存修复和云端对照入口已移除，夜盘与历史导出也使用本地计算。见 [本地计算链路与旧架构退役说明](docs/LOCAL_INDICATOR_ONLY.md)。
 
 当前功能与使用规则见 [近期功能整理（2026-11-21）](docs/FEATURES_2026-11-21.md)：候选与订单工作台、TV 八格与六格联动、趋势评分、开仓准入、候选持仓保护、VWAP 策略及验证边界。
 
@@ -53,7 +55,7 @@ Pine 自动信号的首仓与加仓使用 **市价 MKT + STOP 保护单**，不�
 - Node/前端检查：`npm test`
 - 隔离开发依赖：`requirements-dev.txt`
 
-`main.py`、`auto_runner.py` 是历史流程，策略语义与当前控制台不同，定位见架构文档。
+`main.py`的旧云指标流程已退役，默认立即提示改用控制台；仅显式mock可作历史演示。`auto_runner.py`是兼容入口，行情也使用当前PineTS链路。
 
 小区间突破的完整信号、预约、风险和退出口径见 [突破规则](docs/OPENING_BREAKOUT_RULES.md)，也可从系统架构中的“突破规则”查看。
 

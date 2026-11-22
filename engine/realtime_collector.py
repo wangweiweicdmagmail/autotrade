@@ -71,16 +71,15 @@ class RealtimeCollector:
         self._last_startup_progress = 0.0
         self.startup_indicators: dict = {}
         self.startup_subscribed = 0
-        self.cache_issues: dict[str, dict] = {}
         self._started_at = None
         self._last_restart = 0.0
         self.latest_bar_time: float = 0.0   # 最新 K 线时间戳（数据时钟）
         self.bar_update_delay: Optional[float] = None  # K线收盘→收到 的延时（秒）
         self._running = False
-        # study 健康监测（2026-10-27 协议故障教训：K线正常但指标全灭时
-        # data_stale 检测不到）：stderr 里的 study_error 滚动计数 +
-        # 快照 ts_c 就绪率持续跟踪
-        self._study_errors: deque = deque()      # 最近 60s study_error 时间戳
+        # 本地指标健康监测：K线正常不代表PineTS已完成。
+        # 仅计入 local_indicator_error，并跟踪确认快照就绪率；
+        # study相关名称保留给既有健康接口兼容使用。
+        self._study_errors: deque = deque()      # 最近60s本地计算错误时间戳
         self._ts_dead_since: Optional[float] = None  # ts_c 就绪率跌破一半的起始时刻
 
     async def start(self) -> None:
@@ -151,7 +150,7 @@ class RealtimeCollector:
                 break
             msg = line.decode("utf-8", "replace").rstrip()
             if msg:
-                if any(marker in msg for marker in ("local_indicator_error", "study_error", "Can't parse pine")):
+                if any(marker in msg for marker in ("local_indicator_error",)):
                     self._study_errors.append(time.time())
                 logger.warning("[tv_cloud] %s", msg)
 
@@ -275,10 +274,6 @@ class RealtimeCollector:
                 if msg.get("source") == "pinets" and msg.get("loaded") == msg.get("total"):
                     logger.info("PineTS 本地指标就绪 %s/%s；TV 指标订阅数 %s",
                                 msg["loaded"], msg["total"], msg.get("tv_study_subscriptions"))
-                if issue := msg.get("cache_issue"):
-                    self.cache_issues[issue["id"]] = issue
-                if loaded_id := msg.get("loaded_id"):
-                    self.cache_issues.pop(loaded_id, None)
 
     def _accept_ipo(self, msg):
         symbol = msg.get("symbol")
@@ -368,10 +363,10 @@ class RealtimeCollector:
         return self._snapshot
 
     def study_health(self) -> dict:
-        """study（指标）通道健康度。
+        """PineTS 本地指标健康度（study_health及字段名为兼容接口）。
 
         systemic=True 的两种触发（2026-10-27 故障模式）：
-        - 错误风暴：60s 内 study_error > 20 条（协议级故障是全体刷屏，
+        - 错误风暴：60s 内本地指标错误 > 20 条（批量计算故障，
           单标的自愈重建每分钟最多几条，阈值拉开一个数量级）；
         - 持续死亡：快照已建立但 ts_c 就绪率 < 50% 且持续超过 120s
           （覆盖 daemon 启动慢：54 标的加载约 60-90s，宽限后再判死）。"""

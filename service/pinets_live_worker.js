@@ -13,7 +13,7 @@ parentPort.on('message', async ({ dataset, history, advance }) => {
   const errors = {};
   if ((history && !advance) || !sessions.has(dataset.symbol)) sessions.set(dataset.symbol, {});
   const byIndicator = sessions.get(dataset.symbol);
-  for (const key of dataset.intervalSeconds === 60 ? ['vwap_pullback'] : fiveMinuteKeys) {
+  for (const key of dataset.indicatorKeys || (dataset.intervalSeconds === 60 ? ['vwap_pullback'] : fiveMinuteKeys)) {
     if (key === 'attack' && !dataset.daily?.length) continue;
     try {
       if (!calculators.has(key)) {
@@ -26,14 +26,14 @@ parentPort.on('message', async ({ dataset, history, advance }) => {
       let rows;
       if (key === 'e7v2') {
         // Its ATR[1] and stops diverged on updateTail; keep the verified batch path.
-        rows = await calculate(dataset, { tail: 2 });
+        rows = await calculate(dataset, { tail: dataset.historyTail ?? 2 });
       } else if (byIndicator[key]) {
         try {
           if (advance) {
-            const tail = key === 'fvg' ? 0 : key === 'trend' ? dataset.bars.length : ['e9', 'attack'].includes(key) ? 175 : 2;
+            const tail = dataset.historyTail ?? (key === 'fvg' ? 0 : key === 'trend' ? dataset.bars.length : ['e9', 'attack'].includes(key) ? 175 : 2);
             rows = await byIndicator[key].advance(dataset.bars, tail);
           } else {
-            rows = await byIndicator[key].replaceLast(dataset.bars.at(-1), key === 'fvg' ? 0 : 2);
+            rows = await byIndicator[key].replaceLast(dataset.bars.at(-1), dataset.historyTail ?? (key === 'fvg' ? 0 : 2));
           }
         } catch (_) {
           delete byIndicator[key];
@@ -42,7 +42,7 @@ parentPort.on('message', async ({ dataset, history, advance }) => {
       if (!rows) {
         const session = await calculate.open(dataset);
         byIndicator[key] = session;
-        rows = session.read(key === 'fvg' ? 0 : key === 'trend' ? dataset.bars.length : ['e9', 'attack'].includes(key) ? 175 : 2);
+        rows = session.read(dataset.historyTail ?? (key === 'fvg' ? 0 : key === 'trend' ? dataset.bars.length : ['e9', 'attack'].includes(key) ? 175 : 2));
       }
       rows.reverse();
       if (key === 'fvg') {
