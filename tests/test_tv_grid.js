@@ -141,6 +141,34 @@ test('auto_trade2 six panes put candidates at left and the four beta charts at t
  assert.equal(f.grid('NASDAQ:TSLA').ok,false);assert.equal(f.writes.length,count);
 });
 
+test('holding allocation changes only QQQ and SPY until the third position needs a candidate cell',()=>{
+ const {rhythmDisplaySlots,MarketRhythm}=require('../console/static/market-rhythm');
+ const focus=fixture(6,true),candidates=fixture(8);
+ const frame={day:'2026-11-18',as_of:Date.parse('2026-11-18T15:00:00Z')/1000,
+  coverage:{total:53,aligned:53,missing:[]},ranks:Array.from({length:10},(_,i)=>({symbol:'NASDAQ:S'+i,rank:i+1}))};
+ let state=null;
+ const sync=positions=>{
+  state=rhythmDisplaySlots(state,frame,positions);
+  const ui={displayState:state,rows:state.order.map((symbol,i)=>({symbol,rank:i+1}))};
+  assert(focus.grid(MarketRhythm.computed.focusSymbols.call(ui)).ok);
+  assert(candidates.grid(MarketRhythm.computed.tvSymbols.call(ui)).ok);
+ };
+ const positions=['A','B','C'].map(symbol=>({symbol:'NASDAQ:'+symbol}));
+ sync([]);focus.writes.length=0;candidates.writes.length=0;
+ sync(positions.slice(0,1));assert.deepEqual(focus.writes,[{i:4,s:'NASDAQ:A'}]);
+ sync(positions.slice(0,2));assert.deepEqual(focus.writes,[{i:4,s:'NASDAQ:A'},{i:5,s:'NASDAQ:B'}]);
+ assert.deepEqual(candidates.writes,[]);
+ focus.writes.length=0;sync(positions);
+ assert.deepEqual(focus.writes,[{i:0,s:'NASDAQ:C'}]);assert.deepEqual(candidates.writes,[]);
+ focus.writes.length=0;sync(positions.slice(1));
+ assert.deepEqual(focus.writes,[{i:0,s:'NASDAQ:S0'},{i:4,s:'NASDAQ:C'}]);
+ assert.deepEqual(candidates.writes,[]); // Releasing the overflow seat restores only that candidate cell.
+ focus.writes.length=0;sync([]);
+ assert.deepEqual(focus.writes,[{i:4,s:'NASDAQ:QQQ'},{i:5,s:'AMEX:SPY'}]);
+ assert.equal(focus.widgets[1].current,'CAPITALCOM:NAS100');
+ assert.equal(focus.widgets[2].current,'CAPITALCOM:SPX500');
+});
+
 test('focus rejects the legacy transposed six-grid and old four-grid before any symbol changes',()=>{
  const wanted=['NYSE:UNH','CAPITALCOM:NAS100','CAPITALCOM:SPX500','NASDAQ:NVDA','NASDAQ:QQQ','AMEX:SPY'];
  const transposed=fixture(6),old=fixture(4);

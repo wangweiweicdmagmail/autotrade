@@ -57,7 +57,8 @@ function rhythmDisplaySlots(previous, frame, positions=[]) {
   const ranked=[...(frame?.ranks||[])].filter(r=>r?.symbol).sort((a,b)=>a.rank-b.rank).slice(0,10);
   const held=positions.map(p=>p.symbol);
   const day=frame?.day||'',nextBucket=Number.isFinite(frame?.as_of)?Math.floor(frame.as_of/600):0;
-  const valid=previous?.version===1&&previous.day===day&&Array.isArray(previous.order)&&Array.isArray(previous.heldOrder);
+  const valid=previous?.version===2&&previous.day===day&&Array.isArray(previous.order)&&Array.isArray(previous.heldOrder)
+    &&Array.isArray(previous.referenceSlots)&&previous.referenceSlots.length===2;
   // One accepted, complete, closed-minute snapshot. Later revisions of that minute
   // cannot reshuffle membership while the next candle is forming.
   const accept=rhythmRankingReady(frame)&&(!valid||!Number.isFinite(previous.candidateAsOf)||frame.as_of>previous.candidateAsOf);
@@ -71,7 +72,14 @@ function rhythmDisplaySlots(previous, frame, positions=[]) {
   // Do not consume the ten-minute boundary until its candidate batch is complete.
   const bucket=accept?nextBucket:valid?previous.bucket:null;
   const heldOrder=[...new Set([...(valid?previous.heldOrder:[]).filter(s=>held.includes(s)),...held])];
-  const pinned=heldOrder.slice(0,10),rest=eligible.filter(s=>!pinned.includes(s));
+  // Keep occupied reference cells in place. A flat cell admits the oldest
+  // overflow holding before falling back to QQQ / SPY. Only overflow consumes
+  // the ten candidate display seats.
+  const referenceSlots=['',''];
+  if(valid)previous.referenceSlots.forEach((s,i)=>{if(held.includes(s)&&!referenceSlots.includes(s))referenceSlots[i]=s;});
+  const waiting=heldOrder.filter(s=>!referenceSlots.includes(s));
+  referenceSlots.forEach((s,i)=>{if(!s)referenceSlots[i]=waiting.shift()||'';});
+  const pinned=heldOrder.filter(s=>!referenceSlots.includes(s)).slice(0,10),rest=eligible.filter(s=>!pinned.includes(s));
   let order;
   if(!valid||previous.bucket!==bucket)order=[...pinned,...rest].slice(0,10);
   else {
@@ -81,7 +89,7 @@ function rhythmDisplaySlots(previous, frame, positions=[]) {
     for(let i=pinned.length;i<10;i++)if(!slots[i])slots[i]=incoming.shift()||'';
     order=slots.filter(Boolean);
   }
-  return {version:1,day,bucket,order,heldOrder,candidates:eligible,candidateAsOf,candidateRows};
+  return {version:2,day,bucket,order,heldOrder,referenceSlots,candidates:eligible,candidateAsOf,candidateRows};
 }
 
 function rhythmConfirmedTd(track,time) {
@@ -243,7 +251,7 @@ const MarketRhythm = {
     sourceTracks(){return Object.fromEntries([...(this.frame?.tracks||[]),...(this.frame?.watch_tracks||[])].filter(t=>t.symbol).map(t=>[t.symbol,t]));},
     positions(){return rhythmPositions(this.lots||[],[...(this.frame?.symbols||[]),...(this.frame?.ranks||[]).map(r=>r.symbol),...Object.keys(this.market||{})]);},
     positionKey(){return this.positions.map(p=>p.symbol).join(',');},
-    positionOverflow(){return Math.max(0,this.positions.length-10);},
+    positionOverflow(){return Math.max(0,this.positions.length-12);},
     rankingPending(){return !!this.frame&&!rhythmRankingReady(this.frame);},
     rows(){if(this.positionsReady===false)return [];return (this.displayState?.order||[]).map((symbol,i)=>{
       const raw=(this.displayState?.candidateRows||this.frame?.ranks||[]).find(r=>r.symbol===symbol),position=this.positions.find(p=>p.symbol===symbol);
@@ -265,7 +273,8 @@ const MarketRhythm = {
       return order.map(symbol=>{
         const raw=bySymbol.get(symbol),position=held.get(symbol),seat=this.rows.find(r=>r.symbol===symbol);
         const td=raw?.tdCount??null,direction=position?(position.side==='long'?1:position.side==='short'?-1:0):raw?.direction_sign;
-        return {...raw,symbol,rank:raw?.rank??null,candidateRank:raw?.rank??null,gridSeat:seat?.rank??null,
+        const referenceSlot=(this.displayState?.referenceSlots||[]).indexOf(symbol);
+        return {...raw,symbol,rank:raw?.rank??null,candidateRank:raw?.rank??null,gridSeat:seat?.rank??null,referenceSlot,
           isHeld:!!position,position,direction_sign:direction,tdCount:td,tdState:rhythmTdState(td),
           tdLabel:td==null?'TD —':'TD '+(td>0?'+':'')+td,tdTitle:td==null?'等待TD确认数据':rhythmTime((this.displayState?.candidateAsOf||0)-60)+' K线收盘确认 · TD '+(td>0?'+':'')+td};
       });
@@ -273,7 +282,8 @@ const MarketRhythm = {
     // Visual row order on TV: display slots 9/7/5/3 above 10/8/6/4.
     tvSymbols(){return [9,7,5,3,10,8,6,4].map(rank=>this.rows.find(r=>r.rank===rank)?.symbol||'');},
     focusSymbols(){return [this.rows.find(r=>r.rank===1)?.symbol||'','CAPITALCOM:NAS100','CAPITALCOM:SPX500',
-      this.rows.find(r=>r.rank===2)?.symbol||'','NASDAQ:QQQ','AMEX:SPY'];},
+      this.rows.find(r=>r.rank===2)?.symbol||'',this.displayState?.referenceSlots?.[0]||'NASDAQ:QQQ',
+      this.displayState?.referenceSlots?.[1]||'AMEX:SPY'];},
     gridKey(){return [...this.tvSymbols,...this.focusSymbols].join(',');},
     tracks(){
       const beta=['CAPITALCOM:NAS100','CAPITALCOM:SPX500'].map(symbol=>this.sourceTracks[symbol]||{symbol,is_beta:true});
@@ -297,9 +307,11 @@ const MarketRhythm = {
   methods:{issueLabel:reason=>RHYTHM_ISSUES[reason]||reason,eventLabel:type=>RHYTHM_EVENTS[type]||type,clock:rhythmTime,ticker:rhythmTicker,number:rhythmNumber,signed:rhythmSigned,phase:p=>RHYTHM_LABELS[p]||p,
     loadDisplay(){
       this.displayState=null;
-      try{const saved=JSON.parse(localStorage.getItem('rhythm_display_v1:'+(this.trader||'master')));
-        if(saved?.version===1&&Array.isArray(saved.order)&&saved.order.every(s=>typeof s==='string')
-          &&Array.isArray(saved.heldOrder)&&saved.heldOrder.every(s=>typeof s==='string'))this.displayState=saved;
+      try{const saved=JSON.parse(localStorage.getItem('rhythm_display_v2:'+(this.trader||'master')));
+        if(saved?.version===2&&Array.isArray(saved.order)&&saved.order.every(s=>typeof s==='string')
+          &&Array.isArray(saved.heldOrder)&&saved.heldOrder.every(s=>typeof s==='string')
+          &&Array.isArray(saved.referenceSlots)&&saved.referenceSlots.length===2
+          &&saved.referenceSlots.every(s=>typeof s==='string'))this.displayState=saved;
       }catch{} // Presentation preferences never restore positions or trading authority.
     },
     reconcileDisplay(){
@@ -307,7 +319,7 @@ const MarketRhythm = {
       const next=rhythmDisplaySlots(this.displayState,this.frame,this.positions);
       if(JSON.stringify(next)===JSON.stringify(this.displayState))return;
       this.displayState=next;
-      try{localStorage.setItem('rhythm_display_v1:'+(this.trader||'master'),JSON.stringify(next));}catch{}
+      try{localStorage.setItem('rhythm_display_v2:'+(this.trader||'master'),JSON.stringify(next));}catch{}
     },
     start(){this.stop();this.refresh();this.timer=setInterval(()=>this.refresh(),10000);},
     stop(){clearInterval(this.timer);this.requestId++;this.controller?.abort();this.loading=false;},
@@ -345,6 +357,11 @@ const MarketRhythm = {
       if(symbol){this.selected=symbol;this.$emit('select',symbol);}
     },
     rankLocation(rank){return rank<=2?'TV六格左'+(rank===1?'上':'下'):'TV第'+(6-Math.ceil(rank/2))+'列'+(rank%2?'上':'下');},
+    gridLocation(row){const locations=[];
+      if(row.referenceSlot===0||row.referenceSlot===1)locations.push('TV六格下'+(row.referenceSlot===0?'中':'右')+' · 持仓');
+      if(row.gridSeat)locations.push(this.rankLocation(row.gridSeat));
+      else if(row.gridSeat===undefined&&row.rank)locations.push(this.rankLocation(row.rank));
+      return locations.join(' / ')||'未分配TV席位';},
     openRank(row){
       if(row?.isHeld){this.manageRank(row);return;}
       if(!row?.symbol||![1,-1].includes(row.direction_sign))return;
@@ -358,7 +375,7 @@ const MarketRhythm = {
       +'结构 '+this.number(row.score_parts?.vwap)+' + EMA9斜率 '+this.number(row.score_parts?.slope)+' + 分类 '+this.number(row.score_parts?.classification)+'\n'
       +'5分钟EMA9斜率 '+this.signed(row.ema9_slope_atr)+' ATR/根\n'
       +'近15分钟同侧 '+this.number(row.classification_rate*100)+'%（'+row.classification_correct+'/'+row.classification_samples+'根；样本'+row.classification_samples+'/15）\n'
-      +'乖离 '+this.signed(row.ema9_bias_atr)+' ATR，仅位置参考\n'+(row.gridSeat?this.rankLocation(row.gridSeat):row.gridSeat===null?'未分配TV席位':this.rankLocation(row.rank)):this.rowDescription(row);},
+      +'乖离 '+this.signed(row.ema9_bias_atr)+' ATR，仅位置参考\n'+this.gridLocation(row):this.rowDescription(row)+'\n'+this.gridLocation(row);},
     publishGrid(force=false){
       if(!this.active||!this.frame||this.positionsReady===false||!this.displayState)return;
       const symbols=this.tvSymbols.every(Boolean)?this.tvSymbols:[];

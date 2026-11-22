@@ -364,10 +364,11 @@ const rankedFrame=(symbols,as_of=OPEN+60)=>({day:'2026-11-18',as_of,coverage:{to
 const rankedSymbols=Array.from({length:10},(_,i)=>'NASDAQ:S'+i);
 const held=(symbol,openedAt=1)=>({symbol,qty:10,side:'long',openedAt});
 
-test('positions take the first three display slots and never duplicate candidates or mutate raw ranks',()=>{
+test('two positions use reference cells and only overflow takes candidate seats without mutating raw ranks',()=>{
  const raw=rankedFrame(rankedSymbols),saved=JSON.stringify(raw);
  const state=rhythmDisplaySlots(null,raw,[held('NASDAQ:X'),held('NASDAQ:Y'),held('NASDAQ:S7')]);
- assert.deepEqual(state.order.slice(0,3),['NASDAQ:X','NASDAQ:Y','NASDAQ:S7']);
+ assert.deepEqual(state.referenceSlots,['NASDAQ:X','NASDAQ:Y']);
+ assert.deepEqual(state.order.slice(0,3),['NASDAQ:S7','NASDAQ:S0','NASDAQ:S1']);
  assert.equal(state.order.length,10);assert.equal(new Set(state.order).size,10);assert.equal(JSON.stringify(raw),saved);
  const changed=rankedFrame([...rankedSymbols].reverse(),OPEN+300);
  assert.deepEqual(rhythmDisplaySlots(state,changed,[held('NASDAQ:X'),held('NASDAQ:Y'),held('NASDAQ:S7')]).order,state.order);
@@ -389,13 +390,15 @@ test('a departing candidate is replaced in its own slot immediately, while an ou
  updated.order.forEach((s,i)=>{if(i!==5)assert.equal(s,state.order[i]);});
 });
 
-test('new positions immediately claim the leading slots, partial exits retain priority, and flat positions release them',()=>{
+test('a first holding changes only a reference cell, partial exits keep it and a flat position restores the reference',()=>{
  const raw=rankedFrame(rankedSymbols),initial=rhythmDisplaySlots(null,raw,[]);
  const positions=rhythmPositions([{symbol:'NASDAQ:X',state:'ACTIVE',side:'long',filled_qty:5,entry_time:100}],rankedSymbols);
- const added=rhythmDisplaySlots(initial,raw,positions);assert.equal(added.order[0],'NASDAQ:X');
+ const added=rhythmDisplaySlots(initial,raw,positions);
+ assert.deepEqual(added.referenceSlots,['NASDAQ:X','']);assert.deepEqual(added.order,initial.order);
  const reduced=rhythmPositions([{symbol:'NASDAQ:X',state:'CLOSING',side:'long',filled_qty:1,entry_time:100}],rankedSymbols);
- assert.deepEqual(rhythmDisplaySlots(added,raw,reduced).order,added.order);
- const flat=rhythmDisplaySlots(added,raw,[]);assert(!flat.order.includes('NASDAQ:X'));assert.equal(flat.order.length,10);
+ assert.deepEqual(rhythmDisplaySlots(added,raw,reduced),added);
+ const flat=rhythmDisplaySlots(added,raw,[]);
+ assert.deepEqual(flat.referenceSlots,['','']);assert.deepEqual(flat.order,initial.order);
 });
 
 test('actual filled positions merge symbol aliases, ignore unfilled and closed lots, and preserve both sides',()=>{
@@ -411,13 +414,50 @@ test('persisted slots restore without reshuffling and a new session starts a fre
  const changed=rankedFrame([...rankedSymbols].reverse(),OPEN+300);
  assert.deepEqual(rhythmDisplaySlots(JSON.parse(JSON.stringify(initial)),changed,[held('NASDAQ:X')]).order,initial.order);
  const next=rhythmDisplaySlots(initial,{...changed,day:'2026-11-19',as_of:OPEN+86460},[held('NASDAQ:X')]);
- assert.deepEqual(next.order,['NASDAQ:X',...changed.ranks.slice(0,9).map(r=>r.symbol)]);
+ assert.deepEqual(next.order,changed.ranks.map(r=>r.symbol));assert.deepEqual(next.referenceSlots,['NASDAQ:X','']);
 });
 
-test('positions win even if more than ten exist, and candidate shortages never invent symbols',()=>{
- const positions=Array.from({length:12},(_,i)=>held('NASDAQ:P'+i));
- assert.deepEqual(rhythmDisplaySlots(null,rankedFrame(rankedSymbols),positions).order,positions.slice(0,10).map(p=>p.symbol));
- const empty=rankedFrame([]);assert.deepEqual(rhythmDisplaySlots(null,empty,[held('NASDAQ:X')]).order,['NASDAQ:X']);
+test('twelve holdings fit across reference and candidate cells and shortages never invent candidate symbols',()=>{
+ const positions=Array.from({length:13},(_,i)=>held('NASDAQ:P'+i));
+ const state=rhythmDisplaySlots(null,rankedFrame(rankedSymbols),positions);
+ assert.deepEqual(state.referenceSlots,positions.slice(0,2).map(p=>p.symbol));
+ assert.deepEqual(state.order,positions.slice(2,12).map(p=>p.symbol));
+ const {MarketRhythm}=require('../console/static/market-rhythm');
+ assert.equal(MarketRhythm.computed.positionOverflow.call({positions}),1);
+ const empty=rhythmDisplaySlots(null,rankedFrame([]),[held('NASDAQ:X')]);
+ assert.deepEqual(empty.order,[]);assert.deepEqual(empty.referenceSlots,['NASDAQ:X','']);
+});
+
+test('reference cells keep their occupants in place, promote overflow on exit and restore QQQ and SPY when flat',()=>{
+ const frame=rankedFrame(rankedSymbols),positions=['X','Y','Z'].map(s=>held('NASDAQ:'+s));
+ const initial=rhythmDisplaySlots(null,frame,positions);
+ const promoted=rhythmDisplaySlots(initial,frame,positions.slice(1));
+ assert.deepEqual(promoted.referenceSlots,['NASDAQ:Z','NASDAQ:Y']);
+ const restoredCandidates=[rankedSymbols[9],...rankedSymbols.slice(0,9)];
+ assert.deepEqual(promoted.order,restoredCandidates); // Fill the released slot; do not reshuffle the other nine.
+ const one=rhythmDisplaySlots(promoted,frame,[positions[1]]);
+ assert.deepEqual(one.referenceSlots,['','NASDAQ:Y']);assert.deepEqual(one.order,restoredCandidates);
+ const {MarketRhythm}=require('../console/static/market-rhythm');
+ const ui={rows:rankedSymbols.map((symbol,i)=>({symbol,rank:i+1})),displayState:one};
+ assert.deepEqual(MarketRhythm.computed.focusSymbols.call(ui),
+  ['NASDAQ:S0','CAPITALCOM:NAS100','CAPITALCOM:SPX500','NASDAQ:S1','NASDAQ:QQQ','NASDAQ:Y']);
+ ui.displayState=rhythmDisplaySlots(one,frame,[]);
+ assert.deepEqual(MarketRhythm.computed.focusSymbols.call(ui).slice(4),['NASDAQ:QQQ','AMEX:SPY']);
+});
+
+test('a holding in the top ten retains its candidate seat as well as the dedicated position cell',()=>{
+ const initial=rhythmDisplaySlots(null,rankedFrame(rankedSymbols));
+ const updated=rhythmDisplaySlots(initial,rankedFrame(rankedSymbols),[held(rankedSymbols[6])]);
+ assert.deepEqual(updated.order,initial.order);assert.deepEqual(updated.referenceSlots,[rankedSymbols[6],'']);
+});
+
+test('old portfolio-first preferences are invalidated and v2 preserves reference cells across refreshes',()=>{
+ const frame=rankedFrame(rankedSymbols),positions=[held('NASDAQ:X'),held('NASDAQ:Y')];
+ const old={version:1,day:frame.day,order:['NASDAQ:X','NASDAQ:Y',...rankedSymbols.slice(0,8)],heldOrder:positions.map(p=>p.symbol)};
+ const migrated=rhythmDisplaySlots(old,frame,positions);
+ assert.equal(migrated.version,2);assert.deepEqual(migrated.order,rankedSymbols);
+ const restored=rhythmDisplaySlots(JSON.parse(JSON.stringify(migrated)),rankedFrame([...rankedSymbols].reverse(),OPEN+120),positions);
+ assert.deepEqual(restored.referenceSlots,migrated.referenceSlots);assert.deepEqual(restored.order,migrated.order);
 });
 
 test('holding management filters the order batches instead of opening another entry card',()=>{
@@ -435,12 +475,12 @@ test('portfolio-first TV maps agree with the displayed slots and wait for the fi
  ui.reconcileDisplay();ui.publishGrid();assert.equal(ui.displayState,null);assert.equal(emitted.length,0);
  ui.lots=['NASDAQ:X','NASDAQ:Y','NASDAQ:S7'].map((symbol,i)=>({symbol,state:'ACTIVE',filled_qty:10,side:'long',entry_time:i+1}));
  ui.positionsReady=true;ui.reconcileDisplay();ui.publishGrid();
- assert.deepEqual(ui.rows.slice(0,3).map(r=>r.symbol),['NASDAQ:X','NASDAQ:Y','NASDAQ:S7']);
- assert(ui.rows.slice(0,3).every(r=>r.isHeld));
- assert.deepEqual(ui.focusSymbols,['NASDAQ:X','CAPITALCOM:NAS100','CAPITALCOM:SPX500','NASDAQ:Y','NASDAQ:QQQ','AMEX:SPY']);
- assert.equal(ui.tvSymbols[3],'NASDAQ:S7');
+ assert.deepEqual(ui.rows.slice(0,3).map(r=>r.symbol),['NASDAQ:S7','NASDAQ:S0','NASDAQ:S1']);
+ assert(ui.rows[0].isHeld);
+ assert.deepEqual(ui.focusSymbols,['NASDAQ:S7','CAPITALCOM:NAS100','CAPITALCOM:SPX500','NASDAQ:S0','NASDAQ:X','NASDAQ:Y']);
+ assert.equal(ui.tvSymbols[3],'NASDAQ:S1');
  const key=ui.gridKey;ui.frame=rankedFrame([...rankedSymbols].reverse(),OPEN+300);ui.reconcileDisplay();
- assert.equal(ui.gridKey,key);assert.equal(ui.rows[2].candidateRank,3);
+ assert.equal(ui.gridKey,key);assert.equal(ui.rows[0].candidateRank,3);
 });
 
 test('a partially arriving minute cannot evict candidates; its final batch replaces only the departing slot',()=>{
@@ -483,6 +523,10 @@ test('held stocks remain pinned while all ten current candidates keep their real
  for(const key of ['positions','sourceTracks','rows','rankingRows'])Object.defineProperty(ui,key,{get:()=>MarketRhythm.computed[key].call(ui)});
  ui.reconcileDisplay();assert.equal(ui.rows.length,10);assert.equal(ui.rankingRows.length,11);
  assert.equal(ui.rankingRows[0].symbol,'NASDAQ:HELD');assert.equal(ui.rankingRows[0].rank,null);
+ assert.equal(ui.rankingRows[0].gridSeat,null);assert.equal(ui.rankingRows[0].referenceSlot,0);
+ assert.equal(ui.gridLocation(ui.rankingRows[0]),'TV六格下中 · 持仓');
+ assert.match(ui.scoreDescription(ui.rankingRows[0]),/TV六格下中/);
+ assert.deepEqual(ui.rows.map(r=>r.symbol),rankedSymbols);
  assert.deepEqual(ui.rankingRows.slice(1).map(r=>r.rank),[1,2,3,4,5,6,7,8,9,10]);
 });
 
@@ -514,8 +558,13 @@ test('holdings still take priority during an incomplete minute without admitting
  const partial={...rankedFrame(['NASDAQ:PROVISIONAL',...rankedSymbols].slice(0,10),OPEN+120),
    coverage:{total:53,aligned:15,missing:['NASDAQ:LATE']}};
  const pinned=rhythmDisplaySlots(initial,partial,[held('NASDAQ:POSITION')]);
- assert.equal(pinned.order[0],'NASDAQ:POSITION');assert(!pinned.order.includes('NASDAQ:PROVISIONAL'));
+ assert.deepEqual(pinned.referenceSlots,['NASDAQ:POSITION','']);
+ assert.deepEqual(pinned.order,rankedSymbols);assert(!pinned.order.includes('NASDAQ:PROVISIONAL'));
  assert.deepEqual(rhythmDisplaySlots(pinned,partial).order,rankedSymbols);
  assert.equal(rhythmDisplaySlots(null,partial).order.length,0);
- assert.deepEqual(rhythmDisplaySlots(null,partial,[held('NASDAQ:POSITION')]).order,['NASDAQ:POSITION']);
+ const first=rhythmDisplaySlots(null,partial,[held('NASDAQ:POSITION')]);
+ assert.deepEqual(first.order,[]);assert.deepEqual(first.referenceSlots,['NASDAQ:POSITION','']);
+ const overflow=rhythmDisplaySlots(pinned,partial,[held('NASDAQ:POSITION'),held('NASDAQ:SECOND'),held('NASDAQ:THIRD')]);
+ assert.deepEqual(overflow.referenceSlots,['NASDAQ:POSITION','NASDAQ:SECOND']);
+ assert.equal(overflow.order[0],'NASDAQ:THIRD');assert(!overflow.order.includes('NASDAQ:PROVISIONAL'));
 });
