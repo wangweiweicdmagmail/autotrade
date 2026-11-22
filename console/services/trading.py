@@ -720,11 +720,15 @@ class TradingService:
         if qty <= 0:
             raise HTTPException(400, "无法确定有效股数（请显式填写 qty）")
         signal_snapshot = self.context.trading._snapshot_for(symbol=req.symbol)
+        import uuid
+        research_decision_id = str(uuid.uuid4())
+        signal_snapshot['research_decision_id'] = research_decision_id
         market_frame = getattr(self.context.collector, "market_frame_id", None)
         if market_frame is not None:
             signal_snapshot["decision_market_frame"] = market_frame
         self.context.events.record_event(
             "manual_entry_decision", symbol=req.symbol, side=req.side, trader=trader,
+            research_decision_id=research_decision_id,
             qty=qty, limit_px=limit_px, stop_px=stop_px, limit_type=req.limit_type,
             reason=req.reason, force=req.force, decision_market_frame=market_frame,
             market_direction_mode='candidate' if candidate_evidence else "rhythm" if rhythm_entry else req.market_direction_mode,
@@ -795,11 +799,13 @@ class TradingService:
         if lot is None:
             self.context.events.record_event(
                 "manual_entry_rejected", symbol=req.symbol, side=req.side, trader=trader,
+                research_decision_id=research_decision_id,
                 decision_market_frame=market_frame, reason=err,
             )
             raise HTTPException(400, err)
         self.context.events.record_event(
             "order_placed",
+            research_decision_id=research_decision_id,
             lot_id=lot.lot_id,
             decision_market_frame=market_frame,
             symbol=req.symbol,
@@ -820,6 +826,8 @@ class TradingService:
         self, lot_id: str, req: UpdateTrailRequest, trader: str = None
     ) -> dict:
         ok, err = await self.context.order_mgr.update_trail(lot_id, req.stop_px)
+        self.context.events.record_event('manual_stop_changed' if ok else 'manual_stop_failed',
+                                        lot_id=lot_id, stop_px=req.stop_px, trader=trader, error=err if not ok else '')
         if not ok:
             raise HTTPException(400, err)
         return {"ok": True}

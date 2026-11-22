@@ -4,6 +4,7 @@ from typing import Optional
 import asyncio
 import logging
 import time
+import uuid
 from console.shared import logger
 from engine.live_audit import decision_market_frame
 
@@ -42,16 +43,43 @@ class EventsService:
             path = self.context.paths.data_dir / f"events-{day}.jsonl"
             path.parent.mkdir(parents=True, exist_ok=True)
             rec = {"ts": time.time(), "type": event_type, **data}
+            rec.setdefault('event_id', str(uuid.uuid4()))
             decision_frame = decision_market_frame.get()
             event_frame = getattr(getattr(self.context, "collector", None), "market_frame_id", None)
             if decision_frame is not None:
                 rec.setdefault("decision_market_frame", decision_frame)
             if event_frame is not None:
                 rec.setdefault("market_frame_at_event", event_frame)
+            try:
+                self._attach_research(rec, data, event_frame)
+            except Exception as error:
+                rec['research_evidence_error'] = str(error)
             with open(path, "a", encoding="utf-8") as f:
                 f.write(_json.dumps(rec, ensure_ascii=False) + "\n")
         except Exception as e:
             logger.warning("事件记录失败: %s", e)
+
+    def _attach_research(self, rec, data, event_frame):
+        # Observational metadata only; never invokes an order or mutates a lot.
+        if data.get('lot_id') or data.get('symbol'):
+            lot = getattr(getattr(self.context, 'order_mgr', None), '_lots', {}).get(data.get('lot_id'))
+            symbol = data.get('symbol') or getattr(lot, 'symbol', None)
+            collector = getattr(self.context, 'collector', None)
+            latest = collector.latest() if collector and hasattr(collector, 'latest') else {}
+            row = latest.get(symbol, {})
+            if not row and symbol:
+                matches = [r for k,r in latest.items() if k.split(':')[-1] == symbol]
+                row = matches[0] if len(matches) == 1 else {}
+            rec['research_evidence'] = {'symbol': symbol, 'role': 'event_observation',
+                'frame_id': event_frame, 'market': {k:row[k] for k in
+                ('bar','bar_c','market_1m','ts','ts_c','e9','e9_c','e7v2','e7v2_c',
+                 'vwap_1m','candidate_st_1m_c','price_observed_at','session') if k in row}}
+            rec['research_evidence']['beta'] = {key:{k:latest[key][k] for k in
+                ('bar','market_1m','rhythm_price_1m','price_observed_at') if k in latest[key]}
+                for key in ('CAPITALCOM:NAS100','CAPITALCOM:SPX500') if key in latest}
+            settings = getattr(self.context, 'settings', None)
+            if settings and hasattr(settings, '_candidate_order_protection'):
+                rec['research_evidence']['candidate_protection'] = settings._candidate_order_protection()
 
     def _on_lot_closed(self, d: dict) -> None:
         """保护单触发 / 对账补登的平仓事件：完整字段落事件流，供复盘。"""

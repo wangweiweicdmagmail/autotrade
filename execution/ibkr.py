@@ -273,6 +273,7 @@ class IBKRGateway:
             status = trade.orderStatus
             data = {
                 "action": action, "client_id": order.clientId,
+                "account": getattr(order, 'account', ''),
                 "order_id": order.orderId, "perm_id": order.permId,
                 "parent_id": order.parentId, "order_ref": order.orderRef,
                 "symbol": trade.contract.symbol, "side": order.action,
@@ -288,6 +289,7 @@ class IBKRGateway:
                 fill_execution = fill.execution
                 data.update(
                     exec_id=fill_execution.execId, fill_time=fill_execution.time.isoformat(),
+                    fill_account=getattr(fill_execution, 'acctNumber', ''),
                     fill_qty=fill_execution.shares, fill_px=fill_execution.price,
                 )
             self.on_order_audit("broker_order", **data)

@@ -82,7 +82,7 @@ def candidate_snapshot(frame, now, market=None):
         vwap_reason = '' if vwap_allowed else ('等待有效VWAP中线与新鲜价格' if not vwap_ready else
                       f'当前价 {ema["ema9_price"]:g}，VWAP中线 {vwap:g}，'+
                       ('做多要求价格 > VWAP中线' if direction == 1 else '做空要求价格 < VWAP中线'))
-        ranking = {'model': scoring.get('model'), 'version': scoring.get('version'), 'weights': scoring.get('weights'),
+        ranking = {'batch_id': frame.get('ranking_batch_id'), 'model': scoring.get('model'), 'version': scoring.get('version'), 'weights': scoring.get('weights'),
                    **{key: ranked.get(key) for key in ('score', 'score_parts', 'vwap_score', 'ema9_5m',
                       'ema9_known_at', 'ema9_slope_atr', 'classification_rate', 'classification_correct',
                       'classification_samples', 'classification_start_bar', 'classification_end_bar', 'ema9_bias_atr',
