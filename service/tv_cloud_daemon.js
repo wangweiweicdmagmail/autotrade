@@ -19,6 +19,7 @@ const { startIpoWatch } = require('./ipo_watch');
 const {STOCK_SESSION,MINUTE_HISTORY}=require('./market_session');
 
 const PUSH_INTERVAL_MS = 1000;      // 输出节流：每秒一次
+const {createResearchJournal,digest:researchDigest}=require('./research_journal');
 const HEARTBEAT_MS = 30000;         // 心跳：每 30s
 
 function parseArgs(argv) {
@@ -71,9 +72,35 @@ async function main() {
   const marketSession = args['market-session'] || STOCK_SESSION;
   if (!['24h', 'extended'].includes(marketSession)) throw new Error('不支持的 5 分钟行情时段');
   const defaultSessionSymbols = new Set((args['default-session-symbols'] || '').split(',').filter(Boolean));
+  const research=createResearchJournal(args['research-spool'],{onError:message=>console.error('[research-archive]',message)});
+  const researchDailyKeys=new Map();
+  if(args['research-spool']){
+    try{
+    const series=args.symbols.flatMap(symbol=>{
+      const session=defaultSessionSymbols.has(symbol)?'default':marketSession;
+      return [{symbol,interval:'5m',session},{symbol,interval:'1d',session:session==='default'?'default':'regular'},
+        ...(!defaultSessionSymbols.has(symbol)||BETA.includes(symbol)?[{symbol,interval:'1m',session}]:[])];
+    });
+    research.append('configuration',{symbols:args.symbols,series,market_session:marketSession});
+    const {getDefinition}=require('./pinets_runtime');
+    research.append('definition',{models:definitions.map(d=>getDefinition(({ts:'trend',ss:'smart'})[d.key]||d.key)),
+      registry:JSON.parse(fs.readFileSync(path.join(__dirname,'pine_strategies.json'),'utf8')),
+      dependency_lock:fs.readFileSync(path.join(__dirname,'..','package-lock.json'),'utf8'),
+      scoring_source:fs.readFileSync(path.join(__dirname,'rhythm_score.js'),'utf8'),
+      perception_source:fs.readFileSync(path.join(__dirname,'market_rhythm.js'),'utf8')});
+    }catch(error){console.error('[research-archive] 版本记录失败:',error.message);}
+  }
+  function archiveBars(symbol,interval,session,rows,infos){
+    if(!args['research-spool'])return;
+    try{
+    research.observeBars({symbol,resolved_symbol:infos.full_name||infos.pro_name||symbol,interval,session,
+      provider:'tradingview',adjustment:'splits',timezone:infos.timezone||'unknown',
+      minmove:infos.minmov??infos.minmove??null,pricescale:infos.pricescale??null,type:infos.type||'unknown'},rows);
+    }catch(error){console.error('[research-archive] K线记录失败:',error.message);}
+  }
   const rhythm = args['rhythm-cache'] ? createMarketRhythm({
     symbols: args.symbols.filter(symbol => !defaultSessionSymbols.has(symbol) || BETA.includes(symbol)),
-    cachePath: args['rhythm-cache'],marketSession,
+    cachePath: args['rhythm-cache'],marketSession,onFrame:frame=>research.ranking(frame),
   }) : null;
   let rhythmErrorAt = 0;
   const vwapMinuteBatch = createVwapMinuteBatch(args.symbols.filter(symbol => !defaultSessionSymbols.has(symbol)));
@@ -154,6 +181,7 @@ async function main() {
       entry.sessionError = null;
       if (!chartSession(chart.infos, requestedSession).accepted) return;
       entry.rebuilding = false;
+      archiveBars(symbol,'5m',requestedSession,[...periods].reverse().map(candle),chart.infos);
       updatePrices(snapshot, periods.slice(0, 200));
       if (local) local.observe(symbol, periods, chart.infos, snapshot, entry.daily);
     });
@@ -199,6 +227,7 @@ async function main() {
               ? !chartSession(minuteChart.infos, 'default').accepted
               : minuteChart.infos?.subsession_id !== minuteSession)) return;
           const rows = minuteChart.periods.slice(0, minuteHistory).reverse().map(candle);
+          archiveBars(symbol,'1m',minuteSession,rows,minuteChart.infos);
           if (rows.length < 2) return;
           clearTimeout(entry.minuteTimer);
           entry.minuteFailures = 0;
@@ -244,6 +273,14 @@ async function main() {
         dailyChart.onUpdate(changes => {
           if (entries[symbol] !== entry || entry.dailyChart !== dailyChart || !isPriceUpdate(changes)) return;
           const rows = dailyChart.periods.slice(0, 20).reverse().map(candle);
+          if(chartSession(dailyChart.infos,requestedSession==='default'?'default':'regular').accepted){
+            archiveBars(symbol,'1d',requestedSession==='default'?'default':'regular',rows,dailyChart.infos);
+            if(args['research-spool']){
+              const reference={symbol,daily:rows.map((row,i)=>i===rows.length-1?{time:row.time}:row)};
+              const key=researchDigest(reference);
+              if(researchDailyKeys.get(symbol)!==key&&research.append('reference',reference))researchDailyKeys.set(symbol,key);
+            }
+          }
           if (rows.length < 2) return;
           clearTimeout(entry.dailyTimer);
           entry.dailyFailures = 0;
@@ -291,6 +328,7 @@ async function main() {
 
   // 每秒输出一次最新快照
   setInterval(() => {
+    void research.flush();
     if (rhythm) void rhythm.flush(Date.now() / 1000).catch(error => {
       if (Date.now() - rhythmErrorAt >= 30000) {
         rhythmErrorAt = Date.now();

@@ -184,7 +184,7 @@ function buildFrame(series, symbols, now, fiveMinute={}) {
       excluded:fresh.filter(s=>s.issue).map(s=>({symbol:s.symbol,reason:s.issue}))},
     series:Object.fromEntries(current.map(s=>[s.symbol,{...s,metrics:undefined,events:referenceEvents(s)}]))};
 }
-function createMarketRhythm({symbols,cachePath,marketSession=STOCK_SESSION}) {
+function createMarketRhythm({symbols,cachePath,marketSession=STOCK_SESSION,onFrame=null}) {
   const series={},signatures=new Map(),fiveMinute={},fiveKeys=new Map(); let dirty=false,busy=false,changedAt=0;
   function changed(now){if(!dirty)changedAt=now;dirty=true;}
   return {
@@ -214,6 +214,8 @@ function createMarketRhythm({symbols,cachePath,marketSession=STOCK_SESSION}) {
       busy=true; dirty=false;
       try {
         const frame=buildFrame(series,symbols,now,fiveMinute);
+        // Research is a side channel; it cannot change ranking or prevent publishing.
+        try{const id=onFrame?.(frame);if(id)frame.ranking_batch_id=id;}catch{}
         await fs.mkdir(path.dirname(cachePath),{recursive:true});
         const temporary=cachePath+'.'+process.pid+'.tmp';
         await fs.writeFile(temporary,JSON.stringify(frame),{mode:0o600});

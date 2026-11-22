@@ -132,6 +132,7 @@ class LifecycleService:
         self.context.order_mgr._load(allow_recovery=True)  # reload after owning the writer lock, before broker access
         self.context.order_mgr._save()  # validate/migrate local ledger before any broker side effects
         self.context.market_audit.start()
+        self.context.research_archive.start()
         self.context.gateway.on_order_audit = self.context.events.record_event
         connected = await self.context.gateway.connect()
         if config.EXECUTION_ENABLED and (not connected):
@@ -276,6 +277,7 @@ class LifecycleService:
             self.context.collector.stop,
             self.context.gateway.disconnect,
             self.context.market_audit.stop,
+            self.context.research_archive.stop,
         ):
             try:
                 await stop()

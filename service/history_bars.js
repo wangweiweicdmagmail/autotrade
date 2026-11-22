@@ -16,7 +16,7 @@ async function fetchChart(client,symbol,{timeframe='5',range=601,to=0,session='e
         if(periods.length<range)return;
         const infos=chart.infos||{};
         if(!chartSession(infos,session).accepted){reject(new Error('TradingView 未确认所请求的行情时段'));return;}
-        resolve({metadata:{timezone:infos.timezone,minmove:infos.minmov??infos.minmove,
+        resolve({metadata:{resolved_symbol:infos.full_name||infos.pro_name||symbol,timezone:infos.timezone,minmove:infos.minmov??infos.minmove,
           pricescale:infos.pricescale,type:infos.type,session:infos.subsession_id},
           bars:periods.slice(0,range).map(candle).sort((a,b)=>a.time-b.time)});
       });

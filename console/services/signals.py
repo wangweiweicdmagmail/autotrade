@@ -1068,6 +1068,7 @@ class SignalsService:
             "market_frame_id": self.context.collector.market_frame_id,
             "market_session": self.context.collector.market_session_status(),
             "market_audit": self.context.market_audit.status(),
+            "research_archive": self.context.research_archive.status(),
             "age": health["content_age"],
             "transport_age": health["transport_age"],
             "bar_age": health["bar_age"],

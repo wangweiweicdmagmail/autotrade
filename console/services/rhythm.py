@@ -98,6 +98,7 @@ class MarketRhythmReader:
                         if p[0] + 60 <= as_of), 0)),
                     "is_beta": role == "beta", "aligned": (row.get("last_closed") or 0) + 60 == as_of})
             return {"status": "ready", "day": frame.get("day"), "as_of": as_of,
+                "ranking_batch_id": frame.get('ranking_batch_id'),
                 "scoring": scoring,
                 "generated_at": frame.get("generated_at"), "age_seconds": max(0, now - as_of),
                 "columns": frame["columns"], "coverage": frame.get("coverage"),

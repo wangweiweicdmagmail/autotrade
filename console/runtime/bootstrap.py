@@ -18,6 +18,7 @@ from pathlib import Path
 from engine.pyramid_engine import PyramidEngine
 from engine.realtime_collector import RealtimeCollector
 from engine.live_audit import LiveMarketAudit
+from engine.research_archive import ResearchArchive
 from execution.risk import RiskConfig
 from execution.risk import RiskGate
 from typing import Set
@@ -167,18 +168,26 @@ class ConsoleServices:
         self.monitoring._external_cleanup_task: Optional[asyncio.Task] = None
         self.trading._midpoint_escalate_attempted: set = set()
         self.market_audit = LiveMarketAudit(self.paths.data_dir / "live_audit.sqlite3")
+        self.research_archive = ResearchArchive(self.paths.data_dir / 'research')
+        self.research_archive.runtime_parameters = {
+            'risk': {key:getattr(config,key) for key in ('RISK_PER_TRADE_USD','RISK_MAX_TOTAL_RISK_USD',
+                'RISK_MAX_DIRECTION_RISK_USD','RISK_MAX_SYMBOL_POSITION_PCT')},
+            'candidate_protection': self.settings._candidate_order_protection(),
+        }
         credentials_path = self.paths.tv_credentials_path or (
             CONSOLE_FILE.parent.parent / 'service' / 'creds.json'
             if self.paths.data_dir == RuntimePaths().data_dir
             else self.paths.data_dir / 'tv_credentials.json'
         )
         self.tv_login = TvLoginService(self, credentials_path)
+        self.research_archive.credentials_path = credentials_path
         self.collector: RealtimeCollector = RealtimeCollector(
             config.WATCHLIST, audit=self.market_audit, market_session=config.TV_MARKET_SESSION,
             default_session_symbols=config.TV_DEFAULT_SESSION_SYMBOLS,
             ipo_watches=config.IPO_OPENING_WATCHES,
             on_ipo_trade=self.ipo_alerts.refresh,
             credentials_path=credentials_path,
+            research_spool=self.research_archive.spool,
         )
         self.order_mgr.market_health = self.collector.data_health
         self.order_mgr.entry_admission = self.research.check_candidate_entry

@@ -45,8 +45,9 @@ class RealtimeCollector:
     STARTUP_MAX_SECONDS = 180.0
     RESTART_COOLDOWN_SECONDS = 60.0
 
-    def __init__(self, symbols: List[str], *, audit=None, market_session="extended", default_session_symbols=(), ipo_watches=None, on_ipo_trade=None, credentials_path=None):
+    def __init__(self, symbols: List[str], *, audit=None, market_session="extended", default_session_symbols=(), ipo_watches=None, on_ipo_trade=None, credentials_path=None, research_spool=None):
         self.audit = audit
+        self.research_spool = research_spool
         self.market_session = market_session
         self.default_session_symbols = frozenset(default_session_symbols)
         self.market_sessions: dict[str, dict] = {}
@@ -125,6 +126,7 @@ class RealtimeCollector:
             *(["--ipo-watches", json.dumps(self.ipo_watches)] if self.ipo_watches else []),
             *(["--rhythm-cache", str(self.audit.path.parent / "market_rhythm.json")]
               if self.audit is not None else []),
+            *(["--research-spool", str(self.research_spool)] if self.research_spool is not None else []),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(SERVICE_DIR),
