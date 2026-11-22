@@ -1,0 +1,86 @@
+//@version=6
+indicator("开盘重置 EMA9 · 5M", shorttitle="Session EMA9", overlay=true, format=format.price)
+
+// 独立观察指标，不注册到 AutoTrade，不产生入场或止损指令。
+// 固定周期的 EMA1~EMA9 各自从当天首根 close 初始化，再按真实根数选取。
+// 这与用上一根 EMA4 改变系数继续计算 EMA5 的变周期递推不同。
+lineColor = input.color(color.aqua, "均线颜色")
+lineWidth = input.int(2, "线宽", minval=1, maxval=5)
+
+if not timeframe.isminutes or timeframe.multiplier != 5
+    runtime.error("请切换到五分钟图表后查看开盘重置 EMA9")
+
+string et = "America/New_York"
+bool regular = session.ismarket and not na(time(timeframe.period, "0930-1600:23456", et))
+int dayKey = year(time, et) * 10000 + month(time, et) * 100 + dayofmonth(time, et)
+var int sessionDay = na
+var int sessionBars = 0
+var bool openingLoaded = false
+var bool lineSlot = false
+bool newSession = regular and (na(sessionDay[1]) or sessionDay[1] != dayKey)
+
+if newSession
+    sessionDay := dayKey
+    sessionBars := 0
+    // 缺少当天09:30的开盘K线时等待，避免把中午加载的第一根误当开盘。
+    openingLoaded := hour(time, et) == 9 and minute(time, et) == 30
+    lineSlot := not lineSlot[1]
+
+bool active = regular and openingLoaded
+if active
+    // 显式从前根状态计数，当前根重复报价不会累加；不使用varip。
+    sessionBars := newSession ? 1 : nz(sessionBars[1], 0) + 1
+
+sessionEma(float source, int length, bool enabled, bool reset) =>
+    var float value = na
+    float previous = value[1]
+    float alpha = 2.0 / (length + 1.0)
+    if reset
+        value := enabled ? source : na
+    else if enabled
+        value := na(previous) ? na : alpha * source + (1.0 - alpha) * previous
+    else
+        value := previous
+    value
+
+// 每个写出的函数调用拥有独立状态；所有调用在每根K线上执行。
+float ema1 = sessionEma(close, 1, active, newSession)
+float ema2 = sessionEma(close, 2, active, newSession)
+float ema3 = sessionEma(close, 3, active, newSession)
+float ema4 = sessionEma(close, 4, active, newSession)
+float ema5 = sessionEma(close, 5, active, newSession)
+float ema6 = sessionEma(close, 6, active, newSession)
+float ema7 = sessionEma(close, 7, active, newSession)
+float ema8 = sessionEma(close, 8, active, newSession)
+float ema9 = sessionEma(close, 9, active, newSession)
+
+int effectiveLength = active ? math.min(sessionBars, 9) : 0
+float currentEma = switch effectiveLength
+    1 => ema1
+    2 => ema2
+    3 => ema3
+    4 => ema4
+    5 => ema5
+    6 => ema6
+    7 => ema7
+    8 => ema8
+    9 => ema9
+    => na
+
+// 两路交替的断线绘图，在纯常规盘图表中也不会把昨收和今日首根连起来。
+color currentColor = barstate.isconfirmed ? lineColor : color.new(lineColor, 35)
+plot(lineSlot ? currentEma : na, "Session_EMA_Line_A", color=currentColor, linewidth=lineWidth, style=plot.style_linebr, display=display.pane, offset=0)
+plot(lineSlot ? na : currentEma, "Session_EMA_Line_B", color=currentColor, linewidth=lineWidth, style=plot.style_linebr, display=display.pane, offset=0)
+plot(newSession ? currentEma : na, "Session_First_Close", color=lineColor, linewidth=lineWidth + 1, style=plot.style_circles, display=display.pane, offset=0)
+plot(currentEma, "Session_EMA", display=display.data_window, offset=0)
+plot(active ? sessionBars : na, "Session_Bars", display=display.data_window, offset=0)
+plot(active ? effectiveLength : na, "Effective_Length", display=display.data_window, offset=0)
+plot(active ? 1 : 0, "Session_Ready", display=display.data_window, offset=0)
+
+// 公共输出占位：仅观察均线，没有交易方向、入场计划、ATR或策略止损。
+plot(0, "Entry_Signal", display=display.data_window, offset=0)
+plot(0, "Direction", display=display.data_window, offset=0)
+plot(float(na), "Entry_Price", display=display.data_window, offset=0)
+plot(float(na), "Long_Stop", display=display.data_window, offset=0)
+plot(float(na), "Short_Stop", display=display.data_window, offset=0)
+plot(float(na), "ATR", display=display.data_window, offset=0)
