@@ -199,3 +199,60 @@ test('new bars and rebuilt charts cannot consume a delayed realtime result', asy
   fake.emit('message', resultFor(pending));
   assert.deepEqual(local.snapshot(symbol, raw(next), at + 300000).outputs, {});
 });
+
+test('one-minute worker publishes the exact confirmed opening position alongside unchanged VWAP model output',async t=>{
+ const events=new EventEmitter();
+ const local=createLocalIndicators({intervalSeconds:60,barLimit:500,minBars:10,workers:1,onResult:(...args)=>events.emit('result',...args)});
+ t.after(()=>local.close());
+ const open=Date.parse('2026-11-18T14:30:00Z')/1000;
+ const previous=Array.from({length:200},(_,i)=>({time:open-86400+i*60,open:200,high:201,low:199,close:200,volume:100}));
+ const rows=[...previous,...Array.from({length:21},(_,i)=>({time:open+i*60,open:100,high:i<15?101:104,low:99,close:i<15?100:103,volume:100}))].reverse();
+ const frame={bar:rows[0],bar_c:rows[1]},time=(open+1200)*1000+500;
+ const result=once(events,'result',{signal:AbortSignal.timeout(6000)});
+ local.observe(symbol,rows,{...infos,subsession_id:'regular'},frame,[],time);
+ const [,{outputs}]=await result;
+ assert.deepEqual(Object.keys(outputs).sort(),['opening_position','vwap_pullback']);
+ const position=outputs.opening_position[1];assert.equal(position.time,open+1140);
+ assert.equal(position.ready,1);assert.equal(position.position,3);assert.equal(position.range_position,3);
+ assert.equal(position.range_bars,15);assert.equal(position.opening_start,open);assert.equal(position.range_confirmed_at,open+900);
+ const expected=await createCalculator(getDefinition('vwap_pullback'),{version:pinetsVersion})({symbol,
+  bars:[...rows].reverse(),metadata:{timezone:infos.timezone,minmove:1,pricescale:100,type:'stock',session:'regular'}},{tail:2});
+ assert.deepEqual(outputs.vwap_pullback,[...expected].reverse());
+});
+
+test('the production minute worker releases a first 09:45 batch after an early rollover, with no next quote',async t=>{
+ const {Worker}=require('node:worker_threads');
+ const {createCoalescedUpdater}=require('../service/chart_snapshot');
+ const open=Date.parse('2026-11-18T14:30:00Z')/1000;
+ const time=new BigInt64Array(new SharedArrayBuffer(8));
+ const setTime=value=>Atomics.store(time,0,BigInt(value));
+ const clock=()=>Number(Atomics.load(time,0));
+ const events=new EventEmitter();
+ const local=createLocalIndicators({intervalSeconds:60,barLimit:500,minBars:10,workers:1,
+  makeWorker:()=>new Worker(`const {workerData}=require('node:worker_threads');
+   const clock=new BigInt64Array(workerData.clock);Date.now=()=>Number(Atomics.load(clock,0));
+   require(workerData.module);`,{eval:true,workerData:{clock:time.buffer,module:path.resolve(__dirname,'../service/pinets_live_worker.js')}}),
+  onResult:(...args)=>events.emit('result',...args)});
+ t.after(()=>local.close());
+ const previous=Array.from({length:200},(_,i)=>({time:open-86400+i*60,open:200,high:201,low:199,close:200,volume:100}));
+ const today=Array.from({length:16},(_,i)=>({time:open+i*60,open:100,high:101,low:99,close:100.1,volume:100}));
+ const early=[...previous,...today.slice(0,15)].reverse(),current=[...previous,...today].reverse();
+ const metadata={...infos,subsession_id:'regular'};
+ setTime((open+870)*1000);
+ const initial=once(events,'result',{signal:AbortSignal.timeout(6000)});
+ local.observe(symbol,early,metadata,raw(early),[],clock());
+ assert.equal((await initial)[1].outputs.opening_position[0].ready,0);
+ const tasks=[];let receivedAt;
+ const update=createCoalescedUpdater(()=>local.observe(symbol,current,metadata,raw(current),[],receivedAt),{
+  clock,schedule:(fn,delay)=>{const task={fn,delay};tasks.push(task);return task;}});
+ setTime((open+900)*1000-528);receivedAt=clock();update.notify(today[15].time*1000);
+ assert.equal(tasks[0].delay,528);
+ const next=once(events,'result',{signal:AbortSignal.timeout(6000)});
+ setTime((open+900)*1000);tasks.shift().fn();
+ const [,{outputs}]=await next;
+ assert.equal(outputs.opening_position[1].time,open+840);
+ assert.equal(outputs.opening_position[1].ready,1);assert.equal(outputs.opening_position[1].range_bars,15);
+ assert.equal(outputs.vwap_pullback[1].time,open+840);
+ assert.equal(local.snapshot(symbol,raw(current)).outputs.opening_position[1].ready,1);
+ assert.equal(tasks.length,0);
+});

@@ -305,7 +305,7 @@ def test_policy_options_are_scoped_and_persisted_by_manual_endpoint(manual_marke
     assert run(c.app.trading.api_place_limit_stop(LimitStopOrderRequest(**args)))['ok']
     assert c.place.await_args.kwargs['signal_snapshot'][POLICY_KEY]==policy()
     args['entry_mode']='default'
-    with pytest.raises(HTTPException,match='仅用于轨道'):run(c.app.trading.api_place_limit_stop(LimitStopOrderRequest(**args)))
+    with pytest.raises(HTTPException,match='仅用于趋势'):run(c.app.trading.api_place_limit_stop(LimitStopOrderRequest(**args)))
 
 
 @pytest.mark.parametrize('values', [{'breakeven_minutes':0},{'breakeven_minutes':121},

@@ -150,6 +150,8 @@ class ConsoleServices:
                 max_open_positions=config.RISK_MAX_OPEN_POSITIONS,
                 max_total_risk_usd=config.RISK_MAX_TOTAL_RISK_USD,
                 max_direction_risk_usd=config.RISK_MAX_DIRECTION_RISK_USD,
+                max_direction_positions=config.RISK_MAX_DIRECTION_POSITIONS,
+                single_direction_only=config.RISK_SINGLE_DIRECTION_ONLY,
                 daily_loss_limit_usd=config.RISK_DAILY_LOSS_LIMIT_USD,
             ),
             halt_dir=self.paths.data_dir,
@@ -175,6 +177,7 @@ class ConsoleServices:
             'risk': {key:getattr(config,key) for key in ('RISK_PER_TRADE_USD','RISK_MAX_TOTAL_RISK_USD',
                 'RISK_MAX_DIRECTION_RISK_USD','RISK_MAX_SYMBOL_POSITION_PCT')},
             'candidate_protection': self.settings._candidate_order_protection(),
+            'intelligent_exit': self.settings._intelligent_exit(),
         }
         credentials_path = self.paths.tv_credentials_path or (
             CONSOLE_FILE.parent.parent / 'service' / 'creds.json'
@@ -194,6 +197,8 @@ class ConsoleServices:
         self.order_mgr.market_health = self.collector.data_health
         self.order_mgr.entry_admission = self.research.check_candidate_entry
         self.order_mgr.candidate_protection_options = self.settings._candidate_order_protection
+        self.order_mgr.intelligent_exit_options = self.settings._intelligent_exit
+        self.order_mgr.intelligent_exit_market = self.collector.latest
         self.accounts._equity_cache = {"equity": None, "daily_pnl": None, "ts": 0.0}
         self.order_mgr.position_equity = lambda: self.accounts._equity_cache.get("equity")
         self.monitoring._scan_alerts: dict = {}

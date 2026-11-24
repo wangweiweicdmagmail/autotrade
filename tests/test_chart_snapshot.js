@@ -67,3 +67,31 @@ test('yesterday levels use the previous regular trading day and skip today', () 
     {day: '2026-11-02', date: '2026-10-30', high: 110, low: 90});
   assert.equal(previousRegularRange(daily, monday + 3600).high, 110);
 });
+
+test('minute recomputation coalesces bursts while retaining the latest work and supports cancellation',()=>{
+ const {createCoalescedUpdater}=require('../service/chart_snapshot');
+ let now=1000,value=0;const tasks=[],seen=[];
+ const work=createCoalescedUpdater(()=>seen.push(value),{clock:()=>now,
+  schedule:(fn,delay)=>{const t={fn,delay};tasks.push(t);return t;},cancel:t=>t.cancelled=true});
+ for(let i=0;i<100;i++){value=i;work.notify();}
+ assert.equal(tasks.length,1);assert.equal(tasks[0].delay,0);tasks.shift().fn();
+ assert.deepEqual(seen,[99]);
+ now=1100;value=120;work.notify();assert.equal(tasks[0].delay,900);
+ value=130;work.notify();now=2000;tasks.shift().fn();assert.deepEqual(seen,[99,130]);
+ work.notify();const pending=tasks.at(-1);work.cancel();assert.equal(pending.cancelled,true);
+});
+
+test('an early rollover waits for its minute boundary even behind an already queued timer',()=>{
+ const {createCoalescedUpdater}=require('../service/chart_snapshot');
+ let now=1000;const tasks=[],seen=[];
+ const work=createCoalescedUpdater(()=>seen.push(now),{clock:()=>now,
+  schedule:(fn,delay)=>{const task={fn,delay};tasks.push(task);return task;},cancel:t=>t.cancelled=true});
+ work.notify();
+ work.notify(1500); // A new candle arrives after the first timer was queued.
+ tasks.shift().fn();assert.deepEqual(seen,[]);assert.equal(tasks[0].delay,500);
+ now=1499;tasks.shift().fn();assert.deepEqual(seen,[]);assert.equal(tasks[0].delay,1);
+ now=1500;tasks.shift().fn();assert.deepEqual(seen,[1500]);assert.equal(tasks.length,0);
+ now=1600;work.notify(6000);assert.equal(tasks[0].delay,4400);
+ work.cancel();assert(tasks.shift().cancelled);
+ work.notify();assert.equal(tasks[0].delay,900); // No stale barrier after reconnect.
+});

@@ -237,3 +237,6 @@ alertcondition(
      title = "进入震荡",
      message = "trendState = 0：震荡开始"
 )
+
+// Auxiliary ranking reference only; no change to trend signals or execution outputs.
+plot(ta.ema(close, 5), "Ranking_EMA5", display=display.data_window)

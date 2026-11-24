@@ -8,7 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const TradingView = require('@mathieuc/tradingview');
 const { createMarketClient } = require('./tv_market_proxy');
-const {createPriceUpdater, isPriceUpdate, chartSession, previousRegularRange} = require('./chart_snapshot.js');
+const {createPriceUpdater, createCoalescedUpdater, isPriceUpdate, chartSession, previousRegularRange} = require('./chart_snapshot.js');
 const { chartRetryReason, retryDelay } = require('./chart_health.js');
 const { breakoutContext, historicalBreakoutContext } = require('./candle_metrics.js');
 const {PINE_MODELS,definitions,clearOutputs,localSnapshot}=require('./local_snapshot');
@@ -70,7 +70,7 @@ async function main() {
   const creds = JSON.parse(fs.readFileSync(args.creds, 'utf8'));
 
   const marketSession = args['market-session'] || STOCK_SESSION;
-  if (!['24h', 'extended'].includes(marketSession)) throw new Error('不支持的 5 分钟行情时段');
+  if (!['regular', '24h', 'extended'].includes(marketSession)) throw new Error('不支持的 5 分钟行情时段');
   const defaultSessionSymbols = new Set((args['default-session-symbols'] || '').split(',').filter(Boolean));
   const research=createResearchJournal(args['research-spool'],{onError:message=>console.error('[research-archive]',message)});
   const researchDailyKeys=new Map();
@@ -83,7 +83,7 @@ async function main() {
     });
     research.append('configuration',{symbols:args.symbols,series,market_session:marketSession});
     const {getDefinition}=require('./pinets_runtime');
-    research.append('definition',{models:definitions.map(d=>getDefinition(({ts:'trend',ss:'smart'})[d.key]||d.key)),
+    research.append('definition',{models:[...definitions.map(d=>getDefinition(({ts:'trend',ss:'smart'})[d.key]||d.key)),getDefinition('opening_position')],
       registry:JSON.parse(fs.readFileSync(path.join(__dirname,'pine_strategies.json'),'utf8')),
       dependency_lock:fs.readFileSync(path.join(__dirname,'..','package-lock.json'),'utf8'),
       scoring_source:fs.readFileSync(path.join(__dirname,'rhythm_score.js'),'utf8'),
@@ -101,6 +101,7 @@ async function main() {
   const rhythm = args['rhythm-cache'] ? createMarketRhythm({
     symbols: args.symbols.filter(symbol => !defaultSessionSymbols.has(symbol) || BETA.includes(symbol)),
     cachePath: args['rhythm-cache'],marketSession,onFrame:frame=>research.ranking(frame),
+    onError:({symbol,message})=>console.error(`[market-rhythm/${symbol}] calculation_error: ${message}`),
   }) : null;
   let rhythmErrorAt = 0;
   const vwapMinuteBatch = createVwapMinuteBatch(args.symbols.filter(symbol => !defaultSessionSymbols.has(symbol)));
@@ -126,6 +127,7 @@ async function main() {
   });
   const minuteLocal = createLocalIndicators({
     intervalSeconds: 60, barLimit: MINUTE_HISTORY, minBars: 10, workers: 2,
+    onResult(symbol,{outputs}) { rhythm?.observeOpeningPosition(symbol,outputs.opening_position?.[1]??null,Date.now()/1000); },
     onError(symbol, key, error) {
       const id = symbol + '/' + key;
       const now = Date.now();
@@ -196,7 +198,7 @@ async function main() {
     if (local && (!defaultSessionSymbols.has(symbol) || (rhythm && BETA.includes(symbol)))) {
       const referenceOnly = defaultSessionSymbols.has(symbol);
       const minuteSession = referenceOnly ? 'default' : marketSession;
-      // Both resolutions use real extended-session prices for indicator warm-up.
+      // Both resolutions share the configured stock session; indices retain default.
       const minuteRequest = minuteSubscriptionOptions(referenceOnly, MINUTE_HISTORY,marketSession);
       const minuteHistory = minuteRequest.range;
       const subscribeMinute = () => {
@@ -206,8 +208,36 @@ async function main() {
         entry.rhythmPrice1m = null;
         if (!referenceOnly) minuteLocal.reset(symbol);
         const current = () => entries[symbol] === entry && entry.minuteChart === minuteChart && !entry.gaveUp;
+        const minuteWork=createCoalescedUpdater(()=>{
+          if(!current())return;
+          const periods=minuteChart.periods.slice(0,minuteHistory);
+          const rows=[...periods].reverse().map(candle),candidateNow=Date.now()/1000;
+          if(rows.length<2)return;
+          // Persist the newly closed bar even if its rollover arrived before
+          // the local boundary and there is no subsequent trade this minute.
+          if(entry.minuteReceivedAt<rows.at(-1).time)archiveBars(symbol,'1m',minuteSession,rows,minuteChart.infos);
+          rhythm?.observe(symbol,rows,candidateNow,
+            previousRegularRange(entry.daily,rows.at(-1).time),entry.daily||[],entry.minuteReceivedAt);
+          if(referenceOnly)return;
+          entry.vwap1m=calculateVwap1m(rows,{marketSession});
+          const closedMinutes=rows.filter(bar=>bar.time+60<=candidateNow);
+          const candidateKey=JSON.stringify(closedMinutes);
+          if(candidateKey!==entry.candidateStKey){
+            entry.candidateSt1m=candidateProtectionSnapshot(closedMinutes,candidateNow,{marketSession});
+            entry.candidateStKey=candidateKey;
+          }
+          vwapMinuteBatch.observe(symbol,entry.vwap1m);
+          entry.vwapOpening=openingVwapSnapshot(rows,candidateNow,{marketSession});
+          entry.minuteRaw={bar:rows.at(-1),bar_c:rows.at(-2)};
+          minuteLocal.observe(symbol,periods,minuteChart.infos,entry.minuteRaw,[],entry.minuteReceivedAt*1000);
+        },{onError:error=>{
+          entry.minuteRaw=null;entry.vwap1m=null;entry.candidateSt1m=null;entry.candidateStKey=null;
+          entry.vwapOpening=null;rhythm?.reset(symbol);
+          console.error(`[minute/${symbol}] calculation_error: ${error.message}`);
+        }});
         const retry = () => {
           if (!current()) return;
+          minuteWork.cancel();
           clearTimeout(entry.minuteTimer);
           entry.minuteChart = null;
           entry.minuteRaw = null;
@@ -231,24 +261,9 @@ async function main() {
           if (rows.length < 2) return;
           clearTimeout(entry.minuteTimer);
           entry.minuteFailures = 0;
-          rhythm?.observe(symbol, rows, Date.now() / 1000,
-            previousRegularRange(entry.daily, rows.at(-1).time), entry.daily || []);
-          if (rhythm) entry.rhythmPrice1m = {bar: rows.at(-1), price_observed_at: Date.now() / 1000};
-          if (referenceOnly) return;
-          entry.vwap1m = calculateVwap1m(rows,{marketSession});
-          // Unclosed quote bursts do not recompute the closed ST. Include all
-          // closed OHLCV in the key so a deep TV history correction invalidates it.
-          const candidateNow = Date.now() / 1000;
-          const closedMinutes = rows.filter(bar => bar.time + 60 <= candidateNow);
-          const candidateKey = JSON.stringify(closedMinutes);
-          if (candidateKey !== entry.candidateStKey) {
-            entry.candidateSt1m = candidateProtectionSnapshot(closedMinutes, candidateNow,{marketSession});
-            entry.candidateStKey = candidateKey;
-          }
-          vwapMinuteBatch.observe(symbol, entry.vwap1m);
-          entry.vwapOpening = openingVwapSnapshot(rows, Date.now() / 1000,{marketSession});
-          entry.minuteRaw = {bar: rows.at(-1), bar_c: rows.at(-2)};
-          minuteLocal.observe(symbol, minuteChart.periods, minuteChart.infos, entry.minuteRaw);
+          entry.minuteReceivedAt=Date.now()/1000;
+          if (rhythm) entry.rhythmPrice1m = {bar: rows.at(-1), price_observed_at: entry.minuteReceivedAt};
+          minuteWork.notify(rows.at(-1).time*1000);
         });
         entry.minuteTimer = setTimeout(retry, 30000);
         minuteChart.setMarket(symbol, minuteRequest);
@@ -345,16 +360,17 @@ async function main() {
       sessions[sym] = { ...session, has_bars: !!raw.bar && session.accepted };
       if (!raw.bar || !session.accepted) continue;
       const s = localSnapshot(local, sym, raw);
-      if(rhythm&&!REFERENCES.has(sym)){
+      if(rhythm&&BETA.includes(sym)){
         const history=local?.confirmedHistory(sym,s,'trend');
         if(history&&entry.rhythmFiveKey!==history.historyKey){
           entry.rhythmFiveKey=history.historyKey;
           entry.rhythmFivePeriods=[...history.bars].reverse();
           entry.rhythmFiveAtr=new Map(history.rows.map(p=>[p.time,finite(p.Atr_Value)]));
+          entry.rhythmFiveEma5=new Map(history.rows.map(p=>[p.time,finite(p.EMA_5)]));
         }else if(!history){
-          entry.rhythmFiveKey=null;entry.rhythmFivePeriods=[];entry.rhythmFiveAtr=null;
+          entry.rhythmFiveKey=null;entry.rhythmFivePeriods=[];entry.rhythmFiveAtr=null;entry.rhythmFiveEma5=null;
         }
-        rhythm.observeFiveMinute(sym,entry.rhythmFivePeriods||[],entry.rhythmFiveAtr,Date.now()/1000);
+        rhythm.observeFiveMinute(sym,entry.rhythmFivePeriods||[],entry.rhythmFiveAtr,Date.now()/1000,entry.rhythmFiveEma5);
       }
       const minute = entry.minuteRaw ? minuteLocal.snapshot(sym, entry.minuteRaw) : null;
       // smart_stop（ss/ss_c 独立通道）推送时合并进 ts/ts_c，消费方无感知
@@ -362,6 +378,8 @@ async function main() {
         session,
         vwap_1m: entry.vwap1m || null,
         candidate_st_1m_c: entry.candidateSt1m || null,
+        td_exit_1m_c: rhythm?.confirmedTd(sym, Date.now()/1000) || null,
+        rhythm_confirmed_1m: rhythm?.confirmedState(sym, Date.now()/1000) || null,
         market_1m: minute ? { ...minute.base, price_observed_at: minute.observedAt / 1000 } : null,
         rhythm_price_1m: rhythm ? entry.rhythmPrice1m || null : undefined,
         previous_regular_range: previousRegularRange(entry.daily, s.bar.time),

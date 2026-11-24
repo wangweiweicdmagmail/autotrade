@@ -1,5 +1,7 @@
 # 指标计算统一为本地 PineTS（2026-11-22）
 
+2026-11-24输入更新：[常规时段与VWAP归一化排序](REGULAR_VWAP_Z_RANKING.md)。股票一分钟和五分钟默认regular；指数default。本地PineTS与TV仅订阅K线的架构不变，旧extended数据保留。
+
 股票一分钟与五分钟统一使用extended真实盘前盘后预热，具体会话、VWAP累计和交易时间边界见[统一预热说明](EXTENDED_INDICATOR_WARMUP.md)。
 
 当前唯一指标计算链路为：**TradingView K线 → 本地 PineTS → 实时／收盘确认快照 → 现有执行模型**。项目不再向 TV 注册指标，不再下载私有指标元数据／加密正文，也不提供云指标失败后的自动回退。
@@ -16,7 +18,7 @@
 | 一次性CLI／`npm --prefix service run collect` | `tv_cloud.js` 仅导出K线，旧`--indicators`参数明确拒绝 |
 | 本地诊断 | `python3 service/tv_diag.py` 检查凭据文件、PineTS依赖及本地源码可加载性，不请求TV指标接口 |
 
-正式五分钟worker目前计算原有七个基础指标与黄金信号；一分钟VWAP回踩在独立的一分钟worker中计算。启动进度统计本地实际模型数，不再等待云端脚本正文。
+正式五分钟worker目前计算原有七个基础指标与黄金信号；一分钟VWAP回踩与只观察的opening_position在同一个一分钟worker池计算，后者供[小区间排名](OPENING_POSITION_RANKING.md)，不改变VWAP原输出。启动进度统计本地实际模型数，不再等待云端脚本正文。
 
 ## 已移除的旧实现
 

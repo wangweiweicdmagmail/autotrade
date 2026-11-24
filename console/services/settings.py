@@ -5,7 +5,7 @@ import config
 import json
 import os
 from console.shared import logger
-from console.schemas import SettingsRequest, CandidateProtectionOptions
+from console.schemas import SettingsRequest, CandidateProtectionOptions, IntelligentExitOptions
 
 
 class SettingsService:
@@ -44,6 +44,13 @@ class SettingsService:
         except OSError:
             logger.exception("settings.json 落盘失败")
             return False
+
+    def _intelligent_exit(self) -> dict:
+        value = self._settings.get('intelligent_exit')
+        try:
+            return IntelligentExitOptions(**(value if value is not None else {})).dict()
+        except (ValueError, TypeError):
+            return {'version': 0, 'enabled': False, 'error': '智能退出设置损坏，请重新保存'}
 
     def _candidate_order_protection(self) -> dict:
         value = self._settings.get('candidate_order_protection')
@@ -111,6 +118,7 @@ class SettingsService:
     def _settings_payload(self) -> dict:
         """全局设置当前值（GET /api/settings 与 POST 响应共用）。"""
         return {
+            "intelligent_exit": self._intelligent_exit(),
             "candidate_order_protection": self._candidate_order_protection(),
             "stop_atr_mult": self.context.settings._stop_atr_mult(),
             "screen_premarket_filter": self.context.settings._screen_premarket_filter(),
@@ -134,6 +142,18 @@ class SettingsService:
         """修改全局设置并落盘 settings.json（重启后保持）。
         只更新显式传入的字段（None = 不动），至少传一个。"""
         changed = {}
+        if req.intelligent_exit is not None:
+            if req.__fields_set__ != {'intelligent_exit'}:
+                raise HTTPException(400, '智能退出设置请单独提交')
+            previous = dict(self._settings)
+            self._settings['intelligent_exit'] = req.intelligent_exit.dict()
+            if not self._save_settings():
+                self._settings.clear()
+                self._settings.update(previous)
+                raise HTTPException(500, '智能退出设置保存失败，原设置继续生效')
+            self.context.events.record_event('intelligent_exit_settings_updated', trader=trader,
+                                            intelligent_exit=self._settings['intelligent_exit'])
+            return {'ok': True, **self._settings_payload()}
         if req.candidate_order_protection is not None:
             if req.__fields_set__ != {'candidate_order_protection'}:
                 raise HTTPException(400, '候选保护设置请单独提交')

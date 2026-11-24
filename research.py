@@ -33,6 +33,8 @@ def main(argv=None):
     p = commands.add_parser('method');p.add_argument('--text-file',type=Path,required=True);p.add_argument('--source',required=True)
     p.add_argument('--question',action='append',default=[]);p.add_argument('--status',choices=['hypothesis','user_confirmed','validated'],default='hypothesis');p.add_argument('--method-id')
     p = commands.add_parser('backfill');p.add_argument('--day',required=True);p.add_argument('--credentials',type=Path,required=True);p.add_argument('--max-requests',type=int,default=4)
+    p = commands.add_parser('cache-ranking-day');p.add_argument('--day',required=True);p.add_argument('--credentials',type=Path,required=True);p.add_argument('--concurrency',type=int,default=3)
+    p = commands.add_parser('rank-at');p.add_argument('--day',required=True);p.add_argument('--at',required=True,help='美东收盘确认时刻 HH:MM')
     p = commands.add_parser('backup');p.add_argument('--to',type=Path,required=True)
     args = parser.parse_args(argv)
     archive = ResearchArchive(args.data_dir/'research')
@@ -83,6 +85,10 @@ def main(argv=None):
         if not 1<=args.max_requests<=100:
             raise ValueError('补取请求数无效')
         result = asyncio.run(repair_day(store,args.day,args.credentials,max_requests=args.max_requests))
+    elif args.command in ('cache-ranking-day','rank-at'):
+        import config
+        from engine.ranking_replay import cache_day,rank_at
+        result=asyncio.run(cache_day(store,args.day,config.WATCHLIST,config.TV_DEFAULT_SESSION_SYMBOLS,args.credentials,concurrency=args.concurrency)) if args.command=='cache-ranking-day' else asyncio.run(rank_at(store,args.day,args.at,config.WATCHLIST,config.TV_DEFAULT_SESSION_SYMBOLS))
     elif args.command == 'backup':
         store.backup(args.to);result={'ok':True,'path':str(args.to)}
     print(json.dumps(result,ensure_ascii=False,allow_nan=False))

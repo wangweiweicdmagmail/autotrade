@@ -51,7 +51,7 @@ def test_pending_full_plan_risk(tmp_path):
     run(go())
 
 
-def test_manual_add_blocked_for_auto_position_even_with_symbol_alias(tmp_path):
+def test_manual_add_allowed_for_auto_position_even_with_symbol_alias(tmp_path):
     async def go():
         mgr = make_mgr(tmp_path)
         auto, err = await mgr.place_limit_stop_lot(
@@ -59,10 +59,10 @@ def test_manual_add_blocked_for_auto_position_even_with_symbol_alias(tmp_path):
             signal_snapshot={"strategy_id": "fixture_pullback"},
         )
         assert auto is not None, err
-        blocked, err = await mgr.place_limit_stop_lot(
+        added, err = await mgr.place_limit_stop_lot(
             "AAA", "long", 10, 100, 99, manual_entry=True,
         )
-        assert blocked is None and "禁止手动加仓" in err
+        assert added is not None and added.lot_id != auto.lot_id, err
         other, err = await mgr.place_limit_stop_lot(
             "NASDAQ:BBB", "long", 10, 100, 99, manual_entry=True,
         )

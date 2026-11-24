@@ -45,7 +45,7 @@ class RealtimeCollector:
     STARTUP_MAX_SECONDS = 180.0
     RESTART_COOLDOWN_SECONDS = 60.0
 
-    def __init__(self, symbols: List[str], *, audit=None, market_session="extended", default_session_symbols=(), ipo_watches=None, on_ipo_trade=None, credentials_path=None, research_spool=None):
+    def __init__(self, symbols: List[str], *, audit=None, market_session="regular", default_session_symbols=(), ipo_watches=None, on_ipo_trade=None, credentials_path=None, research_spool=None):
         self.audit = audit
         self.research_spool = research_spool
         self.market_session = market_session
@@ -189,7 +189,7 @@ class RealtimeCollector:
                         (previous["time"], previous.get("revision", 0)))):
                 frame = previous
             self.vwap_distribution = {"frame": frame, "progress": vwap.get("progress")}
-        if self.market_session == "24h" or self.default_session_symbols:
+        if self.market_session in ("regular", "24h") or self.default_session_symbols:
             symbols = {
                 symbol: row for symbol, row in symbols.items()
                 if isinstance(row, dict) and row.get("bar")

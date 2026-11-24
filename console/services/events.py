@@ -73,13 +73,15 @@ class EventsService:
             rec['research_evidence'] = {'symbol': symbol, 'role': 'event_observation',
                 'frame_id': event_frame, 'market': {k:row[k] for k in
                 ('bar','bar_c','market_1m','ts','ts_c','e9','e9_c','e7v2','e7v2_c',
-                 'vwap_1m','candidate_st_1m_c','price_observed_at','session') if k in row}}
+                 'vwap_1m','candidate_st_1m_c','td_exit_1m_c','rhythm_confirmed_1m','rhythm_price_1m','price_observed_at','session') if k in row}}
             rec['research_evidence']['beta'] = {key:{k:latest[key][k] for k in
-                ('bar','market_1m','rhythm_price_1m','price_observed_at') if k in latest[key]}
+                ('bar','market_1m','rhythm_price_1m','rhythm_confirmed_1m','td_exit_1m_c','price_observed_at') if k in latest[key]}
                 for key in ('CAPITALCOM:NAS100','CAPITALCOM:SPX500') if key in latest}
             settings = getattr(self.context, 'settings', None)
             if settings and hasattr(settings, '_candidate_order_protection'):
                 rec['research_evidence']['candidate_protection'] = settings._candidate_order_protection()
+            if settings and hasattr(settings, '_intelligent_exit'):
+                rec['research_evidence']['intelligent_exit'] = settings._intelligent_exit()
 
     def _on_lot_closed(self, d: dict) -> None:
         """保护单触发 / 对账补登的平仓事件：完整字段落事件流，供复盘。"""

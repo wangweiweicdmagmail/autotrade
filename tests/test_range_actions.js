@@ -6,7 +6,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const { test } = require('node:test');
 const RangeDistribution = require('../console/static/range-distribution');
-const {rhythmTradePreview}=require('../console/static/market-rhythm');
+const {rhythmTradePreview,rhythmTdFact,rhythmVwapFact}=require('../console/static/market-rhythm');
 const now = Date.parse('2026-11-05T17:31:00Z') / 1000;
 const barTime = now - 60;
 const symbol = 'NASDAQ:APP';
@@ -30,7 +30,7 @@ function harness(side = 'long') {
     },
   };
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../console/static/app.js'), 'utf8'), {
-    Date: Clock, RangeDistribution, rhythmTradePreview,
+    Date: Clock, RangeDistribution, rhythmTradePreview,rhythmTdFact,rhythmVwapFact,
     Vue: { createApp(value) { options = value; return { use() { return this; }, mount() {} }; } },
     ElementPlus: {}, localStorage: { getItem() { return null; }, setItem() {} },
     fetch: async (url, request) => {
@@ -353,10 +353,19 @@ test('VWAP selection updates the manual trade candidate and preview while the pa
   const target = 'NASDAQ:NVDA';
   const minute = now - 1;
   ui.status.candidate_entry_required=true;
+  ui.status.candidate_beta_filter_version=1;
   ui.status.candidate_order_policy_version=1;
   ui.status.candidate_protection_live_version=1;
   ui.slots[0].vwapOutsideOnly=false; // This case isolates selection; policy gates have separate tests.
-  ui.entryCandidates={ready:true,vwap_direction_required:true,td_threshold:1,ema9_period:9,ema9_interval_seconds:300,as_of:now,rows:[symbol,target].map((symbol,i)=>({symbol,side:i?'short':'long',direction:i?-1:1,vwap:i?204:108,sigma:2,td_count:i?-3:3,td_ready:true,bar_time:now-60,confirmed_at:now}))};
+  const fact=count=>({version:1,source:'confirmed_minute_v1',id:'selection-'+count,known:true,ready:true,bar_time:now-60,confirmed_at:now,quote_bar_time:now,observed_at:now,count});
+  ui.entryCandidates={data_contract_version:4,entry_policy:'stock_vwap_side_v1',direction_source:'confirmed_vwap_direction_v1',td_required:false,beta_filter_required:false,ema9_required:false,td_source:'confirmed_minute_v1',ready:true,vwap_direction_required:true,td_threshold:1,ema9_period:9,ema9_interval_seconds:300,as_of:now,rows:[symbol,target].map((symbol,i)=>({symbol,side:i?'short':'long',direction:i?-1:1,close:i?202:110,vwap:i?204:108,sigma:2,direction_fact:{version:1,source:'confirmed_vwap_direction_v1',id:'vwap-'+i,known:true,ready:true,close:i?202:110,vwap:i?204:108,direction:i?-1:1,bar_time:now-60,confirmed_at:now,quote_bar_time:now,observed_at:now},td_count:i?-3:3,td_fact:fact(i?-3:3),td_ready:true,bar_time:now-60,confirmed_at:now}))};
+  const benchmarkContext=side=>({td_source:'confirmed_minute_v1',version:1,rule:'both_indices_absolute',td_required:true,td_rule:'any_index_same_sign',
+    ready:true,absolute_ready:true,as_of:now,snapshot_id:'selection-minute',direction:0,
+    absolute_long_allowed:true,absolute_short_allowed:true,td_long_allowed:side==='long',td_short_allowed:side==='short',
+    long_allowed:side==='long',short_allowed:side==='short',rows:['NAS100','SPX500'].map(s=>({symbol:'CAPITALCOM:'+s,td_count:side==='long'?1:-1,td_fact:fact(side==='long'?1:-1)}))});
+  ui.entryCandidates.ranking_snapshot={id:'selection-minute'};
+  ui.entryCandidates.beta_filter_required=false;
+  ui.entryCandidates.beta_filter=benchmarkContext('long');
   ui.market[symbol].market_1m = {bar: {time: minute}};
   ui.market[symbol].ts.ema_9=108;
   ui.market[symbol].vwap_pullback = {time: minute, direction: 1};
@@ -370,6 +379,7 @@ test('VWAP selection updates the manual trade candidate and preview while the pa
   ui.deckCollapsed = true;
   const previous = ui.slotRows[0];
 
+  ui.entryCandidates.beta_filter=benchmarkContext('short');
   ui.selectVwapStock(target);
   const current = ui.slotRows[0];
   assert.equal(ui.slots[0].symbol, target);
@@ -382,6 +392,7 @@ test('VWAP selection updates the manual trade candidate and preview while the pa
   assert.notEqual(current.qty, previous.qty);
   assert.equal(switched.at(-1), target);
 
+  ui.entryCandidates.beta_filter=benchmarkContext('long');
   ui.selectVwapStock(symbol);
   assert.equal(ui.deckCollapsed, true);
   assert.equal(ui.slotRows[0].side, 'long');
@@ -502,17 +513,19 @@ test('automatic action rejects changed direction, cancelled confirmation and los
   }
 });
 
-test('golden shortcut blocks missing signals, demo and existing automatic positions', async () => {
+test('golden shortcut blocks missing signals and demo but permits adding to automatic positions', async () => {
   const { ui, requests } = harness();
   await ui.rangeGoldenOrder();
   ui.market[symbol].golden = golden(1, 0);
   ui.demoMode = true;
   await ui.rangeGoldenOrder();
   await ui.rangeStartAuto();
+  assert.equal(requests.length, 0);
   ui.demoMode = false;
   ui.lots = [{ symbol, state: 'ACTIVE', filled_qty: 1, limit_type: 'auto_ema7_autotrade_v2' }];
   await ui.rangeGoldenOrder();
-  assert.equal(requests.length, 0);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].url, '/api/auto/golden-entry');
 });
 
 test('untouched gold signal feed card opens after manual confirmation and shares duplicate protection', async () => {

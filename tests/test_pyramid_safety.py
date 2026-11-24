@@ -260,6 +260,7 @@ def test_group_state_survives_order_manager_disk_roundtrip(tmp_path):
 def test_quote_receipt_time_tracks_each_symbol_without_mutating_input():
     collector = RealtimeCollector([SYM, 'NASDAQ:QQQ'])
     payload = {'symbols': {SYM: {'bar': {'close': 100}}, 'NASDAQ:QQQ': {'bar': {'close': 500}}}}
+    for row in payload['symbols'].values():row['session']={'requested':'regular','resolved':'regular','accepted':True}
     collector._accept_tick(payload, now=1000)
     assert 'price_observed_at' not in payload['symbols'][SYM]
     payload['symbols']['NASDAQ:QQQ']['bar'] = {'close': 501}

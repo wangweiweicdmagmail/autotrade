@@ -16,6 +16,7 @@
 4. 日亏损熔断：当日累计盈亏 <= -RISK_DAILY_LOSS_LIMIT_USD 后，
    当日不再开新仓（halt 状态落盘 logs/halt-YYYYMMDD，重启不丢）；
 5. 止损价合法性：多仓 stop < entry、空仓 stop > entry，且距离 > 0。
+6. 生产禁止多空并存，同向可多笔/同股加仓；仅未结束及受理未知批次保留方向。
 
 参考 nautilus_ibkr_helloworld 的分层风控（时段/熔断/冷却/以损定量），
 v1 先实现硬性限额，冷却/相关组等后续补。
@@ -44,6 +45,8 @@ class RiskConfig:
     daily_loss_limit_usd: float = 1000.0
     daily_loss_halt_enabled: bool = False  # 日亏损熔断开关（默认关闭）
     max_direction_risk_usd: float = 0.0  # 兼容离线配置；生产从 config 注入
+    max_direction_positions: int = 0  # 独立笔数限制；当前生产为0，不限制同向笔数
+    single_direction_only: bool = False  # 生产从config注入True；离线可显式使用旧配置
 
 
 class RiskGate:
@@ -82,7 +85,9 @@ class RiskGate:
                         risk_usd: float = 0,
                         open_risk_usd: float = 0,
                         risk_ref_px: float = 0,
-                        open_direction_risk_usd: float = 0) -> Tuple[bool, str]:
+                        open_direction_risk_usd: float = 0,
+                        open_direction_positions: Optional[int] = None,
+                        open_opposite_positions: Optional[int] = None) -> Tuple[bool, str]:
         """
         返回 (是否放行, 原因)。daily_pnl 为当日累计盈亏（实时+已实现），
         由调用方从 IBKR 账户摘要取得；None = 取不到（FA 口径未解决时），
@@ -92,6 +97,10 @@ class RiskGate:
         限价只做成交保护，不进风险口径（BA 实锤：0.5% 溢价≈止损距离被误计）。
         open_risk_usd 为现有全部开放 lot 的总风险敞口（OrderManager.risk_exposure），
         与本笔计划风险相加超过 max_total_risk_usd 预算时拦截（0 = 不限制）。
+        open_direction_positions 是同向未结束批次数，包含预约意图、挂单、
+        持仓和平仓中；不因保本或风险金额归零而释放名额。
+        single_direction_only开启时，相反方向必须没有未结束批次；
+        同方向不因该开关限制笔数，同股加仓仍受风险金额和合计仓位约束。
         """
         if self.is_halted():
             return False, "日亏损熔断中，今日不再开新仓"
@@ -103,6 +112,21 @@ class RiskGate:
                 and open_positions >= self.cfg.max_open_positions:
             return False, (f"持仓数 {open_positions} 达到上限 "
                            f"{self.cfg.max_open_positions}")   # 0 = 不限制
+        if self.cfg.single_direction_only:
+            if type(open_opposite_positions) is not int or open_opposite_positions < 0:
+                return False, "现有订单方向未确认，禁止新开仓"
+            if open_opposite_positions > 0:
+                existing, requested = ("空头", "多头") if side == "long" else ("多头", "空头")
+                return False, (f"已有{existing}{open_opposite_positions}笔未结束订单，不能新开{requested}；"
+                               "不允许多空并存，原方向挂单及持仓全部结束后才可换向")
+        if self.cfg.max_direction_positions > 0:
+            direction = "多头" if side == "long" else "空头"
+            if type(open_direction_positions) is not int or open_direction_positions < 0:
+                return False, f"{direction}持仓笔数未确认，禁止新开仓"
+            if open_direction_positions >= self.cfg.max_direction_positions:
+                return False, (f"{direction}已有{open_direction_positions}笔未结束订单，"
+                               f"单方向最多{self.cfg.max_direction_positions}笔"
+                               "（挂单、持仓、平仓中均占位，保本不释放）")
         if qty <= 0:
             return False, "qty <= 0"
         if stop <= 0 or entry <= 0:

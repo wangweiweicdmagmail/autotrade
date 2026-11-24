@@ -856,17 +856,24 @@ def test_symbol_cap_blocks_automatic_entry_before_broker_submission(tmp_path):
     run(go())
 
 
-def test_manual_market_entry_once_until_existing_batch_is_finished(tmp_path):
+def test_manual_market_can_add_to_existing_same_symbol_batch(tmp_path):
+    from unittest.mock import AsyncMock
+    from execution.risk import RiskConfig, RiskGate
     async def go():
         for state in (PENDING, ACTIVE, CLOSING):
             mgr = mk_mgr(FakeGW(fills={}), tmp_path, f'manual_once_{state}')
+            mgr._risk = RiskGate(RiskConfig(max_open_positions=0, single_direction_only=True), halt_dir=tmp_path)
             mgr.recovery_status = lambda: {"blocks_entry": False}
+            mgr._gw.place_market_with_stop = AsyncMock(return_value={
+                'ok': True, 'entry_order_id': 9201, 'stop_order_id': 9202})
             attach(mgr, mk_lot('first', state=state, qty=10, sym='NYSE:QCOM'))
             lot, error = await mgr.place_limit_stop_lot(
                 'NASDAQ:QCOM', 'long', 10, 100, 95,
                 limit_type='market', manual_entry=True)
-            assert lot is None and '只允许建仓一次' in error
-            assert len(mgr._lots) == 1
+            assert lot is not None, error
+            assert len(mgr._lots) == 2
+            mgr._gw.place_market_with_stop.assert_awaited_once()
+            cancel_watchers(mgr)
     run(go())
 
 

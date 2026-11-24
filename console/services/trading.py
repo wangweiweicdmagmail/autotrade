@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 import config
 from domain.contracts import finite_number
+from execution.manual_entry import vwap_limit_price
 from execution.candidate_policy import POLICY_KEY, vwap_entry_check
 from console.shared import logger
 from console.schemas import LimitStopOrderRequest, OpeningBreakoutOrderRequest, UpdateTrailRequest
@@ -23,18 +24,45 @@ class TradingService:
     def __init__(self, context):
         self.context = context
 
-    def _rhythm_entry_plan(self, symbol, data, now, stop_mode='atr_2'):
+    def _rhythm_entry_plan(self, symbol, data, now, stop_mode='atr_2', *, ranking='trend', view='mixed', limit_level=None):
         """Manual entry intent, using the same closed-minute perception as the panel."""
         stamp = now.timestamp()
         if now.weekday() >= 5 or not 570 <= now.hour * 60 + now.minute < 960:
             raise HTTPException(400, "轨道市价单仅使用当日常规盘轨道")
+        if getattr(self.context.order_mgr,'entry_admission',None) is not None:
+            from execution.entry_admission import check_candidate
+            snapshot=self.context.research.entry_candidates(stamp,ranking=ranking,view=view)
+            candidate=next((r for r in snapshot['rows'] if r['symbol']==symbol),None)
+            side=candidate.get('side') if candidate else None
+            permission=check_candidate(snapshot,symbol,side)
+            if not permission['ok']:raise HTTPException(400,permission['reason'])
+            close=finite_number((data.get('bar') or {}).get('close'))
+            sigma=finite_number(candidate.get('sigma'))
+            if limit_level is not None:
+                try: close=vwap_limit_price(side,limit_level,candidate.get('vwap'),sigma)
+                except ValueError as error: raise HTTPException(400,str(error))
+            try:stop=self._manual_stop_price(data,side,close,stop_mode,now,sigma)
+            except ValueError as error:raise HTTPException(400,str(error))
+            return side,close,stop,{'sigma':sigma,'vwap':candidate['vwap'],'ema3':candidate['ema3'],
+                'bar_time':candidate['bar_time'],'confirmed_at':candidate['confirmed_at'],
+                'direction':candidate['direction'],'direction_fact':candidate['direction_fact'],
+                'entry_order_type':'LMT' if limit_level else 'MKT','limit_level':limit_level,'entry_reference':close,
+                'td_fact':candidate['td_fact'],
+                'ranking_snapshot':snapshot['ranking_snapshot'],'candidate_admission':permission['evidence'],
+                'stop_source':'manual_vwap_sigma' if stop_mode=='vwap_sigma' else 'market_2atr_outside_bar',
+                'stop_bar_time':data['bar']['time'],'stop_atr_interval_seconds':300,'stop_atr_multiple':2,
+                'stop_atr_value':finite_number(self._ts_c(data).get('atr'))}
+        if limit_level is not None:
+            raise HTTPException(400,'VWAP限价需要趋势榜准入服务')
+        # Compatibility for isolated, non-production callers without candidate admission.
         frame = self.context.research._market_rhythm.read(symbol, watch=symbol, now=stamp)
         tracks = frame.get("tracks", []) + frame.get("watch_tracks", [])
         row = next((t for t in tracks if t.get("symbol") == symbol and not t.get("is_beta")), None)
         if frame.get("status") != "ready" or not row or row.get("issue") or not row.get("aligned"):
             raise HTTPException(400, "四宫格轨道数据未就绪")
         point = next(iter(reversed(row.get("points", []))), None)
-        if not point or not 0 <= stamp - (point[0] + 60) <= 120 or point[10] not in (-1, 1):
+        direction = point[10] if point else None
+        if not point or not 0 <= stamp - (point[0] + 60) <= 120 or direction not in (-1, 1):
             raise HTTPException(400, "四宫格推荐方向或确认数据已失效")
         sigma = finite_number(point[3])
         bar = data.get("bar") or {}
@@ -43,13 +71,13 @@ class TradingService:
         if (close is None or close <= 0 or observed is None or not 0 <= stamp - observed <= 45
                 or bar_time is None or not bar_time <= stamp < bar_time + 300):
             raise HTTPException(400, "实时价格或当前 5 分钟 K 线未就绪")
-        side = "long" if point[10] == 1 else "short"
+        side = "long" if direction == 1 else "short"
         try:
             stop = self._manual_stop_price(data,side,close,stop_mode,now,sigma)
         except ValueError as error:
             raise HTTPException(400, str(error))
         return side, close, stop, {"sigma": sigma, "vwap": point[2], "ema3": point[1],
-            "bar_time": point[0], "confirmed_at": point[0] + 60, "direction": point[10],
+            "bar_time": point[0], "confirmed_at": point[0] + 60, "direction": direction,
             "stop_source": "manual_vwap_sigma" if stop_mode=='vwap_sigma' else "market_2atr_outside_bar", "stop_bar_time": bar_time,
             "stop_atr_interval_seconds": 300, "stop_atr_multiple": 2,
             "stop_atr_value": finite_number(self._ts_c(data).get("atr"))}
@@ -569,20 +597,26 @@ class TradingService:
             "retest",
             "chase",
             "market",
+            "vwap_limit",
         ):
             raise HTTPException(400, f"不支持的限价类型: {req.limit_type}")
         manual_direction = req.market_direction_mode == "manual"
         # rhythm_sigma remains an accepted legacy identifier, using the new ATR policy.
         rhythm_entry = req.entry_mode in ("rhythm_atr", "rhythm_sigma")
+        if req.candidate_ranking != 'trend':
+            raise HTTPException(400,'TD榜已移除，仅支持趋势榜开仓')
+        limit_entry = req.limit_type == 'vwap_limit'
+        if limit_entry and not rhythm_entry:
+            raise HTTPException(400,'VWAP限价仅用于趋势榜手动入场')
         if req.candidate_order is not None and (not rhythm_entry or opening_breakout):
-            raise HTTPException(400, "候选预订单设置仅用于轨道市价入口")
+            raise HTTPException(400, "候选预订单设置仅用于趋势市价／限价入口")
         if req.candidate_order is not None:
             shared = self.context.settings._candidate_order_protection()
             if shared.get('version') != 1:
                 raise HTTPException(400, '候选保护设置未就绪，请在候选与订单页面重新保存')
             req.candidate_order = type(req.candidate_order)(**{**req.candidate_order.dict(), **shared})
-        if rhythm_entry and (req.limit_type != "market" or opening_breakout or manual_direction or req.force):
-            raise HTTPException(400, "轨道入场仅用于四宫格市价单，不能混用其他入场方式")
+        if rhythm_entry and (req.limit_type not in ("market","vwap_limit") or opening_breakout or manual_direction or req.force):
+            raise HTTPException(400, "趋势入场仅用于市价或VWAP限价，不能混用其他入场方式")
         if manual_direction:
             if req.limit_type != "market" or opening_breakout:
                 raise HTTPException(400, "手动方向仅用于手动市价单")
@@ -599,15 +633,17 @@ class TradingService:
         candidate_evidence=None
         if admission is not None and not opening_breakout:
             try:
-                permission=admission(req.symbol,req.side,now.timestamp())
+                permission=admission(req.symbol,req.side,now.timestamp(),**({'view':req.candidate_view} if req.candidate_view!='mixed' else {}))
             except Exception as error:
                 logger.exception('手动入场候选检查不可用')
                 raise HTTPException(400,'候选入场限制：候选检查不可用') from error
             if not isinstance(permission,dict) or permission.get('ok') is not True:
                 raise HTTPException(400,(permission or {}).get('reason','候选入场限制：候选验证失败') if isinstance(permission,dict) else '候选入场限制：候选验证失败')
             candidate_evidence=permission['evidence']
+            if candidate_evidence.get('entry_policy')=='stock_vwap_side_v1' and req.candidate_order is not None:
+                req.candidate_order.vwap_outside_only=False
             if req.force or manual_direction or req.range_direction_confirmed:
-                raise HTTPException(400,'候选趋势方向固定，不能使用反向或强制开仓')
+                raise HTTPException(400,'开仓方向由收盘价相对VWAP的位置确定，不能使用反向或强制开仓')
         opening = now.weekday() < 5 and 570 <= now.hour * 60 + now.minute < 580
         data = (self.context.collector.latest() or {}).get(req.symbol, {})
         bar = data.get("bar") or {}
@@ -633,7 +669,11 @@ class TradingService:
 
         rhythm_evidence = None
         if rhythm_entry:
-            recommended, rhythm_price, rhythm_stop, rhythm_evidence = self._rhythm_entry_plan(req.symbol, data, now,req.manual_stop_mode)
+            recommended, rhythm_price, rhythm_stop, rhythm_evidence = self._rhythm_entry_plan(req.symbol, data, now,req.manual_stop_mode,
+                **({'limit_level':req.vwap_limit_level} if limit_entry else {}),**({'view':req.candidate_view} if req.candidate_view!='mixed' else {}))
+            # Reuse the exact facts that priced this intent if a new confirmation arrived
+            # between the initial admission and the plan read. Do not mix old sigma with new rails.
+            candidate_evidence=rhythm_evidence.pop('candidate_admission',candidate_evidence)
             if req.side != recommended:
                 raise HTTPException(400, "四宫格推荐方向已变化，请重新确认")
             if req.candidate_order is not None and req.candidate_order.vwap_outside_only:
@@ -690,7 +730,7 @@ class TradingService:
         if not opening_breakout and (candidate_evidence is not None or req.manual_stop_mode=='vwap_sigma'):
             evidence=candidate_evidence or rhythm_evidence
             if evidence is None:
-                _,_,_,evidence=self._rhythm_entry_plan(req.symbol,data,now,req.manual_stop_mode)
+                _,_,_,evidence=self._rhythm_entry_plan(req.symbol,data,now,req.manual_stop_mode,**({'view':req.candidate_view} if req.candidate_view!='mixed' else {}))
             reference=bar.get('close') if req.limit_type in ('market','chase') else limit_px
             try:
                 stop_px=self._manual_stop_price(data,req.side,reference,req.manual_stop_mode,now,evidence.get('sigma'))
@@ -723,6 +763,7 @@ class TradingService:
         import uuid
         research_decision_id = str(uuid.uuid4())
         signal_snapshot['research_decision_id'] = research_decision_id
+        signal_snapshot['candidate_view'] = req.candidate_view
         market_frame = getattr(self.context.collector, "market_frame_id", None)
         if market_frame is not None:
             signal_snapshot["decision_market_frame"] = market_frame
@@ -732,7 +773,7 @@ class TradingService:
             qty=qty, limit_px=limit_px, stop_px=stop_px, limit_type=req.limit_type,
             reason=req.reason, force=req.force, decision_market_frame=market_frame,
             market_direction_mode='candidate' if candidate_evidence else "rhythm" if rhythm_entry else req.market_direction_mode,
-            entry_mode=req.entry_mode, rhythm_entry=rhythm_evidence,
+            entry_mode=req.entry_mode, rhythm_entry=rhythm_evidence,candidate_ranking=req.candidate_ranking,candidate_view=req.candidate_view,
             manual_stop_mode=req.manual_stop_mode if not opening_breakout else None,
             candidate_admission=candidate_evidence,
             candidate_order=req.candidate_order.dict() if req.candidate_order else None,
@@ -754,6 +795,9 @@ class TradingService:
             signal_snapshot.update(stop_source="opening_bar_extreme", stop_bar_time=bar["time"])
         if not opening_breakout:
             signal_snapshot.update(manual_stop_mode=req.manual_stop_mode)
+            if rhythm_entry:
+                signal_snapshot.update(candidate_ranking='trend',entry_order_type='LMT' if limit_entry else 'MKT',
+                    vwap_limit_level=req.vwap_limit_level if limit_entry else None)
             if req.candidate_order is not None:
                 signal_snapshot[POLICY_KEY] = req.candidate_order.dict()
             if candidate_evidence:
@@ -793,7 +837,7 @@ class TradingService:
             trader=trader,
             risk_ref_px=risk_ref_px,
             manual_entry=True,
-            entry_order_type="MKT" if opening_breakout or rhythm_entry else "",
+            entry_order_type="LMT" if limit_entry else "MKT" if opening_breakout or rhythm_entry else "",
             **({"submission_deadline": deadline} if deadline is not None else {}),
         )
         if lot is None:

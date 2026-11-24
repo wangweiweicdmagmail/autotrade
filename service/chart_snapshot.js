@@ -6,6 +6,28 @@ function isPriceUpdate(changes) {
   return !Array.isArray(changes) || changes.includes('$prices');
 }
 
+// The daemon emits once per second. Coalesce expensive minute-indicator work
+// during quote bursts, while the caller retains every received candle revision.
+function createCoalescedUpdater(run, {clock=Date.now,schedule=setTimeout,cancel=clearTimeout,intervalMs=1000,onError=error=>{throw error;}}={}) {
+  let timer=null,last=-Infinity,notBefore=0;
+  function execute(){
+    timer=null;
+    // TV can send the next minute just before the local minute boundary.
+    // Recheck a newer barrier even when this timer was already queued.
+    if(clock()<notBefore){timer=schedule(execute,notBefore-clock());return;}
+    notBefore=0;last=clock();
+    try{run();}catch(error){onError(error);}
+  }
+  return {
+    notify(earliest=0){
+      if(Number.isFinite(earliest))notBefore=Math.max(notBefore,earliest);
+      if(timer!==null)return;
+      timer=schedule(execute,Math.max(0,intervalMs-(clock()-last),notBefore-clock()));
+    },
+    cancel(){if(timer!==null)cancel(timer);timer=null;notBefore=0;},
+  };
+}
+
 // Closed history changes only at a new candle or a historical correction.
 // Keep live OHLC/ATR current without rebuilding 160 historical rows per tick.
 function createPriceUpdater(atr) {
@@ -73,4 +95,4 @@ function previousRegularRange(daily, barTime) {
   return null;
 }
 
-module.exports = {createPriceUpdater,isPriceUpdate,chartSession,previousRegularRange};
+module.exports = {createPriceUpdater,createCoalescedUpdater,isPriceUpdate,chartSession,previousRegularRange};

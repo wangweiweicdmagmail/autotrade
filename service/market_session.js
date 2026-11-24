@@ -2,7 +2,7 @@
 
 // One stock-session clock for subscriptions, VWAP accumulation and warm-up.
 // Broker entry windows are separate and continue to use regular trading hours.
-const STOCK_SESSION='extended';
+const STOCK_SESSION='regular';
 const MINUTE_HISTORY=4000;
 const eastern=new Intl.DateTimeFormat('en-CA',{timeZone:'America/New_York',year:'numeric',
   month:'2-digit',day:'2-digit',weekday:'short',hour:'2-digit',minute:'2-digit',hourCycle:'h23'});

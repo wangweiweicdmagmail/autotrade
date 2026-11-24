@@ -4,30 +4,49 @@ from datetime import datetime
 from unittest.mock import AsyncMock
 import pytest
 from execution.entry_admission import candidate_snapshot as build_candidate_snapshot, check_candidate, ema9_entry_state
+from execution.beta_admission import BETA_SYMBOLS
 from console.runtime.bootstrap import build_services, RuntimePaths
 from .test_risk_exposure import make_mgr
 from .test_pine_execution import fixture_model, fixture_output, SYM
 from .test_pyramid_safety import StateBroker
 from .conftest import run
+from .confirmed_minute_helpers import minute_data
 
 NOW=datetime.fromisoformat('2026-11-19T15:15:05+00:00').timestamp()
 STAMP=NOW-5
 
 
+def beta_tracks(at=STAMP, directions=(0,0), td=1):
+    cutoff=int(at//300)*300
+    return [{'symbol':symbol,'aligned':True,'is_beta':True,'last_closed':at-60,
+             'td':{'version':1,'comparison_bars':4,'trend_threshold':3,'counts':[[at-60,td]]},
+             'beta_ema9':{'version':1,'period':9,'interval_seconds':300,'time':cutoff-300,'known_at':cutoff,'value':100},
+             'points':[[at-60,100,100,2,100,104,96,100+direction*3,0,'waiting',0]]}
+            for symbol,direction in zip(BETA_SYMBOLS,directions)]
+
+
 def frame():
     return {'status':'ready','day':'2026-11-19','as_of':STAMP,
+            'coverage':{'total':1,'aligned':1,'missing':[]},
+            'ranking_snapshot':{'version':1,'id':'fixture-accepted-minute','as_of':STAMP,'day':'2026-11-19'},
             'ranks':[{'symbol':SYM,'rank':1,'direction_sign':1}],
-            'tracks':[{'symbol':SYM,'aligned':True,'td':{'version':1,'comparison_bars':4,'trend_threshold':3,'counts':[[STAMP-60,1]]},'points':[[STAMP-60,100,99,2,100,101,99,100,2,'outside_progress',1]]}]}
+            'tracks':[{'symbol':SYM,'aligned':True,'td':{'version':1,'comparison_bars':4,'trend_threshold':3,'counts':[[STAMP-60,1]]},'points':[[STAMP-60,100,99,2,100,101,99,100,2,'outside_progress',1]]},*beta_tracks()]}
 
 
-def market(direction=1):
-    return {SYM:{'bar':{'time':STAMP,'open':100,'high':101,'low':99,'close':100},
-                 'ts':{'time':STAMP,'ema_9':99 if direction==1 else 101},
-                 'e9':{'ema_9':200},'price_observed_at':NOW}}
+def market(direction=1, *, now=NOW):
+    minute=int(now//60)*60;five=int(now//300)*300
+    return {SYM:{'bar':{'time':five,'open':100,'high':101,'low':99,'close':100},
+                 'ts':{'time':five,'ema_9':99 if direction==1 else 101},
+                 'e9':{'ema_9':200},'price_observed_at':now,
+                 **minute_data(minute,direction,vwap=99 if direction==1 else 101)},
+            **{s:minute_data(minute,direction,session='default') for s in BETA_SYMBOLS}}
 
 
 def candidate_snapshot(data, now, market_data=None):
     direction=(data.get('ranks') or [{}])[0].get('direction_sign',1)
+    # Original gate tests isolate the candidate; use matching benchmark TD context.
+    for row in data.get('tracks',[]):
+        if row.get('symbol') in BETA_SYMBOLS:row['td']['counts'][0][1]=direction
     return build_candidate_snapshot(data,now,market(direction) if market_data is None else market_data)
 
 
@@ -67,17 +86,18 @@ def test_production_policy_reads_the_confirmed_cache_and_expires_without_rewriti
     try:
         app.collector._snapshot=market()
         data=frame();row={**data['tracks'][0],'last_closed':STAMP-60}
-        raw={'version':1,'as_of':STAMP,'day':data['day'],'columns':['time'],'beta':[],
-             'scoring':{'model':'ema9_15m_v3','version':3,'pending':[],'ready':1,'eligible':1},
-             'ranks':data['ranks'],'series':{SYM:row},'coverage':{}}
-        raw['ranks'][0].update(score=88,score_parts={'vwap':28,'slope':40,'classification':20},
+        raw={'version':1,'as_of':STAMP,'day':data['day'],'columns':['time'],'beta':list(BETA_SYMBOLS),
+             'scoring':{'model':'opening15_midpoint_v7','version':7,'stock_session':'regular','pending':[],'ready':1,'eligible':1},
+             'ranks':[{**r,'opening_position':r.get('opening_position',2)} for r in data['ranks']],'series':{SYM:row,**{r['symbol']:r for r in beta_tracks()}},'coverage':{'total':3,'aligned':3,'missing':[]}}
+        app.research._market_rhythm.expected_symbols={SYM,*BETA_SYMBOLS}
+        raw['ranks'][0].update(opening_position=2,score=88,score_parts={'vwap':28,'slope':40,'classification':20},
                                classification_rate=1,classification_samples=15,ema9_slope_atr=.5)
         path=tmp_path/'market_rhythm.json';path.write_text(json.dumps(raw));saved=path.read_bytes()
         allowed=app.order_mgr.entry_admission(SYM,'long',NOW)
         assert allowed['ok'] and allowed['evidence']['sigma']==2
         evidence=allowed['evidence']['ranking_evidence']
-        assert evidence['model']=='ema9_15m_v3' and evidence['score']==88
-        assert evidence['classification_samples']==15 and evidence['score_parts']['classification']==20
+        assert evidence['model']=='opening15_midpoint_v7' and evidence['score']==88
+        assert evidence['snapshot_id']==allowed['evidence']['ranking_evidence']['snapshot_id']
         assert not app.order_mgr.entry_admission(SYM,'short',NOW)['ok']
         assert not app.order_mgr.entry_admission(SYM,'long',NOW+121)['ok']
         assert path.read_bytes()==saved
@@ -88,9 +108,10 @@ def test_pending_scoring_batch_cannot_grant_new_entry_from_a_partial_top_ten(tmp
     app=build_services(RuntimePaths(tmp_path))
     try:
         data=frame();row={**data['tracks'][0],'last_closed':STAMP-60}
-        raw={'version':1,'as_of':STAMP,'day':data['day'],'columns':['time'],'beta':[],
-             'scoring':{'model':'ema9_15m_v3','version':3,'pending':[{'symbol':'NASDAQ:MSFT'}],'ready':1,'eligible':2},
-             'ranks':data['ranks'],'series':{SYM:row},'coverage':{}}
+        raw={'version':1,'as_of':STAMP,'day':data['day'],'columns':['time'],'beta':list(BETA_SYMBOLS),
+             'scoring':{'model':'opening15_midpoint_v7','version':7,'stock_session':'regular','pending':[{'symbol':'NASDAQ:MSFT'}],'ready':1,'eligible':2},
+             'ranks':[{**r,'opening_position':r.get('opening_position',2)} for r in data['ranks']],'series':{SYM:row,**{r['symbol']:r for r in beta_tracks()}},'coverage':{'total':3,'aligned':3,'missing':[]}}
+        app.research._market_rhythm.expected_symbols={SYM,*BETA_SYMBOLS}
         (tmp_path/'market_rhythm.json').write_text(json.dumps(raw));app.collector._snapshot=market()
         assert not app.order_mgr.entry_admission(SYM,'long',NOW)['ok']
     finally:app.close_log_handler()
@@ -159,12 +180,14 @@ def test_temporary_admission_rejection_does_not_consume_a_pine_signal_bar():
     assert len(broker.calls)==1
 
 
-@pytest.mark.parametrize('direction,td,allowed',[(1,0,False),(1,1,True),(1,2,True),(1,3,True),(1,-1,False),(-1,0,False),(-1,-1,True),(-1,-2,True),(-1,-3,True),(-1,1,False)])
+@pytest.mark.parametrize('direction,td,allowed',[(1,0,True),(1,1,True),(1,2,True),(1,3,True),(1,-1,True),(-1,0,True),(-1,-1,True),(-1,-2,True),(-1,-3,True),(-1,1,True)])
 def test_confirmed_td_must_reach_the_same_side_threshold(direction,td,allowed):
     data=frame();data['ranks'][0]['direction_sign']=direction
     data['tracks'][0]['points'][0][10]=direction;data['tracks'][0]['td']['counts'][0][1]=td
     data['tracks'][0]['points'][0][2]=99 if direction==1 else 101
-    snapshot=candidate_snapshot(data,NOW)
+    data['tracks'][0]['points'][0][8]=2*direction
+    live=market(direction);live[SYM]['rhythm_confirmed_1m']['td_count']=td
+    snapshot=candidate_snapshot(data,NOW,live)
     assert len(snapshot['rows'])==1  # Below-threshold candidates remain visible.
     result=check_candidate(snapshot,SYM,'long' if direction==1 else 'short')
     assert result['ok'] is allowed
@@ -174,6 +197,7 @@ def test_confirmed_td_must_reach_the_same_side_threshold(direction,td,allowed):
 
 @pytest.mark.parametrize('fault',['missing','old','future','duplicate','schema','bool','string','fraction','nonfinite'])
 def test_invalid_or_wrong_minute_td_cannot_borrow_a_previous_qualifying_count(fault):
+    from execution.confirmed_td import confirmed_td
     data=frame();td=data['tracks'][0]['td']
     if fault=='missing':data['tracks'][0].pop('td')
     elif fault=='old':td['counts']=[[STAMP-120,8]]
@@ -184,15 +208,15 @@ def test_invalid_or_wrong_minute_td_cannot_borrow_a_previous_qualifying_count(fa
     elif fault=='string':td['counts'][0][1]='3'
     elif fault=='fraction':td['counts'][0][1]=3.5
     else:td['counts'][0][1]=float('nan')
-    assert not check_candidate(candidate_snapshot(data,NOW),SYM,'long')['ok']
+    assert confirmed_td(data['tracks'][0],STAMP-60) is None
 
 
 @pytest.mark.parametrize('stage',['risk_wait','after_intent'])
 def test_td_dropping_below_threshold_before_submission_prevents_any_broker_order(tmp_path,stage):
-    mgr=make_mgr(tmp_path);data=frame()
-    mgr.entry_admission=lambda symbol,side,now:check_candidate(candidate_snapshot(data,NOW),symbol,side)
+    mgr=make_mgr(tmp_path);data=frame();live=market()
+    mgr.entry_admission=lambda symbol,side,now:check_candidate(candidate_snapshot(data,NOW,live),symbol,side)
     mgr._gw.place_market_with_stop=AsyncMock(return_value={})
-    def drop():data['tracks'][0]['td']['counts'][0][1]=0
+    def drop():live[SYM]['rhythm_confirmed_1m']['vwap']=100
     if stage=='risk_wait':
         async def pnl():drop();return 0
         mgr._gw.realized_pnl=pnl
@@ -201,7 +225,7 @@ def test_td_dropping_below_threshold_before_submission_prevents_any_broker_order
         def changed():save();drop()
         mgr._save=changed
     lot,reason=run(mgr.place_limit_stop_lot(SYM,'long',10,100,99,entry_order_type='MKT'))
-    assert lot is None and 'TD' in reason
+    assert lot is None and 'VWAP' in reason
     mgr._gw.place_market_with_stop.assert_not_awaited()
     assert all(not row.entry_submission_pending for row in mgr._lots.values())
 
@@ -217,7 +241,7 @@ def test_five_minute_ema9_requires_price_strictly_on_the_entry_side(side,ema,all
 
 @pytest.mark.parametrize('fault',['missing','stale_price','future_price','stale_bar','non_five_minute','misaligned',
                                  'bad_ema','bool_ema','string_ema','zero_price','legacy_ema7_only'])
-def test_ema9_missing_stale_or_mixed_bar_data_cannot_allow_entry(fault):
+def test_quote_integrity_remains_required_but_ema9_is_no_longer_an_entry_filter(fault):
     data=market();row=data[SYM]
     if fault=='missing':data={}
     elif fault=='stale_price':row['price_observed_at']=NOW-46
@@ -231,29 +255,32 @@ def test_ema9_missing_stale_or_mixed_bar_data_cannot_allow_entry(fault):
     elif fault=='zero_price':row['bar']['close']=0
     else:row['ts'].pop('ema_9')
     result=check_candidate(candidate_snapshot(frame(),NOW,data),SYM,'long')
-    assert not result['ok'] and 'EMA9' in result['reason']
+    quote_fault=fault in ('missing','stale_price','future_price','stale_bar','non_five_minute','zero_price')
+    assert result['ok'] is not quote_fault
 
 
 def test_td_coloring_metadata_keeps_three_while_entry_threshold_is_one():
     data=frame();snapshot=candidate_snapshot(data,NOW)
-    assert snapshot['td_threshold']==1
+    assert snapshot['td_required'] is False
     assert check_candidate(snapshot,SYM,'long')['ok']
     data['tracks'][0]['td']['trend_threshold']=1
-    assert not check_candidate(candidate_snapshot(data,NOW),SYM,'long')['ok']
+    assert check_candidate(candidate_snapshot(data,NOW),SYM,'long')['ok']  # Frozen coloring metadata is not live TD.
 
 
 def test_status_advertises_the_same_entry_threshold_and_ema9_contract(console_app):
     from starlette.testclient import TestClient
     data=TestClient(console_app.app).get('/api/status').json()
-    assert data['candidate_td_threshold']==1
-    assert data['candidate_ema9_filter']=={'period':9,'interval_seconds':300,'price_source':'bar.close','ema_source':'ts.ema_9'}
+    assert data['candidate_td_threshold'] is None
+    assert data['candidate_entry_policy']=='stock_vwap_side_v1'
+    assert data['candidate_entry_data_version']==4
+    assert data['candidate_ema9_filter']=={'required':False,'period':9,'interval_seconds':300,'price_source':'bar.close','ema_source':'ts.ema_9'}
 
 
 @pytest.mark.parametrize('stage',['risk_wait','after_intent'])
-def test_crossing_ema9_before_broker_submission_blocks_without_sending(tmp_path,stage):
+def test_crossing_ema9_does_not_block_a_same_sign_td_order(tmp_path,stage):
     mgr=make_mgr(tmp_path);data=market()
     mgr.entry_admission=lambda symbol,side,now:check_candidate(candidate_snapshot(frame(),NOW,data),symbol,side)
-    mgr._gw.place_market_with_stop=AsyncMock(return_value={})
+    mgr._gw.place_market_with_stop=AsyncMock(return_value={'ok':True,'dry_run':True,'entry_order_id':1,'stop_order_id':2})
     def cross():data[SYM]['ts']['ema_9']=101
     if stage=='risk_wait':
         async def pnl():cross();return 0
@@ -263,30 +290,30 @@ def test_crossing_ema9_before_broker_submission_blocks_without_sending(tmp_path,
         def changed():save();cross()
         mgr._save=changed
     lot,reason=run(mgr.place_limit_stop_lot(SYM,'long',10,100,99,entry_order_type='MKT'))
-    assert lot is None and 'EMA9' in reason
-    mgr._gw.place_market_with_stop.assert_not_awaited()
-    assert all(not row.entry_submission_pending for row in mgr._lots.values())
+    assert lot is not None,reason
+    mgr._gw.place_market_with_stop.assert_awaited_once()
 
 
 @pytest.mark.parametrize('direction,vwap,allowed',[(1,99,True),(1,100,False),(1,101,False),
                                                 (-1,101,True),(-1,100,False),(-1,99,False),
                                                 (1,None,False),(1,float('nan'),False),(1,True,False)])
-def test_vwap_midline_is_mandatory_for_all_entries_even_without_the_optional_outer_band_filter(direction,vwap,allowed):
+def test_vwap_midline_sets_the_only_technical_entry_direction(direction,vwap,allowed):
     data=frame();data['ranks'][0]['direction_sign']=direction
     data['tracks'][0]['points'][0][10]=direction;data['tracks'][0]['points'][0][2]=vwap
+    data['tracks'][0]['points'][0][8]=2*direction
     data['tracks'][0]['td']['counts'][0][1]=direction
-    result=check_candidate(candidate_snapshot(data,NOW),SYM,'long' if direction==1 else 'short')
+    live=market(direction);live[SYM]['rhythm_confirmed_1m']['vwap']=vwap
+    result=check_candidate(candidate_snapshot(data,NOW,live),SYM,'long' if direction==1 else 'short')
     assert result['ok'] is allowed
-    if allowed:assert result['evidence']['vwap_direction_allowed']
-    else:assert 'VWAP' in result['reason']
+    if allowed:assert result['evidence']['entry_policy']=='stock_vwap_side_v1'
 
 
 @pytest.mark.parametrize('stage',['risk_wait','after_intent'])
-def test_vwap_midline_crossing_before_submission_never_reaches_the_broker(tmp_path,stage):
+def test_vwap_midline_crossing_blocks_before_send(tmp_path,stage):
     mgr=make_mgr(tmp_path);data=frame();live=market()
     mgr.entry_admission=lambda symbol,side,now:check_candidate(candidate_snapshot(data,NOW,live),symbol,side)
-    mgr._gw.place_market_with_stop=AsyncMock(return_value={})
-    def cross():data['tracks'][0]['points'][0][2]=101
+    mgr._gw.place_market_with_stop=AsyncMock(return_value={'ok':True,'dry_run':True,'entry_order_id':1,'stop_order_id':2})
+    def cross():live[SYM]['rhythm_confirmed_1m']['vwap']=101
     if stage=='risk_wait':
         async def pnl():cross();return 0
         mgr._gw.realized_pnl=pnl
@@ -297,4 +324,3 @@ def test_vwap_midline_crossing_before_submission_never_reaches_the_broker(tmp_pa
     lot,reason=run(mgr.place_limit_stop_lot(SYM,'long',10,100,99,entry_order_type='MKT'))
     assert lot is None and 'VWAP' in reason
     mgr._gw.place_market_with_stop.assert_not_awaited()
-    assert all(not row.entry_submission_pending for row in mgr._lots.values())

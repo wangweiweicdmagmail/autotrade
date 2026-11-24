@@ -4,7 +4,7 @@
     python3 cache_day.py --day 2026-10-23                 # 全部自选
     python3 cache_day.py --day 2026-10-23 --symbols NASDAQ:NVDA,NYSE:TSM
 
-流程：dump_trend_state.js（extended K线 + PineTS本地指标，锚定目标日16:00 ET）
+流程：dump_trend_state.js（regular K线 + PineTS本地指标，锚定目标日16:00 ET）
 → research_db.upsert_bars 幂等入库。重复执行安全（同 symbol+time 覆盖）。
 """
 
@@ -41,7 +41,8 @@ def main() -> None:
         out_path = f.name
     cmd = ["node", str(DUMP_JS), "--symbols", ",".join(symbols),
            "--to", str(anchor), "--range", str(RANGE), "--out", out_path,
-           "--default-session-symbols", ",".join(sorted(config.TV_DEFAULT_SESSION_SYMBOLS))]
+           "--default-session-symbols", ",".join(sorted(config.TV_DEFAULT_SESSION_SYMBOLS)),
+           "--session", config.TV_MARKET_SESSION]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
     if r.returncode != 0:
         print("dump 失败:", r.stderr[-2000:], file=sys.stderr)

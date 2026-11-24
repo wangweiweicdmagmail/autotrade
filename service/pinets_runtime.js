@@ -5,13 +5,18 @@ const path = require('node:path');
 const { loadPineModels, outputFromPeriod } = require('./pine_models');
 
 const versions = {
-  e9: '12.0', e20: '1.0', e7v2: '3.0', golden: '1.0', trend: '27.0', fvg: '7.0',
-  smart: '1.0', attack: '18.0', vwap_pullback: '1.2',
+  e9: '12.0', e20: '1.0', e7v2: '3.0', golden: '1.0', trend: '28.0', fvg: '7.0',
+  smart: '1.0', attack: '18.0', vwap_pullback: '1.2', opening_position: '2.0',
 };
-const sourceFiles = { golden: 'large-candle-retracement.pine', vwap_pullback: 'vwap-outer-pullback-1m.pine' };
+const sourceFiles = { opening_position: 'opening-range-position.pine', golden: 'large-candle-retracement.pine', vwap_pullback: 'vwap-outer-pullback-1m.pine' };
 const supplementalPlots = {
+  opening_position: {position:'Opening_Range_Position',from_open_position:'Opening_From_Open',range_position:'Opening_Centered_Position',day_open:'Day_Open',opening_high:'Opening_High',opening_low:'Opening_Low',
+    width:'Opening_Range_Width',ready:'Range_Ready',direction:'Position_Direction',midpoint:'Opening_Midpoint',
+    high_position:'Opening_High_Position',low_position:'Opening_Low_Position',opening_start:'Opening_Start',
+    range_confirmed_at:'Range_Confirmed_At',range_bars:'Opening_Range_Bars',
+    entry_signal:'Entry_Signal',execution_direction:'Direction',entry_price:'Entry_Price',long_stop:'Long_Stop',short_stop:'Short_Stop',atr:'ATR'},
   trend: {
-    Trend_State: 'Trend State', Atr_Value: 'Atr Value', ST_Duration_Bars: 'ST Duration Bars',
+    EMA_5: 'Ranking_EMA5', Trend_State: 'Trend State', Atr_Value: 'Atr Value', ST_Duration_Bars: 'ST Duration Bars',
     ST_Push_Count: 'ST Push Count', EMA_Fast: 'EMA Fast', EMA_Slow: 'EMA Slow',
     Up_Trend: 'Up Trend', Down_Trend: 'Down Trend',
     Uptrend_Channel: 'Uptrend Channel', Downtrend_Channel: 'Downtrend Channel',
@@ -33,7 +38,7 @@ function getDefinition(id) {
   const plots = model?.plots ?? supplementalPlots[key];
   if (!plots || !Object.hasOwn(versions, key)) throw new Error(`未登记的本地指标: ${id}`);
   return {
-    key, version: versions[key], model, plots,
+    key, version: versions[key], model: model ?? (key==='opening_position'?{interval_seconds:60}:undefined), plots,
     source: fs.readFileSync(path.join(__dirname, '..', 'indicators', sourceFiles[key] ?? `pinets/${key}.pine`), 'utf8'),
   };
 }

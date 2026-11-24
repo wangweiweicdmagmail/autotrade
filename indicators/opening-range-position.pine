@@ -1,0 +1,79 @@
+//@version=6
+indicator("开盘小区间归一化位置 · 中点半宽", shorttitle="Opening Position", overlay=false, precision=4)
+
+// 独立研究指标：零轴是小区间中点，1单位是09:30–09:45区间半宽。
+// 不混入盘前，不使用未来价格，不注册或发出交易指令。
+if not timeframe.isminutes or (timeframe.multiplier != 1 and timeframe.multiplier != 5)
+    runtime.error("开盘小区间位置请使用一分钟或五分钟图表")
+
+string et = "America/New_York"
+int dayKey = year(time, et) * 10000 + month(time, et) * 100 + dayofmonth(time, et)
+bool newDay = na(dayKey[1]) or dayKey != dayKey[1]
+int openingStart = timestamp(et, year(time, et), month(time, et), dayofmonth(time, et), 9, 30)
+int openingEnd = openingStart + 15 * 60 * 1000
+int barMilliseconds = timeframe.multiplier * 60 * 1000
+bool regular = not na(time(timeframe.period, "0930-1600:23456", et))
+bool openingWindow = regular and time >= openingStart and time < openingEnd
+
+var float dayOpen = na
+var float rangeHigh = na
+var float rangeLow = na
+var int rangeBars = 0
+var int lastOpeningTime = na
+var bool rangeIntegrity = true
+
+// 每次从前一根状态重建，实时重复报价不累加根数或保留已被修订的极值。
+dayOpen := newDay ? na : dayOpen[1]
+rangeHigh := newDay ? na : rangeHigh[1]
+rangeLow := newDay ? na : rangeLow[1]
+rangeBars := newDay ? 0 : nz(rangeBars[1], 0)
+lastOpeningTime := newDay ? na : lastOpeningTime[1]
+rangeIntegrity := newDay ? true : rangeIntegrity[1]
+if openingWindow
+    if time == openingStart
+        dayOpen := open
+    if na(lastOpeningTime)
+        rangeIntegrity := time == openingStart
+    else
+        rangeIntegrity := rangeIntegrity and time == lastOpeningTime + barMilliseconds
+    rangeHigh := na(rangeHigh) ? high : math.max(rangeHigh, high)
+    rangeLow := na(rangeLow) ? low : math.min(rangeLow, low)
+    rangeBars += 1
+    lastOpeningTime := time
+
+float width = rangeHigh - rangeLow
+float midpoint = (rangeHigh + rangeLow) / 2.0
+bool windowComplete = rangeIntegrity and not na(dayOpen) and dayOpen > 0 and rangeBars == 15 / timeframe.multiplier and lastOpeningTime + barMilliseconds == openingEnd
+bool windowConfirmed = time >= openingEnd or (barstate.isconfirmed and time_close >= openingEnd)
+bool ready = regular and windowComplete and windowConfirmed and not na(width) and width > 0
+float fromOpenPosition = ready ? (close - dayOpen) / width : na
+float position = ready ? (close - midpoint) / (width / 2.0) : na
+float centeredPosition = ready ? (close - midpoint) / (width / 2.0) : na
+float upperPosition = ready ? (rangeHigh - midpoint) / (width / 2.0) : na
+float lowerPosition = ready ? (rangeLow - midpoint) / (width / 2.0) : na
+color trendColor = position > 0 ? color.lime : position < 0 ? color.red : color.gray
+
+hline(0, "小区间中点零轴", color=color.yellow)
+plot(position, "Opening_Range_Position", color=trendColor, linewidth=2, style=plot.style_linebr, offset=0)
+plot(upperPosition, "Opening_High_Position", color=color.new(color.green, 40), style=plot.style_linebr, offset=0)
+plot(lowerPosition, "Opening_Low_Position", color=color.new(color.red, 40), style=plot.style_linebr, offset=0)
+plot(fromOpenPosition, "Opening_From_Open", display=display.data_window, offset=0)
+plot(centeredPosition, "Opening_Centered_Position", display=display.data_window, offset=0)
+plot(regular ? openingStart / 1000 : na, "Opening_Start", display=display.data_window, offset=0)
+plot(ready ? openingEnd / 1000 : na, "Range_Confirmed_At", display=display.data_window, offset=0)
+plot(regular ? rangeBars : 0, "Opening_Range_Bars", display=display.data_window, offset=0)
+plot(ready ? midpoint : na, "Opening_Midpoint", display=display.data_window, offset=0)
+plot(ready ? dayOpen : na, "Day_Open", display=display.data_window, offset=0)
+plot(ready ? rangeHigh : na, "Opening_High", display=display.data_window, offset=0)
+plot(ready ? rangeLow : na, "Opening_Low", display=display.data_window, offset=0)
+plot(ready ? width : na, "Opening_Range_Width", display=display.data_window, offset=0)
+plot(ready ? 1 : 0, "Range_Ready", display=display.data_window, offset=0)
+plot(ready ? (position > 0 ? 1 : position < 0 ? -1 : 0) : 0, "Position_Direction", display=display.data_window, offset=0)
+
+// 仅观察，不提供可执行入场计划；公共输出明确不发单。
+plot(0, "Entry_Signal", display=display.data_window, offset=0)
+plot(0, "Direction", display=display.data_window, offset=0)
+plot(float(na), "Entry_Price", display=display.data_window, offset=0)
+plot(float(na), "Long_Stop", display=display.data_window, offset=0)
+plot(float(na), "Short_Stop", display=display.data_window, offset=0)
+plot(float(na), "ATR", display=display.data_window, offset=0)

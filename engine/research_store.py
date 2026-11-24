@@ -151,8 +151,26 @@ class ResearchStore:
                     db.execute('INSERT OR REPLACE INTO candle_heads VALUES(?,?,?,?)', (identity, stamp, key, received))
         elif kind == 'ranking':
             c, scoring = payload['coverage'], payload['scoring']
+            session = payload.get('ranking_session') or {}
+            premarket = session.get('phase') == 'premarket'
+            regular_complete = c['aligned'] == c['total'] and not c['missing'] and not scoring['pending']
+            if premarket:
+                at = datetime.fromtimestamp(payload['as_of']-60, ET)
+                universe = payload.get('universe') or []
+                premarket = (session.get('version') == 1 and session.get('cohort') == 'available'
+                    and session.get('ready_after') == payload['as_of']+10
+                    and payload.get('published_at', 0) >= payload['as_of']+10
+                    and at.weekday() < 5 and 240 <= at.hour*60+at.minute < 570
+                    and len(set(universe)) == len(universe) == c['total']
+                    and type(c['aligned']) is int and 0 < c['aligned'] <= c['total']
+                    and len(set(c['missing'])) == len(c['missing']) == c['total']-c['aligned']
+                    and set(c['missing']) <= set(universe)
+                    and all(r.get('ready') is True and r['symbol'] in universe
+                        and r['symbol'] not in c['missing']
+                        and (payload.get('context', {}).get(r['symbol'], {}).get('point') or [None])[0] == payload['as_of']-60
+                        for r in payload['ranks']))
             if (type(payload['as_of']) is not int or payload['as_of'] % 60 or payload['as_of'] > observed
-                    or c['total'] <= 0 or c['aligned'] != c['total'] or c['missing'] or scoring['pending']):
+                    or c['total'] <= 0 or not (premarket if session.get('phase') == 'premarket' else regular_complete)):
                 raise ValueError('榜单不是完整已确认批次')
             db.execute('INSERT OR IGNORE INTO ranking_batches VALUES(?,?,?,?,?)',
                        (payload['batch_id'], payload['day'], payload['as_of'], observed, encode(payload)))

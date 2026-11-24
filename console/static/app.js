@@ -2,7 +2,6 @@
 const { createApp } = Vue;
 const TV_EXTENSION_PRESENCE = 'chrome-extension://ehppgccaimaoccmhnncamnkpcknfmhge/presence.json';
 const TV_EXTENSION_DOWNLOAD = '/api/tv/extension.zip';
-const TD_ENTRY_THRESHOLD = 1;
 const openingVwapClock = new Intl.DateTimeFormat('en-US', {
   timeZone: 'America/New_York', weekday: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
 });
@@ -89,6 +88,9 @@ createApp({
       bottomTab: 'rhythm',
       rhythmFrame: null,
       entryCandidates: {ready:false,reason:'等待候选榜单',rows:[]},
+      entryCandidateViews: {},
+      confirmedVwap: {version:0,rows:{}},
+      confirmedTd: {version:0,rows:{}},
       tvGridStatus: '等待TV双窗口席位齐备',
       tvGridLastKey: '',
       tvGridLayoutKeys: {},
@@ -285,11 +287,13 @@ createApp({
       btResult: null,
       btError: '',
       slots: [
-        { symbol: '', limitType: 'rhythm_market', stopMode:'atr_2', manualDirection: null, directionConfirming: false,
+        { symbol: '', limitType: 'rhythm_market', orderType:'MKT', limitLevel:'vwap', candidateRanking:'trend',candidateView:'mixed', stopMode:'atr_2', manualDirection: null, directionConfirming: false,
           vwapOutsideOnly:true },
       ],
       candidateProtection:{version:1,timed_breakeven_enabled:true,breakeven_minutes:5,trailing_enabled:false,trailing_source:'ema9_5m'},
       candidateProtectionSaving:false,
+      intelligentExit:{version:1,enabled:false,breakeven_minutes:5},
+      intelligentExitSaving:false,
       placing: false,
       ws: null,
       systemClosing: false,
@@ -450,7 +454,7 @@ createApp({
       });
     },
     riskUsd() { return this.status.risk_per_trade_usd || 0; },
-    manualSymbols() { return this.status.candidate_entry_required ? (this.entryCandidates.rows||[]).map(r=>r.symbol) : this.watchlist; },
+    manualSymbols() { const snapshot=this.candidateSnapshotFor('trend',this.slots[0]?.candidateView||'mixed'); return this.status.candidate_entry_required ? (snapshot?.rows||[]).map(r=>r.symbol) : this.watchlist; },
     nightChart() {
       const rows = (this.night.bars || []).slice(-90);
       const fields = new Map((this.night.history_outputs || []).map(row => [row.time, row]));
@@ -545,6 +549,9 @@ createApp({
     slotRows() {
       // 单格交易台（v2026-10-23 起一格，方向按钮按趋势多空都开）
       return this.slots.map((slot) => this.calcSlot(slot));
+    },
+    candidateLimitSides() {
+      return this.slots.map(slot=>(this.entryCandidates.rows||[]).find(row=>row.symbol===slot.symbol)?.side||null);
     },
     manualTradeContexts() {
       return this.slots.map(slot => `${slot.symbol}|${slot.limitType}`);
@@ -755,12 +762,20 @@ createApp({
 
   // 参数持久化：单笔资金/最大仓位/FVG 时间窗口改动即写 localStorage（各浏览器独立）
   watch: {
+    candidateLimitSides: {
+      flush:'sync',
+      handler(sides) { sides.forEach((side,i)=>{
+        if(['long','short'].includes(side)&&['upper','lower'].includes(this.slots[i].limitLevel))
+          this.slots[i].limitLevel=side==='long'?'upper':'lower';
+      }); },
+    },
     manualTradeContexts: {
       flush: 'sync',
       handler(contexts, previous = []) {
         contexts.forEach((context, i) => {
           if (context !== previous[i]) {
             this.slots[i].manualDirection = null;
+            this.slots[i].limitLevel='vwap';
             this.slots[i].directionRevision = (this.slots[i].directionRevision || 0) + 1;
           }
         });
@@ -1344,6 +1359,7 @@ createApp({
         auto_order_failed: '策略下单失败', auto_expired: '埋单过期',
         auto_breakeven: '移动保本', breakout_first_bar_protection: '突破首根K线保护', breakout_close_protection: '突破五分钟保护', auto_trail: 'ST跟踪',
         candidate_order_protection:'候选订单保护',candidate_order_protection_failed:'候选订单保护待重试',
+        intelligent_exit_action:'智能退出仓位',intelligent_exit_failed:'智能退出未完成',
         auto_reverse_close: '反向平仓', auto_done: '实例结束',
         auto_adopted: '收养人工仓',
         auto_entry_proposed: '开仓候选', auto_entry_approved: '确认开仓候选',
@@ -1943,9 +1959,14 @@ createApp({
           this.status = msg.status;
           if(Number.isFinite(msg.status?.max_symbol_position_pct)&&msg.status.max_symbol_position_pct>0)
             this.maxPositionPct=msg.status.max_symbol_position_pct;
+          this.confirmedVwap = msg.confirmed_vwap || {version:0,rows:{}};
+          this.entryCandidateViews = msg.entry_candidate_views || {};
           this.entryCandidates = msg.entry_candidates || {ready:false,reason:'等待候选榜单',rows:[]};
+          this.confirmedTd = msg.confirmed_td || {version:0,rows:{}};
           if(!this.candidateProtectionSaving&&msg.status?.candidate_order_protection)
             this.candidateProtection={...msg.status.candidate_order_protection};
+          if(!this.intelligentExitSaving&&msg.status?.intelligent_exit)
+            this.intelligentExit={...msg.status.intelligent_exit};
           // 止损 ATR 倍数跟快照走（全客户端同步）；编辑中（dirty）不覆盖输入框
           if (!this.atrMultDirty && msg.status && msg.status.stop_atr_mult != null) {
             this.atrMult = msg.status.stop_atr_mult;
@@ -2549,7 +2570,6 @@ createApp({
     // 股数按以损定量；服务端会按实时价重新定价，浏览器价仅供参考
     async chaseFvg(ev, force = false, forceReason = '') {
       if (this.placing && !force) return;
-      if (this.hasAutoPosition(ev.symbol)) return this.$message.warning('该标的已有自动策略仓位，禁止手动加仓');
       const bar = this.market[ev.symbol] && this.market[ev.symbol].bar;
       const close = bar && bar.close;
       if (!close || close <= 0) return this.$message.warning('无实时行情，无法追价');
@@ -2736,9 +2756,9 @@ createApp({
       let dirty = false;
       let exitDirty = false;
       for (const l of this.lots) {
-        if(l.state==='CLOSED'&&l.exit_reason==='candidate_timed_breakeven_stop'&&!this.lastTimedExit[l.lot_id]){
+        if(l.state==='CLOSED'&&['candidate_timed_breakeven_stop','intelligent_timed_breakeven'].includes(l.exit_reason)&&!this.lastTimedExit[l.lot_id]){
           const ticker=(l.symbol||'').split(':').pop();
-          const minutes=l.signal_snapshot?.candidate_order_protection?.breakeven_minutes_applied;
+          const minutes=l.signal_snapshot?.intelligent_exit?.last_decision?.breakeven_minutes??l.signal_snapshot?.candidate_order_protection?.breakeven_minutes_applied;
           this.speak(`${ticker.split('').join(' ')} 持仓${minutes}分钟，已按保本规则平仓`);
           this.$notify({title:'定时保本退出',message:`${ticker} 到期时价格已越过成本，已按规则平仓，实际盈亏见订单批次`,type:'warning',duration:10000,position:'bottom-right'});
           this.lastTimedExit[l.lot_id]=true;exitDirty=true;
@@ -2747,9 +2767,10 @@ createApp({
           dirty = true;
           const ticker = (l.symbol || '').split(':').pop();
           const spelled = ticker.split('').join(' ');
+          const smart=l.signal_snapshot?.intelligent_exit;
           const protection=l.signal_snapshot?.candidate_order_protection;
-          const timed=protection?.breakeven_trigger==='timed_breakeven'&&protection.timed_breakeven_done;
-          const minutes=protection?.breakeven_minutes_applied;
+          const timed=smart?.timed_breakeven_done||protection?.breakeven_trigger==='timed_breakeven'&&protection.timed_breakeven_done;
+          const minutes=smart?.breakeven_minutes??protection?.breakeven_minutes_applied;
           this.speak(timed?`${spelled} 持仓${minutes}分钟，已自动保本`:`${spelled} 已保本，止损已至成本或更有利`);
           this.$notify({
             title: timed?'定时自动保本':'保本',
@@ -2805,6 +2826,7 @@ createApp({
     // 点选横截面选股结果：单格交易台直接填入选中标的（方向由按钮按趋势自适应）；
     // 所有单标的切图保留同窗口 TV 的固定第六格，失败时显示原因。
     pickScreen(r) {
+      this.slots[0].candidateRanking='trend';this.slots[0].candidateView='mixed';
       this.slots[0].symbol = r.symbol;
       this.$message.success(`已选中 ${r.ticker}`);
       this.tvShow(r.symbol);
@@ -2815,8 +2837,9 @@ createApp({
       this.pickScreen({ symbol, ticker: this.tickerOf(symbol) });
     },
 
-    selectRhythmStock(symbol) {
-      if (symbol) this.slots[0].symbol=symbol;
+    selectRhythmStock(symbol,options={}) {
+      this.slots[0].candidateView=options.view||'mixed';
+      if (symbol) {this.slots[0].candidateRanking='trend';this.slots[0].symbol=symbol;}
     },
 
     manageRhythmPosition(symbol) {
@@ -2918,9 +2941,11 @@ createApp({
       }
     },
 
-    openRhythmTrade({symbol,frame}) {
-      if (!symbol) return;
+    openRhythmTrade({symbol,frame,ranking='trend',view='mixed'}) {
+      if (!symbol || ranking!=='trend') return;
       this.rhythmFrame=frame;
+      this.slots[0].candidateView=view;
+      this.slots[0].candidateRanking='trend';
       this.slots[0].symbol=symbol;
       this.slots[0].limitType='rhythm_market';
       this.slots[0].manualDirection=null;
@@ -3250,39 +3275,91 @@ createApp({
         '当前价 '+format(price)+'，五分钟EMA9 '+format(ema)+'，'+(side==='long'?'做多要求价格 > EMA9':'做空要求价格 < EMA9')};
     },
 
-    vwapDirectionState(symbol,side,now=Date.now()/1000) {
-      const snapshot=this.entryCandidates,candidate=(snapshot.rows||[]).find(r=>r.symbol===symbol);
+    candidateSnapshotFor(ranking='trend',view='mixed') {
+      if(ranking==='trend'&&view!=='mixed')return this.entryCandidateViews?.[view]||{ready:false,reason:'等待方向榜准入数据',rows:[]};
+      return ranking==='trend'?this.entryCandidates:{ready:false,reason:'TD榜已移除，仅支持趋势榜开仓',rows:[]};
+    },
+
+    tdFactState(fact,now=Date.now()/1000){return rhythmTdFact(fact,now);},
+
+    quoteEntryState(symbol,now=Date.now()/1000) {
+      const data=this.market[symbol]||{},bar=data.bar||{},price=bar.close,stamp=bar.time,observed=data.price_observed_at;
+      const ready=Number.isFinite(price)&&price>0&&Number.isFinite(stamp)&&stamp%300===0&&0<=now-stamp&&now-stamp<300
+        &&Number.isFinite(observed)&&stamp<=observed&&observed<=now&&now-observed<=45;
+      return {ready,price,reason:ready?'':'等待新鲜且有效的当前价格'};
+    },
+
+    vwapDirectionState(symbol,side,now=Date.now()/1000,ranking='trend') {
+      const snapshot=this.candidateSnapshotFor(ranking),candidate=(snapshot.rows||[]).find(r=>r.symbol===symbol);
       const ema=this.ema9EntryState(symbol,side,now),vwap=candidate?.vwap;
-      const ready=!!(snapshot.vwap_direction_required===true&&snapshot.ready&&Number.isFinite(snapshot.as_of)
-        &&0<=now-snapshot.as_of&&now-snapshot.as_of<=120&&candidate?.bar_time+60===snapshot.as_of
-        &&candidate?.confirmed_at===snapshot.as_of&&ema.ready&&Number.isFinite(vwap)&&vwap>0);
+      const ready=!!(snapshot.vwap_direction_required===true&&snapshot.ready&&snapshot.data_contract_version===2
+        &&this.tdFactState(candidate?.td_fact,now).ready&&ema.ready&&Number.isFinite(vwap)&&vwap>0);
       const ok=!!(ready&&(side==='long'?ema.price>vwap:side==='short'?ema.price<vwap:false));
       const format=v=>Number.isFinite(v)?String(+v.toFixed(5)):'—';
       return {ready,ok,price:ema.price,vwap,reason:ok?'':!ready?'等待VWAP中线方向过滤数据':
         '当前价 '+format(ema.price)+'，VWAP中线 '+format(vwap)+'，'+(side==='long'?'做多要求价格 > VWAP中线':'做空要求价格 < VWAP中线')};
     },
 
-    candidateAdmissionReason(symbol, side = null) {
+    basicVwapEntry(snapshot) {
+      return snapshot?.data_contract_version===4&&snapshot.entry_policy==='stock_vwap_side_v1'
+        &&snapshot.direction_source==='confirmed_vwap_direction_v1'&&snapshot.td_required===false
+        &&snapshot.ema9_required===false&&snapshot.vwap_direction_required===true&&snapshot.beta_filter_required===false;
+    },
+
+    vwapFactState(fact,now=Date.now()/1000){return rhythmVwapFact(fact,now);},
+
+    candidateAdmissionReason(symbol,side=null,ranking='trend',view='mixed') {
       if(!this.status.candidate_entry_required)return '';
-      const snapshot=this.entryCandidates,row=(snapshot.rows||[]).find(r=>r.symbol===symbol);
-      if(!snapshot.ready)return snapshot.reason||'等待候选榜单';
+      if(ranking!=='trend')return 'TD榜已移除，仅支持趋势榜开仓';
+      const snapshot=this.candidateSnapshotFor(ranking,view),row=(snapshot.rows||[]).find(r=>r.symbol===symbol);
+      if(!this.basicVwapEntry(snapshot))return '收盘价／VWAP开仓规则版本不匹配，请刷新页面并加载新版服务';
+      if(!snapshot.ready)return snapshot.reason||'等待趋势榜';
       if(!row)return '不在当前有效前十候选中';
-      if(side&&row.side!==side)return '候选趋势方向已变化，请重新确认';
-      const now=Date.now()/1000;
-      if(!Number.isFinite(snapshot.as_of)||now<snapshot.as_of||now-snapshot.as_of>120)
-        return '候选榜单确认数据已过期';
-      if(row.bar_time+60!==snapshot.as_of||row.confirmed_at!==snapshot.as_of)
-        return '候选TD确认时刻未对齐';
-      if(snapshot.td_threshold!==TD_ENTRY_THRESHOLD)return '请重启控制台加载TD开仓检查';
-      const td=row.td_count,sign=row.side==='long'?1:row.side==='short'?-1:0;
-      if(!Number.isSafeInteger(td)||!row.td_ready)return '等待当前分钟TD收盘确认数据';
-      if(!sign||sign*td<TD_ENTRY_THRESHOLD)return '当前TD '+(td>0?'+':'')+td+'，'+(sign===1?'做多要求TD ≥ '+TD_ENTRY_THRESHOLD:'做空要求TD ≤ −'+TD_ENTRY_THRESHOLD);
-      if(snapshot.ema9_period!==9||snapshot.ema9_interval_seconds!==300)return '请重启控制台加载五分钟EMA9过滤';
-      return this.ema9EntryState(symbol,side||row.side,now).reason||this.vwapDirectionState(symbol,side||row.side,now).reason;
+      const now=Date.now()/1000,fact=this.vwapFactState(row.direction_fact,now);
+      if(!fact.ready)return fact.reason;
+      if(row.bar_time!==fact.bar_time||row.confirmed_at!==fact.confirmed_at||row.close!==fact.close||row.vwap!==fact.vwap||row.direction!==fact.direction)
+        return '收盘价与VWAP准入证据未对齐';
+      const wanted=side||row.side,sign=wanted==='long'?1:wanted==='short'?-1:0;
+      if(!fact.direction||sign!==fact.direction||row.side!==wanted)return '1分钟收盘价 '+fact.close+' / VWAP '+fact.vwap+'，'+(fact.direction===1?'仅可做多':fact.direction===-1?'仅可做空':'相等不开仓');
+      return this.quoteEntryState(symbol,now).reason;
+    },
+
+    vwapLimitChoice(slot,candidate) {
+      const side=candidate?.side,level=slot.limitLevel||'vwap',mid=candidate?.vwap,sigma=candidate?.sigma;
+      if(!['long','short'].includes(side)||!['vwap',side==='long'?'upper':'lower'].includes(level))
+        return {ready:false,price:null,reason:'做多仅可选VWAP或上轨，做空仅可选VWAP或下轨'};
+      if(!Number.isFinite(mid)||mid<=0||(level!=='vwap'&&(!Number.isFinite(sigma)||sigma<=0)))
+        return {ready:false,price:null,reason:'等待确认VWAP轨道'};
+      const price=+Number(mid+(level==='upper'?sigma:level==='lower'?-sigma:0)).toFixed(2);
+      return {ready:price>0,price,reason:price>0?'':'VWAP限价取整后无效'};
+    },
+
+    setCandidateOrderType(i,type) {
+      if(!['MKT','LMT'].includes(type))return;
+      this.slots[i].orderType=type;this.slots[i].limitLevel='vwap';
     },
 
     candidateOrderOptions(slot) {
-      return {...this.candidateProtection,vwap_outside_only:slot.vwapOutsideOnly!==false};
+      return {...this.candidateProtection,vwap_outside_only:false};
+    },
+
+    async saveIntelligentExit(key,value) {
+      if(this.intelligentExitSaving||this.demoMode)return;
+      if(this.status.intelligent_exit_version!==1)return this.$message.warning('请重启控制台加载智能退出模块');
+      const defaults={version:1,enabled:false,breakeven_minutes:5};
+      const next={...(this.intelligentExit.version===1?this.intelligentExit:defaults),[key]:value};
+      if(!Number.isInteger(next.breakeven_minutes)||next.breakeven_minutes<1||next.breakeven_minutes>120)
+        return this.$message.warning('保本时间须为1–120分钟的整数');
+      this.intelligentExitSaving=true;
+      try{
+        const response=await fetch('/api/settings',{method:'POST',headers:this.tradeHeaders(true),body:JSON.stringify({intelligent_exit:next})});
+        this.checkWrite403(response);const data=await response.json();
+        if(!response.ok)throw Error(typeof data.detail==='string'?data.detail:'智能退出设置保存失败');
+        if(data.intelligent_exit?.version!==1)throw Error('后端未确认智能退出设置，请重启控制台');
+        this.intelligentExit={...data.intelligent_exit};
+        this.$message.success(next.enabled?'智能退出已开启，作用于全部控制台持仓':'智能退出已关闭');
+      }catch(error){this.$message.error(error.message||String(error));}
+      finally{this.intelligentExitSaving=false;}
     },
 
     async saveCandidateProtection(key,value) {
@@ -3305,7 +3382,7 @@ createApp({
     },
 
     candidateVwapState(slot) {
-      const now=Date.now()/1000,candidate=(this.entryCandidates.rows||[]).find(r=>r.symbol===slot.symbol);
+      const now=Date.now()/1000,candidate=(this.candidateSnapshotFor(slot.candidateRanking||'trend',slot.candidateView||'mixed').rows||[]).find(r=>r.symbol===slot.symbol);
       const point=this.rhythmFrame?.tracks?.find(t=>t.symbol===slot.symbol)?.points?.at(-1);
       const mid=candidate?.vwap??point?.[2],sigma=candidate?.sigma??point?.[3];
       const confirmed=candidate?.confirmed_at??(point?.[0]+60);
@@ -3331,15 +3408,14 @@ createApp({
 
     manualEntryChecks(slot) {
       if(!this.status.candidate_entry_required)return [];
-      const snapshot=this.entryCandidates,candidate=(snapshot.rows||[]).find(r=>r.symbol===slot.symbol);
+      const ranking=slot.candidateRanking||'trend',view=slot.candidateView||'mixed',snapshot=this.candidateSnapshotFor(ranking,view),candidate=(snapshot.rows||[]).find(r=>r.symbol===slot.symbol);
       const side=slot.side||candidate?.side,sign=side==='long'?1:side==='short'?-1:0,now=Date.now()/1000;
-      const data=this.market[slot.symbol]||{},ema=this.ema9EntryState(slot.symbol,side,now),vwapDirection=this.vwapDirectionState(slot.symbol,side,now);
+      const data=this.market[slot.symbol]||{},quote=this.quoteEntryState(slot.symbol,now);
       const format=v=>Number.isFinite(v)?String(+v.toFixed(5)):'—';
-      const confirmed=!!(snapshot.ready&&Number.isFinite(snapshot.as_of)&&0<=now-snapshot.as_of&&now-snapshot.as_of<=120
-        &&candidate?.bar_time+60===snapshot.as_of&&candidate?.confirmed_at===snapshot.as_of);
-      const td=candidate?.td_count,tdReady=snapshot.td_threshold===TD_ENTRY_THRESHOLD&&confirmed
-        &&candidate?.td_ready&&Number.isSafeInteger(td);
-      const emaVersion=snapshot.ema9_period===9&&snapshot.ema9_interval_seconds===300;
+      const fact=this.vwapFactState(candidate?.direction_fact,now);
+      const aligned=!!(fact.known&&candidate?.bar_time===fact.bar_time&&candidate?.confirmed_at===fact.confirmed_at
+        &&candidate?.close===fact.close&&candidate?.vwap===fact.vwap&&candidate?.direction===fact.direction);
+      const confirmed=!!(snapshot.ready&&this.basicVwapEntry(snapshot)&&aligned&&fact.ready);
       const price=slot.limitPx??data.bar?.close,stop=slot.stopPx;
       const stopOK=Number.isFinite(price)&&price>0&&Number.isFinite(stop)&&stop>0&&!!sign&&(side==='long'?stop<price:stop>price);
       const pos=stopOK&&this.equity>0&&this.riskUsd>0?calcPosition(this.equity,this.riskUsd,price,stop,this.maxPositionPct,this.status.max_order_qty||0):{qty:0,risk:0};
@@ -3348,29 +3424,28 @@ createApp({
       const riskKnown=[total,direction,totalLimit,directionLimit].every(Number.isFinite)&&!!sign&&pos.qty>0;
       const riskOK=riskKnown&&pos.risk<=this.riskUsd+1e-8&&(totalLimit===0||total+pos.risk<=totalLimit+1e-8)
         &&(directionLimit===0||direction+pos.risk<=directionLimit+1e-8);
-      const repeated=this.lots.some(l=>this.sameOrderSymbol(l.symbol,slot.symbol)
-        &&(['ACTIVE','PENDING','CLOSING'].includes(l.state)||l.entry_submission_pending));
-      const options=slot.candidateOrder,vwap=options?.vwap_outside_only?this.candidateVwapState(slot):null;
+      const directionMax=this.status.max_direction_positions||0,count=this.status.direction_position_counts?.[side];
+      const countKnown=!!sign&&Number.isInteger(count)&&count>=0;
+      const opposite=this.status.direction_position_counts?.[side==='long'?'short':'long'];
+      const oppositeKnown=!!sign&&Number.isInteger(opposite)&&opposite>=0;
+      const options=slot.candidateOrder;
       const policyReady=!options||(this.status.candidate_order_policy_version===1&&this.status.candidate_protection_live_version===1
         &&Number.isInteger(options.breakeven_minutes)&&options.breakeven_minutes>=1&&options.breakeven_minutes<=120
         &&['ema9_5m','st_1m_10_3'].includes(options.trailing_source));
       return [
-        {key:'candidate',label:'前十候选',ok:!!candidate,detail:candidate?'当前第 '+candidate.rank+' 名':'不在有效候选榜'},
-        {key:'direction',label:'趋势同向',ok:!!sign&&candidate?.side===side,detail:sign?(side==='long'?'做多':'做空')+' · 候选'+(candidate?.side==='long'?'多头':candidate?.side==='short'?'空头':'方向未就绪'):'等待方向'},
-        {key:'td',label:'一分钟收盘TD',ok:!!(tdReady&&sign*td>=TD_ENTRY_THRESHOLD),detail:tdReady?'TD '+(td>0?'+':'')+td+' · '+(sign===1?'要求 ≥ 1':'要求 ≤ −1'):'等待有效收盘TD / 新规则'},
-        {key:'ema9',label:'五分钟EMA9',ok:emaVersion&&ema.ok,detail:!emaVersion?'等待后端加载过滤规则':!ema.ready?ema.reason:
-          '现价 '+format(ema.price)+' / EMA9 '+format(ema.ema)+' · 要求'+(side==='long'?'高于':'低于')},
-        {key:'vwap_direction',label:'VWAP中线方向',ok:vwapDirection.ok,detail:!vwapDirection.ready?vwapDirection.reason:
-          '现价 '+format(vwapDirection.price)+' / 中线 '+format(vwapDirection.vwap)+' · 要求'+(side==='long'?'高于':'低于')},
-        {key:'vwap',label:'VWAP区间过滤',ok:!vwap||vwap.ok,detail:vwap?vwap.detail:'本笔已关闭区间过滤'},
+        {key:'candidate',label:'趋势前十候选',ok:!!candidate&&ranking==='trend',detail:candidate?'当前第 '+candidate.rank+' 名':'不在有效趋势榜'},
+        {key:'vwap_direction',label:'1分钟收盘价／VWAP',ok:aligned&&sign!==0&&fact.direction===sign&&candidate?.side===side,
+          detail:fact.known?'收盘 '+format(fact.close)+' / VWAP '+format(fact.vwap)+' · '+(fact.direction===1?'只做多':fact.direction===-1?'只做空':'相等不开仓'):'等待有效收盘价与VWAP'},
         {key:'policy',label:'候选订单设置',ok:policyReady,detail:policyReady?'使用页面顶部的实时保护设置':'请重启控制台或检查保本分钟数（1–120）'},
-        ...(options?.trailing_enabled&&options.trailing_source==='st_1m_10_3'?
-          [{key:'trailing_st',label:'跟踪ST方向',...(()=>{const st=this.candidateStState(slot);return {ok:st.ok,detail:st.detail};})()}]:[]),
-        {key:'data',label:'行情时效',ok:confirmed&&ema.ready&&this.status.market_running!==false&&!this.status.market_stale,
-          detail:this.status.market_running===false?'行情采集已停止':this.status.market_stale?'行情已陈旧':confirmed&&ema.ready?'确认≤120秒 · 报价≤45秒':snapshot.reason||'等待新鲜且对齐的数据'},
+        {key:'data',label:'个股行情时效',ok:confirmed&&quote.ready&&this.status.market_running!==false,
+          detail:this.status.market_running===false?'行情采集已停止':confirmed&&quote.ready?'个股确认有效 · 报价≤45秒':fact.reason||quote.reason||snapshot.reason||'等待个股有效确认数据'},
         {key:'stop',label:'保护止损',ok:stopOK,detail:stopOK?(slot.manualStopMode==='vwap_sigma'?'1σ':'2×ATR / K线外')+' · '+format(stop):'等待方向正确的有效止损'},
         {key:'risk',label:'预估风险预算',ok:!!riskOK,detail:riskKnown?'本笔$'+pos.risk+' · 总$'+format(total+pos.risk)+'/'+(totalLimit||'不限')+' · 同向$'+format(direction+pos.risk)+'/'+(directionLimit||'不限'):'等待数量、账户和风险数据'},
-        {key:'position',label:'数量与重复建仓',ok:pos.qty>0&&!repeated,detail:repeated?'已有未结束批次，禁止手动加仓':pos.qty>0?pos.qty+'股 · 最大'+this.maxPositionPct+'%仓位':'等待有效风险定量'},
+        ...(directionMax>0?[{key:'direction_position',label:'单方向持仓名额',ok:countKnown&&count<directionMax,
+          detail:countKnown?(side==='long'?'多头':'空头')+'已占用 '+count+'/'+directionMax+' 笔 · 挂单及平仓中占位，保本不释放':'等待服务端方向持仓笔数'}]:[]),
+        ...(this.status.single_direction_only?[{key:'direction_consistency',label:'禁止多空并存',ok:oppositeKnown&&opposite===0,
+          detail:!oppositeKnown?'等待当前未结束订单方向':opposite>0?'当前有'+(side==='long'?'空头':'多头')+opposite+'笔未结束订单，不能反向开仓':'无反向未结束订单；同向可多笔、同股可加仓'}]:[]),
+        {key:'position',label:'数量与仓位上限',ok:pos.qty>0,detail:pos.qty>0?pos.qty+'股 · 同股合计上限'+this.maxPositionPct+'%，发单前复核':'等待有效风险定量'},
         {key:'account',label:'交易通道',ok:!!(this.status.connected||this.status.dry_run)&&!this.status.halted,
           detail:this.status.halted?'账户风控已暂停':this.status.dry_run?'模拟执行':this.status.connected?'TWS已连接':'等待TWS连接'},
       ];
@@ -3379,14 +3454,15 @@ createApp({
     calcSlot(slot, sideOverride = null) {
       const data = this.market[slot.symbol];
       const restricted=!!this.status.candidate_entry_required;
-      const candidate=(this.entryCandidates.rows||[]).find(r=>r.symbol===slot.symbol);
+      const ranking=slot.candidateRanking||'trend',view=slot.candidateView||'mixed',snapshot=this.candidateSnapshotFor(ranking,view);
+      const candidate=(snapshot.rows||[]).find(r=>r.symbol===slot.symbol);
       const stopMode=slot.stopMode||'atr_2';
       const minuteMarket = !restricted && slot.limitType === 'market' && this.status.manual_market_st_interval_seconds === 60;
       const manualSide = !restricted && slot.limitType === 'market' && slot.manualDirection?.symbol === slot.symbol
         && ['long', 'short'].includes(slot.manualDirection.side) ? slot.manualDirection.side : null;
       const marketDirectionMode = restricted?'candidate':manualSide ? 'manual' : 'st';
       const empty = {
-        symbol: slot.symbol, limitType: slot.limitType,manualStopMode:stopMode,
+        symbol: slot.symbol, limitType: slot.limitType,manualStopMode:stopMode,candidateRanking:ranking,candidateView:view,orderType:slot.orderType||'MKT',limitLevel:slot.limitLevel||'vwap',
         candidateOrder:slot.limitType==='rhythm_market'?this.candidateOrderOptions(slot):null,
         tdCount:Number.isSafeInteger(candidate?.td_count)?candidate.td_count:null,
         minuteMarket, marketDirectionMode, stSide: null,
@@ -3401,12 +3477,15 @@ createApp({
         const now=new Date();
         const track=this.rhythmFrame?.tracks?.find(t=>t.symbol===slot.symbol);
         const sigma=candidate?.sigma??track?.points?.at(-1)?.[3];
-        const plan=rhythmTradePreview(restricted?this.entryCandidates:this.rhythmFrame,slot.symbol,data,now.getTime()/1000,(side,atr)=>
-          this.manualStopPrice(data,side,data?.bar?.close,stopMode,now,sigma));
-        if(restricted&&(!this.entryCandidates.ready||!candidate||candidate.side!==plan.side)) {
-          plan.ready=false;plan.blockReason=this.entryCandidates.reason||'不在当前候选榜单或趋势方向已变化';
+        const limitChoice=this.vwapLimitChoice(slot,candidate);
+        const reference=empty.orderType==='LMT'?limitChoice.price:data?.bar?.close;
+        const plan=rhythmTradePreview(restricted?snapshot:this.rhythmFrame,slot.symbol,data,now.getTime()/1000,(side,atr)=>
+          this.manualStopPrice(data,side,reference,stopMode,now,sigma),reference);
+        if(empty.orderType==='LMT'&&!limitChoice.ready){plan.ready=false;plan.blockReason=limitChoice.reason;}
+        if(restricted&&(!snapshot.ready||!candidate||candidate.side!==plan.side)) {
+          plan.ready=false;plan.blockReason=snapshot.reason||'不在当前候选榜单或VWAP方向已变化';
         }
-        const admissionReason=this.candidateAdmissionReason(slot.symbol,plan.side);
+        const admissionReason=this.candidateAdmissionReason(slot.symbol,plan.side,ranking,view);
         if(admissionReason){plan.ready=false;plan.blockReason=admissionReason;}
         if(this.status.candidate_order_policy_version!==1||this.status.candidate_protection_live_version!==1){plan.ready=false;plan.blockReason='请重启控制台加载候选订单设置';}
         if(!Number.isInteger(empty.candidateOrder.breakeven_minutes)||empty.candidateOrder.breakeven_minutes<1||empty.candidateOrder.breakeven_minutes>120){plan.ready=false;plan.blockReason='保本时间须为1–120分钟的整数';}
@@ -3414,7 +3493,7 @@ createApp({
           const outside=this.candidateVwapState({...empty,...plan});
           if(!outside.ok){plan.ready=false;plan.blockReason='VWAP区间过滤：'+outside.detail;}
         }
-        if(empty.candidateOrder.trailing_enabled&&empty.candidateOrder.trailing_source==='st_1m_10_3'){
+        if(!this.basicVwapEntry(snapshot)&&empty.candidateOrder.trailing_enabled&&empty.candidateOrder.trailing_source==='st_1m_10_3'){
           const st=this.candidateStState({...empty,...plan});if(!st.ok){plan.ready=false;plan.blockReason='ST跟踪入场：'+st.detail;}
         }
         const pos=plan.ready?calcPosition(this.equity,this.riskUsd,plan.limitPx,plan.stopPx,this.maxPositionPct,this.status.max_order_qty||0):{qty:0,amount:0,risk:0};
@@ -3488,7 +3567,7 @@ createApp({
       if(restricted||stopMode==='vwap_sigma')stopPx=this.manualStopPrice(data,side,limitPx,stopMode,now,candidate?.sigma);
       // Production manual entries use the confirmed candidate direction.
       const ready = !!(side && limitPx && limitPx > 0 && stopPx && stopPx > 0
-        &&(!restricted||!this.candidateAdmissionReason(slot.symbol,side))
+        &&(!restricted||!this.candidateAdmissionReason(slot.symbol,side,ranking,view))
         && (!minuteMarket || stSide)
         && (!opening || (side === 'long' ? stopPx < limitPx : stopPx > limitPx)));
       const pos = ready ? calcPosition(this.equity, this.riskUsd, limitPx, stopPx, this.maxPositionPct, this.status.max_order_qty || 0) : { qty: 0, amount: 0, risk: 0 };
@@ -3523,11 +3602,12 @@ createApp({
 
       return {
         symbol: slot.symbol,       // 下单需要
+        candidateRanking:ranking,candidateView:view,
         limitType: slot.limitType, // 下单需要
         minuteMarket, marketDirectionMode, stSide,
         side, close, limitPx, stopPx, atr,manualStopMode:stopMode,
         tdCount:Number.isSafeInteger(candidate?.td_count)?candidate.td_count:null,
-        blockReason:restricted?this.candidateAdmissionReason(slot.symbol,side):'',
+        blockReason:restricted?this.candidateAdmissionReason(slot.symbol,side,ranking,view):'',
         qty: pos.qty, amount: pos.amount, risk: pos.risk,
         equityRatio, ready, chg, trendState, divergence, stopDist, stopDistPct,
         fvgDir, fvgText,
@@ -3542,7 +3622,7 @@ createApp({
     },
 
     typeLabel(t) {
-      return { ema: 'EMA快线', channel: '通道边沿', midpoint: '中点限价单', retest: '回踩限价单', chase: 'FVG追价', market: '市价单', rhythm_market: '轨道市价单', twap: 'TWAP分批' }[t] || t;
+      return { ema: 'EMA快线', channel: '通道边沿', midpoint: '中点限价单', retest: '回踩限价单', chase: 'FVG追价', market: '市价单', rhythm_market: '趋势开仓', twap: 'TWAP分批' }[t] || t;
     },
 
     // 判断是否为「不在多头/空头列表」拦截（结构化 code，或纯文本报错兜底）
@@ -3592,14 +3672,6 @@ createApp({
       } catch { return false; }
     },
 
-    hasAutoPosition(symbol) {
-      const ticker = this.tickerOf(symbol);
-      return this.lots.some(lot => this.tickerOf(lot.symbol) === ticker &&
-        ['ACTIVE', 'PENDING', 'CLOSING'].includes(lot.state) && lot.filled_qty > 0 &&
-        (lot.trader === 'auto' || lot.limit_type?.startsWith('auto_') ||
-          lot.signal_snapshot?.strategy_id || lot.signal_snapshot?.auto_strategy || lot.signal_snapshot?.pyramid_seed));
-    },
-
     openingBreakoutBarTime(row) {
       return row.bar_time ?? row.time - 300;
     },
@@ -3625,7 +3697,7 @@ createApp({
       if (row.status && !['preview', 'confirmed'].includes(row.status)) return true;
       const confirmedAt = row.confirmed_at || row.time;
       if (row.status !== 'preview' && this.now >= confirmedAt + 20) return true;
-      return !row.stop_px || this.hasAutoPosition(row.symbol)
+      return !row.stop_px
         || this.lots.some(lot => lot.signal_snapshot?.opening_breakout_id === row.id);
     },
 
@@ -3674,7 +3746,6 @@ createApp({
       if (!this.status.dry_run && !this.status.connected) return 'IBKR 未连接';
       const observation = this.market[row.symbol]?.price_observed_at;
       if (this.status.market_stale || !(observation <= this.now && this.now - observation <= 15)) return '行情已过期';
-      if (this.hasAutoPosition(row.symbol)) return '已有自动策略仓位，禁止手动加仓';
       return '';
     },
 
@@ -3744,7 +3815,6 @@ createApp({
     async placeOpeningBreakout(row) {
       if (['preview', 'armed'].includes(row.status)) return this.prepareOpeningBreakout(row);
       if (this.openingBreakoutEntryDisabled(row)) return;
-      if (this.hasAutoPosition(row.symbol)) return this.$message.warning('该标的已有自动策略仓位，禁止手动加仓');
       this.placing = true;
       try {
         if (!await this.confirmSlowMarketEntry({ ...row, openingBreakout: true })) return;
@@ -3765,18 +3835,17 @@ createApp({
 
     async placeOrder(slot, force = false, forceReason = '', validate = null) {
       if (this.placing && !force) return;
-      if (this.hasAutoPosition(slot.symbol)) return this.$message.warning('该标的已有自动策略仓位，禁止手动加仓');
       if (!slot.ready || !(slot.qty > 0)) return this.$message.warning('行情或风险定量未就绪，无法下单');
       const entryChecksPass=()=>{const failed=this.manualEntryChecks(slot).find(c=>!c.ok);if(failed)this.$message.warning(failed.label+'：'+failed.detail);return !failed;};
       if(!entryChecksPass())return;
       const optionsStillSelected=()=>slot.limitType!=='rhythm_market'||this.slots.some(source=>
-        source.symbol===slot.symbol&&JSON.stringify(this.candidateOrderOptions(source))===JSON.stringify(slot.candidateOrder));
+        source.symbol===slot.symbol&&(source.candidateRanking||'trend')===(slot.candidateRanking||'trend')&&(source.candidateView||'mixed')===(slot.candidateView||'mixed')&&(source.orderType||'MKT')===(slot.orderType||'MKT')&&(source.limitLevel||'vwap')===(slot.limitLevel||'vwap')&&JSON.stringify(this.candidateOrderOptions(source))===JSON.stringify(slot.candidateOrder));
       if(!optionsStillSelected())return this.$message.warning('候选订单设置已变更，请重新确认');
       const manualChoice = slot.marketDirectionMode === 'manual'
         ? this.slots.find(source => source.symbol === slot.symbol)?.manualDirection : null;
       const directionStillSelected = () => this.status.candidate_entry_required
-        ? !this.candidateAdmissionReason(slot.symbol,slot.side)
-          &&this.slots.some(s=>s.symbol===slot.symbol&&(s.stopMode||'atr_2')===(slot.manualStopMode||'atr_2'))
+        ? !this.candidateAdmissionReason(slot.symbol,slot.side,slot.candidateRanking||'trend',slot.candidateView||'mixed')
+          &&this.slots.some(s=>s.symbol===slot.symbol&&(s.candidateRanking||'trend')===(slot.candidateRanking||'trend')&&(s.candidateView||'mixed')===(slot.candidateView||'mixed')&&(s.stopMode||'atr_2')===(slot.manualStopMode||'atr_2'))
         : slot.marketDirectionMode !== 'manual'
         || this.slots.some(source => source.symbol === slot.symbol && source.limitType === 'market'
           && source.manualDirection === manualChoice && manualChoice?.side === slot.side);
@@ -3785,16 +3854,19 @@ createApp({
       try {
         if (validate && !validate()) return;
         const ticker = slot.symbol.split(':').pop();
-        const reason = slot.limitType === 'rhythm_market' ? `${ticker} 候选推荐${slot.side === 'long' ? '做多' : '做空'} · 市价 · ${slot.manualStopMode==='vwap_sigma'?'1σ止损':'5分钟2×ATR/当前K线外止损'}`
+        const reason = slot.limitType === 'rhythm_market' ? `${ticker} 候选推荐${slot.side === 'long' ? '做多' : '做空'} · ${slot.orderType==='LMT'?'限价 '+slot.limitPx:'市价'} · ${slot.manualStopMode==='vwap_sigma'?'1σ止损':'5分钟2×ATR/当前K线外止损'}`
           : (force && forceReason) ? `执意开仓：${forceReason}`
           : `${ticker} ${slot.side} ${slot.limitType} ${['market','rhythm_market'].includes(slot.limitType) ? '市价' : '限价'}`
             + (slot.marketDirectionMode === 'manual' ? ' · 已确认震荡行情，手动方向' : '');
         const body = {
           symbol: slot.symbol, side: slot.side, qty: slot.qty,
           limit_px: slot.limitPx, stop_px: slot.stopPx,
-          limit_type: slot.limitType === 'rhythm_market' ? 'market' : slot.limitType, reason,
+          limit_type: slot.limitType === 'rhythm_market' ? (slot.orderType==='LMT'?'vwap_limit':'market') : slot.limitType, reason,
+          vwap_limit_level:slot.limitLevel||'vwap',
           entry_mode: slot.limitType === 'rhythm_market' ? 'rhythm_atr' : 'default',
           manual_stop_mode: slot.manualStopMode || 'atr_2',
+          candidate_ranking: slot.candidateRanking || 'trend',
+          candidate_view: slot.candidateView || 'mixed',
           force,
           max_position_pct: this.maxPositionPct,
         };
@@ -4007,6 +4079,9 @@ createApp({
     exitReasonLabel(r) {
       return { trail_stop: '跟踪保护止损成交', stop: '保护止损触发', manual: '用户手动平仓',
         candidate_timed_breakeven_stop:'定时保本退出（到期现价已越过成本）',
+        intelligent_timed_breakeven:'智能退出：定时保本到期，现价已越过成本',
+        intelligent_td_reverse_3:'智能退出：一分钟TD反向达到3',
+        intelligent_td_reverse_4:'智能退出：一分钟TD反向达到4',
         candidate_st_trailing_flip:'ST跟踪止盈反向退出（已启用ST模式）',
         manual_stop: '用户退出策略组', manual_stop_close: '用户退出策略组',
         st_flip: 'ST转向自动平仓（历史规则）', trend_reverse: '策略方向反向退出（历史规则）',

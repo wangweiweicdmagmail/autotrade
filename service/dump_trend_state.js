@@ -4,7 +4,7 @@ const fs=require('node:fs'),path=require('node:path');
 const {fetchDataset}=require('./history_bars');
 const {computeHistory}=require('./local_history');
 async function main(){
- const args={range:601,session:'extended',to:0,creds:path.join(__dirname,'creds.json'),symbols:[]};
+ const args={range:601,session:'regular',to:0,creds:path.join(__dirname,'creds.json'),symbols:[]};
  for(let i=2;i<process.argv.length;i+=2){const key=process.argv[i].replace(/^--/,'');args[key]=key==='symbols'?process.argv[i+1].split(','):['range','to'].includes(key)?Number(process.argv[i+1]):process.argv[i+1];}
  if(!args.symbols.length||!Number.isSafeInteger(args.range)||args.range<1||args.range>5001)throw new Error('无效的历史K线参数');
  if(!['regular','extended','24h','default'].includes(args.session))throw new Error('不支持的行情时段');

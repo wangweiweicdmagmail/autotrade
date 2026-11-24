@@ -13,7 +13,7 @@ async function main(){
   const client=await createMarketClient(TradingView,credentials);
   try{
     const data=await fetchChart(client,args.symbol,{timeframe:{'1m':'1','5m':'5','1d':'D'}[args.interval],
-      range:args.range,to:args.to,session:args.session,timeout:25000});
+      range:args.range,to:args.to,session:args.session,timeout:25000,replay:args.historical_replay===true});
     process.stdout.write(JSON.stringify(data));
   }finally{await client.end();}
 }

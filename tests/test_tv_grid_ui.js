@@ -49,7 +49,7 @@ test('global ticker clicks use the same single-cell route even in rhythm mode wi
 });
 
  test('both TV windows receive independent targets and one failure does not suppress the other',async()=>{
- const {ui}=setup(),calls=[],focusSymbols=['NASDAQ:S1','CAPITALCOM:NAS100','CAPITALCOM:SPX500','NASDAQ:S2','NASDAQ:QQQ','AMEX:SPY'];
+ const {ui}=setup(),calls=[],focusSymbols=['NASDAQ:S1','CAPITALCOM:NAS100','CAPITALCOM:SPX500','NASDAQ:S2','NASDAQ:QQQ','NASDAQ:NVDA'];
  ui.requestTvBridge=async detail=>{calls.push(detail);return detail.layout==='candidates'?{ok:false,reason:'八格未打开'}:{ok:true,panes:Array.from({length:6},()=>({ok:true}))};};
  await ui.syncRhythmGrid({symbols,focusSymbols});
  assert.deepEqual(calls.map(c=>c.layout),['candidates','focus']);
@@ -97,7 +97,7 @@ test('position management shows all batches for stock aliases and leaves entry c
 });
 
 test('a local candidate replacement never sends a grid request to the unchanged six-pane window',async()=>{
- const {ui}=setup(),calls=[],focusSymbols=['NASDAQ:S1','CAPITALCOM:NAS100','CAPITALCOM:SPX500','NASDAQ:S2','NASDAQ:QQQ','AMEX:SPY'];
+ const {ui}=setup(),calls=[],focusSymbols=['NASDAQ:S1','CAPITALCOM:NAS100','CAPITALCOM:SPX500','NASDAQ:S2','NASDAQ:QQQ','NASDAQ:NVDA'];
  ui.requestTvBridge=async detail=>{calls.push(detail);return{ok:true,panes:Array.from({length:detail.layout==='focus'?6:8},()=>({ok:true}))};};
  await ui.syncRhythmGrid({symbols,focusSymbols});assert.equal(calls.length,2);
  const next=[...symbols];next[5]='NYSE:UNH';
@@ -111,7 +111,7 @@ test('a local candidate replacement never sends a grid request to the unchanged 
 });
 
 test('a failed layout retries independently without reapplying the already confirmed window',async()=>{
- const {ui}=setup(),calls=[],focusSymbols=['NASDAQ:S1','CAPITALCOM:NAS100','CAPITALCOM:SPX500','NASDAQ:S2','NASDAQ:QQQ','AMEX:SPY'];
+ const {ui}=setup(),calls=[],focusSymbols=['NASDAQ:S1','CAPITALCOM:NAS100','CAPITALCOM:SPX500','NASDAQ:S2','NASDAQ:QQQ','NASDAQ:NVDA'];
  let ready=false;
  ui.requestTvBridge=async detail=>{calls.push(detail.layout);return detail.layout==='candidates'&&!ready?
    {ok:false,reason:'pending'}:{ok:true,panes:Array.from({length:detail.layout==='focus'?6:8},()=>({ok:true}))};};

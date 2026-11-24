@@ -3,22 +3,32 @@ const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const fs=require('node:fs');
 const vm=require('node:vm');
-const {rhythmTradePreview}=require('../console/static/market-rhythm');
+const {rhythmTradePreview,rhythmTdFact,rhythmVwapFact}=require('../console/static/market-rhythm');
 const now=Date.parse('2026-11-18T15:15:05Z')/1000;
 const minute=now-5;
+function tdFact(count,at=minute){return {version:1,source:'confirmed_minute_v1',id:'fact-'+at+'-'+count,known:Number.isSafeInteger(count),ready:Number.isSafeInteger(count),bar_time:at-60,confirmed_at:at,quote_bar_time:at,observed_at:at+1,count};}
+function directionFact(direction=1,vwap=direction===1?99:101){return {version:1,source:'confirmed_vwap_direction_v1',id:'vwap-'+minute,known:true,ready:true,bar_time:minute-60,confirmed_at:minute,quote_bar_time:minute,observed_at:now,close:100,vwap,direction};}
+function neutralBeta(td=1){return {data_contract_version:4,entry_policy:'stock_vwap_side_v1',direction_source:'confirmed_vwap_direction_v1',td_required:false,ema9_required:false,vwap_direction_required:true,td_source:'confirmed_minute_v1',evaluated_at:now,ranking_snapshot:{id:'test-minute'},beta_filter_required:false,
+ beta_filter:{td_source:'confirmed_minute_v1',version:1,rule:'both_indices_absolute',ready:true,as_of:minute,snapshot_id:'test-minute',direction:0,
+ absolute_ready:true,absolute_long_allowed:true,absolute_short_allowed:true,
+ absolute_long_reason:'',absolute_short_reason:'',td_required:true,td_rule:'any_index_same_sign',td_ready:true,
+ td_long_allowed:td>0,td_short_allowed:td<0,td_long_reason:td>0?'':'做多要求至少一个指数TD > 0',td_short_reason:td<0?'':'做空要求至少一个指数TD < 0',
+ long_allowed:td>0,short_allowed:td<0,long_reason:td>0?'':'做多要求至少一个指数TD > 0',short_reason:td<0?'':'做空要求至少一个指数TD < 0',rows:[
+ {symbol:'CAPITALCOM:NAS100',ready:true,direction:0,price:100,upper:102,lower:98,ema9:100,td_ready:true,td_count:td,td_fact:tdFact(td)},
+ {symbol:'CAPITALCOM:SPX500',ready:true,direction:0,price:100,upper:102,lower:98,ema9:100,td_ready:true,td_count:td,td_fact:tdFact(td)}]}};}
 function setup(storage={}){
   let options;const requests=[],charts=[];
   class Clock extends Date{constructor(...args){super(...(args.length?args:[now*1000]));}static now(){return now*1000;}}
   vm.runInNewContext(fs.readFileSync(require.resolve('../console/static/app.js'),'utf8'),{
     Vue:{createApp(o){options=o;return{use(){return this;},mount(){}};}},ElementPlus:{},
-    localStorage:{getItem(k){return storage[k]??null;},setItem(k,v){storage[k]=v;}},Date:Clock,rhythmTradePreview,
-    fetch:async(url,r)=>{const body=JSON.parse(r.body);requests.push({url,body});return{ok:true,json:async()=>url==='/api/settings'?{candidate_order_protection:body.candidate_order_protection}:{lot:{}}};},
+    localStorage:{getItem(k){return storage[k]??null;},setItem(k,v){storage[k]=v;}},Date:Clock,rhythmTradePreview,rhythmTdFact,rhythmVwapFact,
+    fetch:async(url,r)=>{const body=JSON.parse(r.body);requests.push({url,body});return{ok:true,json:async()=>url==='/api/settings'?{candidate_order_protection:body.candidate_order_protection,intelligent_exit:body.intelligent_exit}:{lot:{}}};},
   });
   const symbol='NASDAQ:NVDA';
   const ui={...options.data(),...options.methods,equity:100000,riskUsd:1000,
     market:{[symbol]:{bar:{time:minute,close:100,low:99,high:101},ts_c:{atr:2},ts:{atr:50,ema_9:99},price_observed_at:now,
       market_1m:{bar_c:{time:minute-60}},candidate_st_1m_c:{version:1,time:minute-60,price:98,direction:1,atr_period:10,multiplier:3,interval_seconds:60,session:'regular'}}},
-    status:{candidate_protection_live_version:1,candidate_order_policy_version:1,max_order_qty:100000,manual_stop_modes:['atr_2','vwap_sigma'],connected:true,market_running:true,market_stale:false,total_risk_usd:0,long_risk_usd:0,short_risk_usd:0,max_total_risk_usd:2200,max_direction_risk_usd:1100},lots:[],tvShow:s=>charts.push(s),
+    status:{candidate_beta_filter_version:1,intelligent_exit_version:1,candidate_protection_live_version:1,candidate_order_policy_version:1,max_order_qty:100000,manual_stop_modes:['atr_2','vwap_sigma'],connected:true,market_running:true,market_stale:false,total_risk_usd:0,long_risk_usd:0,short_risk_usd:0,max_total_risk_usd:2200,max_direction_risk_usd:1100},lots:[],tvShow:s=>charts.push(s),
     $message:{success(){},warning(){},error(e){throw Error(e);}},tradeHeaders:()=>({}),checkWrite403(){},
     confirmSlowMarketEntry:async()=>true};
   // Existing tests isolate their original gates; the new filter has explicit coverage below.
@@ -76,7 +86,7 @@ test('rhythm card uses the ordinary market stop outside the five-minute candle o
 
 test('manual entries take only candidate direction and can choose sigma without changing the ATR default',async()=>{
  const {ui,symbol,requests}=setup();ui.status.candidate_entry_required=true;
- ui.entryCandidates={ready:true,vwap_direction_required:true,td_threshold:1,ema9_period:9,ema9_interval_seconds:300,as_of:minute,rows:[{symbol,side:'long',direction:1,vwap:99,sigma:2,rank:1,td_count:3,td_ready:true,bar_time:minute-60,confirmed_at:minute}]};
+ ui.entryCandidates={...neutralBeta(),ready:true,vwap_direction_required:true,td_threshold:1,ema9_period:9,ema9_interval_seconds:300,as_of:minute,rows:[{symbol,side:'long',direction:1,close:100,direction_fact:directionFact(),vwap:99,sigma:2,rank:1,td_count:3,td_fact:tdFact(3),td_ready:true,bar_time:minute-60,confirmed_at:minute}]};
  ui.slots[0].symbol=symbol;ui.slots[0].limitType='market';
  ui.market[symbol].ts.direction=-1; // ST cannot reverse the selected candidate trend.
  ui.market[symbol].bar.low=95;ui.market[symbol].bar.high=105;
@@ -89,7 +99,7 @@ test('manual entries take only candidate direction and can choose sigma without 
 
 test('candidate reversal during confirmation cancels a manual order',async()=>{
  const {ui,symbol,requests}=setup();ui.status.candidate_entry_required=true;
- ui.entryCandidates={ready:true,vwap_direction_required:true,td_threshold:1,ema9_period:9,ema9_interval_seconds:300,as_of:minute,rows:[{symbol,side:'long',direction:1,vwap:99,sigma:2,td_count:3,td_ready:true,bar_time:minute-60,confirmed_at:minute}]};ui.slots[0].symbol=symbol;
+ ui.entryCandidates={...neutralBeta(),ready:true,vwap_direction_required:true,td_threshold:1,ema9_period:9,ema9_interval_seconds:300,as_of:minute,rows:[{symbol,side:'long',direction:1,close:100,direction_fact:directionFact(),vwap:99,sigma:2,td_count:3,td_fact:tdFact(3),td_ready:true,bar_time:minute-60,confirmed_at:minute}]};ui.slots[0].symbol=symbol;
  ui.confirmSlowMarketEntry=async()=>{ui.entryCandidates.rows[0].side='short';return true;};
  await ui.placeOrder(ui.calcSlot(ui.slots[0]));assert.equal(requests.length,0);
 });
@@ -104,38 +114,15 @@ function productionAdmission(ui,symbol,td=1,direction=1){
  ui.market[symbol].candidate_st_1m_c.direction=direction;
  ui.market[symbol].ts.ema_9=direction===1?99:101;
  ui.status.candidate_entry_required=true;ui.slots[0].symbol=symbol;
- ui.entryCandidates={ready:true,vwap_direction_required:true,td_threshold:1,ema9_period:9,ema9_interval_seconds:300,as_of:minute,rows:[{symbol,rank:1,side:direction===1?'long':'short',direction,vwap:direction===1?99:101,sigma:2,
-   td_count:td,td_ready:td!=null,bar_time:minute-60,confirmed_at:minute}]};
+ ui.entryCandidates={...neutralBeta(direction),ready:true,vwap_direction_required:true,td_threshold:1,ema9_period:9,ema9_interval_seconds:300,as_of:minute,rows:[{symbol,rank:1,side:direction===1?'long':'short',direction,close:100,direction_fact:directionFact(direction),vwap:direction===1?99:101,sigma:2,
+   td_count:td,td_fact:tdFact(td),td_ready:td!=null,bar_time:minute-60,confirmed_at:minute}]};
 }
 
-test('candidate card defaults, timer/trailing choices and directional VWAP filter are sent per order',async()=>{
- const {ui,symbol,requests}=setup();productionAdmission(ui,symbol);
- const defaults=ui.candidateOrderOptions({});
- assert.equal(defaults.timed_breakeven_enabled,true);assert.equal(defaults.breakeven_minutes,5);
- assert.equal(defaults.vwap_outside_only,true);assert.equal(defaults.trailing_enabled,false);
- ui.slots[0].vwapOutsideOnly=true;ui.entryCandidates.rows[0].vwap=100;ui.entryCandidates.rows[0].sigma=2;
- let row=ui.calcSlot(ui.slots[0]);assert(!row.ready);assert.match(row.blockReason,/VWAP/);
- assert(!ui.manualEntryChecks(row).find(c=>c.key==='vwap').ok);
- ui.market[symbol].bar.close=103;ui.market[symbol].bar.high=104;ui.candidateProtection.breakeven_minutes=7;
- ui.candidateProtection.trailing_enabled=true;ui.candidateProtection.trailing_source='st_1m_10_3';
- row=ui.calcSlot(ui.slots[0]);assert(row.ready);
- await ui.placeOrder(row);assert.equal(requests.length,1);
- assert.equal(requests[0].body.candidate_order.breakeven_minutes,7);
- assert.equal(requests[0].body.candidate_order.trailing_source,'st_1m_10_3');
- assert.equal(requests[0].body.candidate_order.trailing_enabled,true);
+test('retired TD board cannot open a card or reuse saved preferences',()=>{
+ const {ui,symbol,frame}=setup();ui.deckCollapsed=true;
+ ui.openRhythmTrade({symbol,frame,ranking:'td'});
+ assert.equal(ui.deckCollapsed,true);assert.equal(ui.slots[0].candidateRanking,'trend');
 });
-
-test('candidate filter mirrors short boundaries and can be explicitly disabled',()=>{
- const {ui,symbol}=setup();productionAdmission(ui,symbol,-1,-1);
- ui.market[symbol].bar.low=96;
- ui.slots[0].vwapOutsideOnly=true;ui.entryCandidates.rows[0].vwap=100;
- for(const [price,ready] of [[99,false],[98,false],[97,true]]){
-  ui.market[symbol].bar.close=price;assert.equal(ui.calcSlot(ui.slots[0]).ready,ready);
- }
- ui.market[symbol].bar.close=99;ui.slots[0].vwapOutsideOnly=false;
- assert(ui.calcSlot(ui.slots[0]).ready);
-});
-
 test('policy changes while confirming and old backend versions cannot submit',async()=>{
  const {ui,symbol,requests}=setup();productionAdmission(ui,symbol);
  ui.confirmSlowMarketEntry=async()=>{ui.candidateProtection.breakeven_minutes=10;return true;};
@@ -186,8 +173,8 @@ test('the default track market card works from live admission without opening th
  assert.equal(row.limitPx,100);assert.equal(row.stopPx,96);
 });
 
-test('manual TD gating includes thresholds on both sides, rejects unknown and opposite TD, and keeps both stop choices',()=>{
- for(const [direction,td,allowed] of [[1,0,false],[1,1,true],[1,2,true],[1,-1,false],[-1,0,false],[-1,-1,true],[-1,-2,true],[-1,1,false],[1,null,false]]){
+test('TD counts do not gate either direction or either stop mode',()=>{
+ for(const [direction,td,allowed] of [[1,0,true],[1,1,true],[1,2,true],[1,-1,true],[-1,0,true],[-1,-1,true],[-1,-2,true],[-1,1,true],[1,null,true]]){
   const {ui,symbol}=setup();productionAdmission(ui,symbol,td,direction);
   for(const mode of ['atr_2','vwap_sigma']){
    ui.slots[0].stopMode=mode;const row=ui.calcSlot(ui.slots[0]);assert.equal(row.ready,allowed);
@@ -196,14 +183,13 @@ test('manual TD gating includes thresholds on both sides, rejects unknown and op
  }
 });
 
-test('a TD drop while confirming an order cancels submission and an old server remains blocked',async()=>{
+test('VWAP direction change while confirming cancels submission; old contract is blocked',async()=>{
  const {ui,symbol,requests}=setup();productionAdmission(ui,symbol);
- let confirmations=0;ui.confirmSlowMarketEntry=async()=>{confirmations++;ui.entryCandidates.rows[0].td_count=0;return true;};
- await ui.placeOrder(ui.calcSlot(ui.slots[0]));assert.equal(confirmations,1);assert.equal(requests.length,0);
- delete ui.entryCandidates.td_threshold;
- const row=ui.calcSlot(ui.slots[0]);assert(!row.ready);assert.match(row.blockReason,/重启控制台/);
+ ui.confirmSlowMarketEntry=async()=>{ui.entryCandidates.rows[0].direction_fact.vwap=101;return true;};
+ await ui.placeOrder(ui.calcSlot(ui.slots[0]));assert.equal(requests.length,0);
+ ui.entryCandidates.data_contract_version=3;
+ assert(!ui.calcSlot(ui.slots[0]).ready);
 });
-
 test('track market sizing respects the configured 140 percent cap on both sides',()=>{
  for(const direction of [1,-1]){
   const {ui,symbol}=setup();productionAdmission(ui,symbol,3*direction,direction);
@@ -213,74 +199,184 @@ test('track market sizing respects the configured 140 percent cap on both sides'
  }
 });
 
-test('EMA9 admission uses the existing five-minute nine-period value and mirrors both sides strictly',()=>{
- for(const [direction,ema,allowed] of [[1,99,true],[1,100,false],[1,101,false],[-1,101,true],[-1,100,false],[-1,99,false]]){
-  const {ui,symbol}=setup();productionAdmission(ui,symbol,direction,direction);
-  ui.market[symbol].ts.ema_9=ema;ui.market[symbol].e9={ema_9:999};
-  const row=ui.calcSlot(ui.slots[0]);assert.equal(row.ready,allowed);
-  const checks=ui.manualEntryChecks(row);assert.equal(checks.length,12);
-  assert.equal(checks.find(c=>c.key==='ema9').ok,allowed);
-  if(!allowed){assert.equal(row.qty,0);assert.match(row.blockReason,/EMA9/);}
- }
-});
 
-test('every card check stays visible and reports its own failure instead of hiding checks after the first',()=>{
- const {ui,symbol}=setup();productionAdmission(ui,symbol,0);
- ui.market[symbol].ts.ema_9=101;ui.status.halted=true;ui.status.total_risk_usd=2100;
- const checks=ui.manualEntryChecks(ui.calcSlot(ui.slots[0]));
- assert(checks.find(c=>c.key==='candidate').ok);
- assert(!checks.find(c=>c.key==='td').ok);assert(!checks.find(c=>c.key==='ema9').ok);
- assert(!checks.find(c=>c.key==='risk').ok);assert(!checks.find(c=>c.key==='account').ok);
- const html=fs.readFileSync(require.resolve('../console/static/index.html'),'utf8');
- assert(html.includes("check.ok ? '✓' : '✗'"));
- assert(html.includes('manualEntryChecks(slot).some(c => !c.ok)'));
-});
 
-test('all checks pass for a fresh same-side TD1 entry, while budget excess and duplicate batches each show a cross',async()=>{
+test('budget excess blocks entry, while an existing same-symbol batch permits a separate addition',async()=>{
  const {ui,symbol,requests}=setup();productionAdmission(ui,symbol);
  const row=ui.calcSlot(ui.slots[0]);assert(ui.manualEntryChecks(row).every(c=>c.ok));
  ui.status.long_risk_usd=200;
  assert(!ui.manualEntryChecks(row).find(c=>c.key==='risk').ok);
  await ui.placeOrder(row);assert.equal(requests.length,0);
  ui.status.long_risk_usd=0;ui.lots=[{symbol,state:'PENDING',filled_qty:0}];
- assert(!ui.manualEntryChecks(row).find(c=>c.key==='position').ok);
+ assert(ui.manualEntryChecks(row).find(c=>c.key==='position').ok);
+ await ui.placeOrder(row);assert.equal(requests.length,1);
+});
+
+test('the order card uses server-wide direction slots even when risk is zero and local lots are filtered',async()=>{
+ const {ui,symbol,requests}=setup();productionAdmission(ui,symbol);
+ ui.status.max_direction_positions=1;
+ ui.status.direction_position_counts={long:1,short:0};
+ const row=ui.calcSlot(ui.slots[0]);
+ assert.equal(ui.lots.length,0);assert.equal(ui.status.long_risk_usd,0);
+ const check=ui.manualEntryChecks(row).find(c=>c.key==='direction_position');
+ assert(!check.ok);assert.match(check.detail,/1\/1.*保本不释放/);
+ await ui.placeOrder(row);assert.equal(requests.length,0);
+ ui.status.direction_position_counts.long=0;
+ assert(ui.manualEntryChecks(row).find(c=>c.key==='direction_position').ok);
+ delete ui.status.direction_position_counts;
+ assert(!ui.manualEntryChecks(row).find(c=>c.key==='direction_position').ok);
+});
+
+test('with the direction count limit disabled, the order card has no slot blocker and can submit',async()=>{
+ const {ui,symbol,requests}=setup();productionAdmission(ui,symbol);
+ ui.status.max_direction_positions=0;
+ ui.status.direction_position_counts={long:3,short:2};
+ const row=ui.calcSlot(ui.slots[0]);
+ assert(!ui.manualEntryChecks(row).some(c=>c.key==='direction_position'));
+ delete ui.status.direction_position_counts;
+ assert(ui.manualEntryChecks(row).every(c=>c.ok));
+ await ui.placeOrder(row);assert.equal(requests.length,1);
+});
+
+test('only actual opposite unfinished orders block entry; TD and closed history do not block additions',async()=>{
+ const {ui,symbol,requests}=setup();productionAdmission(ui,symbol);
+ ui.status.single_direction_only=true;ui.status.max_direction_positions=0;
+ ui.status.max_direction_risk_usd=2200;ui.status.long_risk_usd=1000;ui.status.total_risk_usd=1000;
+ ui.status.direction_position_counts={long:2,short:1};
+ ui.lots=[{symbol,state:'ACTIVE',side:'long',filled_qty:10,trader:'auto',signal_snapshot:{strategy_id:'fixture'}}];
+ const row=ui.calcSlot(ui.slots[0]);
+ assert(!ui.manualEntryChecks(row).find(c=>c.key==='direction_consistency').ok);
+ await ui.placeOrder(row);assert.equal(requests.length,0);
+ ui.status.direction_position_counts.short=0;
+ ui.lots.push({symbol:'NASDAQ:HISTORY',state:'CLOSED',side:'short',filled_qty:100});
+ assert(ui.manualEntryChecks(row).every(c=>c.ok));
+ await ui.placeOrder(row);assert.equal(requests.length,1);
+ delete ui.status.direction_position_counts;
+ assert(!ui.manualEntryChecks(row).find(c=>c.key==='direction_consistency').ok);
+});
+
+
+
+
+
+test('intelligent exit master switch is saved separately and does not open an entry card',async()=>{
+ const {ui,requests}=setup();ui.deckCollapsed=true;
+ assert.equal(ui.intelligentExit.enabled,false);
+ await ui.saveIntelligentExit('enabled',true);
+ assert.equal(ui.intelligentExit.enabled,true);assert.equal(ui.deckCollapsed,true);
+ assert.deepEqual(Object.keys(requests[0].body),['intelligent_exit']);
+ assert.equal(requests[0].body.intelligent_exit.breakeven_minutes,5);
+ await ui.saveIntelligentExit('enabled',false);assert.equal(ui.intelligentExit.enabled,false);
+ assert.equal(requests.length,2);assert(requests.every(r=>r.url==='/api/settings'));
+});
+
+test('an older server cannot accept the new intelligent exit switch',async()=>{
+ const {ui,requests}=setup();delete ui.status.intelligent_exit_version;
+ await ui.saveIntelligentExit('enabled',true);
+ assert.equal(requests.length,0);assert.equal(ui.intelligentExit.enabled,false);
+});
+
+
+test('trend entry ignores TD, indices, EMA9 and ST but requires close and VWAP',async()=>{
+ for(const sign of [1,-1]){
+  const {ui,symbol,requests}=setup();productionAdmission(ui,symbol,-sign,sign);
+  delete ui.entryCandidates.beta_filter;delete ui.market[symbol].ts.ema_9;delete ui.market[symbol].candidate_st_1m_c;
+  ui.candidateProtection.trailing_enabled=true;ui.candidateProtection.trailing_source='st_1m_10_3';
+  const row=ui.calcSlot(ui.slots[0]);assert(row.ready,row.blockReason);
+  const checks=ui.manualEntryChecks(row);assert(checks.every(c=>c.ok));
+  assert(!checks.some(c=>['td','beta','beta_td','ema9','trailing_st'].includes(c.key)));
+  await ui.placeOrder(row);assert.equal(requests.length,1);
+  assert.equal(requests[0].body.side,sign===1?'long':'short');
+  ui.entryCandidates.rows[0].vwap=null;assert(!ui.calcSlot(ui.slots[0]).ready);
+ }
+});
+test('the checklist retains quote, risk, stop and account checks while allowing same-symbol additions',()=>{
+ const {ui,symbol}=setup();productionAdmission(ui,symbol);
+ let row=ui.calcSlot(ui.slots[0]);assert(ui.manualEntryChecks(row).every(c=>c.ok));
+ ui.status.total_risk_usd=2100;ui.status.halted=true;ui.lots=[{symbol,state:'PENDING'}];
+ const checks=ui.manualEntryChecks(row);
+ for(const key of ['risk','account'])assert.equal(checks.find(c=>c.key===key).ok,false);
+ assert(checks.find(c=>c.key==='position').ok);
+ assert(checks.find(c=>c.key==='vwap_direction').ok);
+ assert(checks.find(c=>c.key==='stop').ok);
+ const html=fs.readFileSync(require.resolve('../console/static/index.html'),'utf8');
+ assert(html.includes("check.ok ? '✓' : '✗'"));
+});
+
+test('EMA9 and index changes do not block an unchanged VWAP side',async()=>{
+ const {ui,symbol,requests}=setup();productionAdmission(ui,symbol);
+ ui.confirmSlowMarketEntry=async()=>{ui.market[symbol].ts.ema_9=110;ui.entryCandidates.beta_filter={ready:false};return true;};
+ await ui.placeOrder(ui.calcSlot(ui.slots[0]));assert.equal(requests.length,1);
+});
+test('simple entry still rejects wrong contract, stale stock TD, stale quote, zero and changed source',async()=>{
+ for(const fault of ['contract','policy','flags','td_stale','quote','zero','source']){
+  const {ui,symbol,requests}=setup();productionAdmission(ui,symbol);
+  const slot=ui.calcSlot(ui.slots[0]);assert(slot.ready);
+  ui.confirmSlowMarketEntry=async()=>{
+   const snapshot=ui.entryCandidates,row=snapshot.rows[0];
+   if(fault==='contract')snapshot.data_contract_version=2;
+   else if(fault==='policy')delete snapshot.entry_policy;
+   else if(fault==='flags')snapshot.beta_filter_required=true;
+   else if(fault==='td_stale')row.direction_fact.observed_at=now-46;
+   else if(fault==='quote')ui.market[symbol].price_observed_at=now-46;
+   else if(fault==='zero'){row.direction_fact.vwap=row.vwap=100;row.direction_fact.direction=row.direction=0;}
+   else ui.slots[0].candidateRanking='td';
+   return true;
+  };
+  await ui.placeOrder(slot);assert.equal(requests.length,0,fault);
+ }
+});
+
+test('unrelated aggregate stale state does not override fresh selected-stock evidence',()=>{
+ const {ui,symbol}=setup();productionAdmission(ui,symbol);
+ ui.status.market_stale=true;
+ const row=ui.calcSlot(ui.slots[0]);assert(row.ready);
+ assert(ui.manualEntryChecks(row).find(c=>c.key==='data').ok);
+ ui.market[symbol].price_observed_at=now-46;
+ assert(!ui.calcSlot(ui.slots[0]).ready);
+});
+
+test('ATR stop does not require sigma while choosing sigma does',()=>{
+ const {ui,symbol}=setup();productionAdmission(ui,symbol);
+ ui.entryCandidates.rows[0].sigma=null;
+ assert(ui.calcSlot(ui.slots[0]).ready);
+ ui.slots[0].stopMode='vwap_sigma';assert(!ui.calcSlot(ui.slots[0]).ready);
+ ui.entryCandidates.rows[0].sigma=2;assert(ui.calcSlot(ui.slots[0]).ready);
+});
+
+test('VWAP limit choices mirror long and short and submit LMT intent with fixed level',async()=>{
+ for(const sign of [1,-1])for(const level of ['vwap',sign===1?'upper':'lower']){
+  const {ui,symbol,requests}=setup();productionAdmission(ui,symbol,-sign,sign);
+  ui.setCandidateOrderType(0,'LMT');ui.slots[0].limitLevel=level;
+  const row=ui.calcSlot(ui.slots[0]);assert(row.ready,row.blockReason);
+  const price=level==='vwap'?(sign===1?99:101):(sign===1?101:99);
+  assert.equal(row.limitPx,price);assert.equal(row.qty,Math.floor(1000/Math.abs(price-row.stopPx)));
+  await ui.placeOrder(row);assert.equal(requests.length,1);
+  assert.equal(requests[0].body.limit_type,'vwap_limit');assert.equal(requests[0].body.vwap_limit_level,level);
+  assert.equal(requests[0].body.limit_px,price);
+ }
+});
+
+test('wrong-side level, missing sigma, or changing order type during confirmation never sends',async()=>{
+ const {ui,symbol,requests}=setup();productionAdmission(ui,symbol);
+ ui.setCandidateOrderType(0,'LMT');ui.slots[0].limitLevel='lower';
+ assert(!ui.calcSlot(ui.slots[0]).ready);
+ ui.slots[0].limitLevel='upper';ui.entryCandidates.rows[0].sigma=null;
+ assert(!ui.calcSlot(ui.slots[0]).ready);
+ ui.entryCandidates.rows[0].sigma=2;const row=ui.calcSlot(ui.slots[0]);assert(row.ready);
+ ui.confirmSlowMarketEntry=async()=>{ui.setCandidateOrderType(0,'MKT');return true;};
  await ui.placeOrder(row);assert.equal(requests.length,0);
 });
 
-test('EMA9 crossing while the confirmation is open prevents the manual HTTP request',async()=>{
- const {ui,symbol,requests}=setup();productionAdmission(ui,symbol);
- ui.confirmSlowMarketEntry=async()=>{ui.market[symbol].ts.ema_9=101;return true;};
- await ui.placeOrder(ui.calcSlot(ui.slots[0]));assert.equal(requests.length,0);
-});
-
-test('the checklist cannot mark stale or absent EMA9 as a pass and does not borrow the strategy EMA7',()=>{
- for(const fault of ['missing','old','time','version']){
-  const {ui,symbol}=setup();productionAdmission(ui,symbol);
-  const data=ui.market[symbol];data.e9={ema_9:99};
-  if(fault==='missing')delete data.ts.ema_9;
-  if(fault==='old')data.price_observed_at=now-46;
-  if(fault==='time')data.ts.time=minute-300;
-  if(fault==='version')delete ui.entryCandidates.ema9_period;
-  const row=ui.calcSlot(ui.slots[0]);assert(!row.ready);assert.equal(row.qty,0);
-  assert(!ui.manualEntryChecks(row).find(c=>c.key==='ema9').ok);
- }
-});
-
-test('VWAP midline direction is mandatory with outer-band filtering disabled, and both references must agree',()=>{
- for(const [direction,vwap,allowed] of [[1,99,true],[1,100,false],[1,101,false],[-1,101,true],[-1,100,false],[-1,99,false]]){
-  const {ui,symbol}=setup();productionAdmission(ui,symbol,direction,direction);
-  ui.slots[0].vwapOutsideOnly=false;ui.entryCandidates.rows[0].vwap=vwap;
-  const row=ui.calcSlot(ui.slots[0]);assert.equal(row.ready,allowed);
-  assert.equal(ui.manualEntryChecks(row).find(c=>c.key==='vwap_direction').ok,allowed);
-  if(!allowed)assert.match(row.blockReason,/VWAP中线/);
- }
-});
-
-test('VWAP crossing during confirmation and missing direction capability both prevent a manual request',async()=>{
- const {ui,symbol,requests}=setup();productionAdmission(ui,symbol);
- ui.confirmSlowMarketEntry=async()=>{ui.market[symbol].bar.close=98.5;return true;};
- ui.market[symbol].ts.ema_9=98; // Price still above EMA9 after crossing VWAP 99.
- await ui.placeOrder(ui.calcSlot(ui.slots[0]));assert.equal(requests.length,0);
- delete ui.entryCandidates.vwap_direction_required;
- assert(!ui.manualEntryChecks(ui.calcSlot(ui.slots[0])).find(c=>c.key==='vwap_direction').ok);
+test('manual side-view orders retain their source and use VWAP even when ranking direction is opposite',async()=>{
+ const {ui,symbol,requests}=setup();ui.status.candidate_entry_required=true;
+ const row={symbol,side:'short',direction:-1,ranking_direction:1,rank:7,close:100,vwap:101,sigma:2,direction_fact:directionFact(-1,101),
+  td_fact:tdFact(1),bar_time:minute-60,confirmed_at:minute};
+ ui.entryCandidates={...neutralBeta(),ready:true,rows:[]};
+ ui.entryCandidateViews={long:{...neutralBeta(),ready:true,ranking_view:'long',rows:[row]}};
+ ui.openRhythmTrade({symbol,frame:{},view:'long'});
+ assert.equal(ui.slots[0].candidateView,'long');
+ const preview=ui.calcSlot(ui.slots[0]);assert(preview.ready,preview.blockReason);assert.equal(preview.side,'short');
+ assert.equal(preview.candidateView,'long');await ui.placeOrder(preview);
+ assert.equal(requests.length,1);assert.equal(requests[0].body.candidate_view,'long');assert.equal(requests[0].body.side,'short');
 });

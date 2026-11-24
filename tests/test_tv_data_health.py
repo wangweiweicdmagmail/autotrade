@@ -19,7 +19,7 @@ def _collector():
 
 def _tick(close=100.0, bar_time=1_000.0, volume=10):
     return {"type": "tick", "symbols": {
-        "NASDAQ:QQQ": {"bar": {"time": bar_time, "close": close,
+        "NASDAQ:QQQ": {"session":{"requested":"regular","resolved":"regular","accepted":True},"bar": {"time": bar_time, "close": close,
                                 "volume": volume}}}}
 
 
@@ -294,7 +294,7 @@ def test_complete_watchlist_tick_larger_than_four_mb_is_read(monkeypatch):
     async def go():
         c=RealtimeCollector([f'TEST:{i}' for i in range(53)])
         c._running=True
-        payload={'type':'tick','symbols':{symbol:{'bar':{'time':1000,'close':100},
+        payload={'type':'tick','symbols':{symbol:{'session':{'requested':'regular','resolved':'regular','accepted':True},'bar':{'time':1000,'close':100},
                  'history_context':'x'*90000} for symbol in c.symbols}}
         line=(json.dumps(payload)+'\n').encode()
         assert len(line)>4*1024*1024
@@ -344,7 +344,7 @@ def test_24h_feed_rejects_unconfirmed_data_and_removes_prior_quotes():
     c._accept_tick({
         "sessions": {"NASDAQ:QQQ": good, "NASDAQ:MSFT": wrong},
         "symbols": {
-            "NASDAQ:QQQ": {"bar": bar, "session": good},
+            "NASDAQ:QQQ": {"session":{"requested":"regular","resolved":"regular","accepted":True},"bar": bar, "session": good},
             "NASDAQ:MSFT": {"bar": bar, "session": wrong},
         },
     }, now=1001)
@@ -354,7 +354,7 @@ def test_24h_feed_rejects_unconfirmed_data_and_removes_prior_quotes():
 
     c._accept_tick({
         "sessions": {"NASDAQ:QQQ": wrong, "NASDAQ:MSFT": wrong},
-        "symbols": {"NASDAQ:QQQ": {"bar": bar, "session": wrong}},
+        "symbols": {"NASDAQ:QQQ": {"session":{"requested":"regular","resolved":"regular","accepted":True},"bar": bar, "session": wrong}},
     }, now=1002)
     assert c.latest() == {}
     assert c.market_session_status()["confirmed"] == 0

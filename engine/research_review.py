@@ -11,7 +11,8 @@ from engine.research_methods import ResearchNotes
 from execution.state_store import ExecutionStateStore
 
 HUMAN = {'manual_breakeven', 'manual_stop_changed', 'order_close_requested', 'order_close_half', 'order_cancelled'}
-AUTOMATIC = {'candidate_order_protection', 'candidate_order_protection_failed', 'auto_breakeven', 'pyramid_breakeven'}
+AUTOMATIC = {'candidate_order_protection', 'candidate_order_protection_failed', 'auto_breakeven', 'pyramid_breakeven',
+             'intelligent_exit_action', 'intelligent_exit_failed'}
 
 
 def actor(event):
@@ -139,7 +140,7 @@ class ResearchReview:
                                     'interpretation':'unfilled order intent, not an executed entry'}})
             if lot.get('closed_at') and lot.get('avg_fill'):
                 exit_actor = actor({'type':'lot_closed','exit_reason':lot.get('exit_reason')})
-                if str(lot.get('exit_reason','')).startswith(('candidate_', 'breakout_')):
+                if str(lot.get('exit_reason','')).startswith(('candidate_', 'breakout_', 'intelligent_')):
                     exit_actor = 'automatic'
                 actions.append({'id': 'exit:'+key+':'+str(lot['closed_at']), 'kind': 'exit', 'lot_id': key,
                                 'ts': lot['closed_at'], 'actor': exit_actor,

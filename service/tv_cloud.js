@@ -3,7 +3,7 @@
 const fs=require('node:fs'),path=require('node:path');
 const {fetchChart,symbolSession}=require('./history_bars');
 function parseArgs(argv){
- const args={symbols:['NASDAQ:QQQ'],timeframe:'5',range:300,session:'extended',creds:path.join(__dirname,'creds.json'),timeout:25000};
+ const args={symbols:['NASDAQ:QQQ'],timeframe:'5',range:300,session:'regular',creds:path.join(__dirname,'creds.json'),timeout:25000};
  for(let i=2;i<argv.length;i+=2){const key=argv[i].replace(/^--/,'');args[key]=key==='symbols'?argv[i+1].split(','):['range','timeout','to'].includes(key)?Number(argv[i+1]):argv[i+1];}
  if(args.indicators)throw new Error('TV指标订阅已退役；此入口只拉K线，指标使用PineTS');
  if(!['regular','extended','24h','default'].includes(args.session))throw new Error('不支持的行情时段');

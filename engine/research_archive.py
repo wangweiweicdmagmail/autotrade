@@ -54,7 +54,7 @@ class ResearchArchive:
 
     def capture_versions(self):
         root = Path(__file__).resolve().parents[1]
-        names = ('execution/entry_admission.py','execution/candidate_policy.py','engine/pine_execution.py',
+        names = ('execution/entry_admission.py','execution/candidate_policy.py','execution/intelligent_exit.py','engine/pine_execution.py',
                  'execution/operations.py','execution/risk.py','engine/research_calendar.py')
         payload = {'sources': {name:(root/name).read_text() for name in names}, 'runtime':self.runtime_parameters}
         self.store.apply(envelope('definition',payload))

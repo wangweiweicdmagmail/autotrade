@@ -4,7 +4,7 @@ const assert=require('node:assert/strict');
 const fs=require('node:fs/promises');
 const os=require('node:os');
 const path=require('node:path');
-const {calculateSeries: calculateSessionSeries,buildFrame,createMarketRhythm}=require('../service/market_rhythm');
+const {calculateSeries: calculateSessionSeries,buildFrame:buildRealFrame,createMarketRhythm}=require('../service/market_rhythm');
 const calculateSeries=(symbol,bars,now,daily=[])=>calculateSessionSeries(symbol,bars,now,daily,{marketSession:'regular'});
 const {rhythmChartModel,rhythmFormingPoint}=require('../console/static/market-rhythm');
 const OPEN=Date.parse('2026-11-18T14:30:00Z')/1000;
@@ -17,6 +17,121 @@ const rising=Array.from({length:15},(_,i)=>bar(OPEN+i*60,100+i*2));
 const series=(bars,now=OPEN+900,symbol='NASDAQ:TEST')=>calculateSeries(symbol,[...warm,...bars],now,[{time:prior},{time:OPEN}]);
 const scoreHistory=time=>Array.from({length:9},(_,i)=>({time:Math.floor(time/300)*300-(i+1)*300,
   known_at:Math.floor(time/300)*300-i*300,ema9:100-i,atr:2}));
+
+// Synthetic confirmed Pine outputs isolate chart, TD, TV-seat and snapshot behavior.
+function buildFrame(series,symbols,now,histories={},options={}){
+ const openingPositions=Object.fromEntries(Object.values(series).filter(r=>!r.symbol.startsWith('CAPITALCOM:')).map(row=>{
+  const points=row.points||[],p=points.at(-1),first=points.find(q=>q[0]===OPEN);
+  const early=points.filter(q=>q[0]>=OPEN&&q[0]<OPEN+900);
+  const high=Math.max(...early.map(q=>q[5])),low=Math.min(...early.map(q=>q[6])),width=high-low;
+  const position=p&&first?(p[7]-(high+low)/2)/(width/2):NaN;
+  return [row.symbol,{time:p?.[0],ready:early.length===15?1:0,day_open:first?.[4],opening_high:high,opening_low:low,width,
+   position,range_position:position,direction:Math.sign(position),opening_start:OPEN,range_confirmed_at:OPEN+900,range_bars:early.length,midpoint:(high+low)/2}];
+ }));
+ return buildRealFrame(series,symbols,now,histories,{...options,openingPositions});
+}
+
+function benchmarkFrame(){
+ const at=OPEN+900;
+ return {status:'ready',day:'2026-11-18',as_of:at,ranking_snapshot:{version:1,id:'index-minute',as_of:at,day:'2026-11-18'},
+  tracks:['CAPITALCOM:NAS100','CAPITALCOM:SPX500'].map((symbol,i)=>({symbol,is_beta:true,aligned:true,
+   points:[[at-60,100,100,2,100,101,99,100,0,'waiting',0]],
+   td:{version:1,comparison_bars:4,trend_threshold:3,counts:[[at-120,99],[at-60,i?-4:3],[at,25]]}}))};
+}
+
+function liveUi(frame,extra={}) {
+ const {MarketRhythm,rhythmConfirmedTd}=require('../console/static/market-rhythm');
+ const entries=[...(frame?.tracks||[]).map(row=>[row.symbol,rhythmConfirmedTd(row,frame.as_of-60)]),
+  ...(frame?.td_ranking?.ranks||[]).map(r=>[r.symbol,r.td_count])];
+ const rows=Object.fromEntries(entries.map(([symbol,count])=>[symbol,{version:1,source:'confirmed_minute_v1',id:'fact-'+symbol,
+  known:Number.isSafeInteger(count),ready:Number.isSafeInteger(count),count,bar_time:frame.as_of-60,confirmed_at:frame.as_of,
+  quote_bar_time:frame.as_of,observed_at:frame.as_of+1}]));
+ return {...MarketRhythm.methods,frame,now:(frame?.as_of||OPEN)+5,tdSnapshot:{version:1,rows},...extra};
+}
+
+test('a newly accepted snapshot refreshes the visible ranking immediately without repeat TV churn',()=>{
+ const {MarketRhythm}=require('../console/static/market-rhythm');
+ const calls=[],ui={active:true,frame:{ranking_snapshot:{id:'previous'}},refresh:force=>calls.push(force)};
+ MarketRhythm.watch.rankingSnapshotId.call(ui,'new-minute');assert.deepEqual(calls,[true]);
+ ui.frame.ranking_snapshot.id='new-minute';
+ MarketRhythm.watch.rankingSnapshotId.call(ui,'new-minute');
+ MarketRhythm.watch.rankingSnapshotId.call(ui,'');
+ ui.active=false;MarketRhythm.watch.rankingSnapshotId.call(ui,'later-minute');
+ assert.deepEqual(calls,[true]);
+});
+
+test('boundary confirmation preserves the actual receive timestamp independently of calculation time',()=>{
+ const feed=createMarketRhythm({symbols:['NASDAQ:TEST'],clock:()=>OPEN+900});
+ feed.observe('NASDAQ:TEST',rising,OPEN+900,null,[],OPEN+899.472);
+ const fact=feed.confirmedState('NASDAQ:TEST',OPEN+900);
+ assert.equal(fact.time,OPEN+840);assert.equal(fact.received_at,OPEN+899.472);
+ assert.equal(fact.computed_at,OPEN+900);assert.equal(fact.published_at,OPEN+900);
+});
+
+test('two fixed index TD rows use the accepted minute and keep their order through a pending batch',()=>{
+ const {MarketRhythm}=require('../console/static/market-rhythm');
+ const ui=liveUi(benchmarkFrame(),{displayState:{candidateSnapshotId:'index-minute'},locked:true,focus:OPEN});
+ const rows=MarketRhythm.computed.benchmarkRows.call(ui);
+ assert.deepEqual(rows.map(r=>r.symbol),['CAPITALCOM:NAS100','CAPITALCOM:SPX500']);
+ assert.deepEqual(rows.map(r=>r.tdLabel),['TD +3','TD -4']);
+ assert.deepEqual(rows.map(r=>r.tdState),['up','down']);
+ assert(rows.every(r=>r.confirmedAt===OPEN+900));
+ ui.frame.batch_progress={waiting:true,coverage:{aligned:1,total:53}};
+ ui.frame.tracks.reverse();
+ assert.deepEqual(MarketRhythm.computed.benchmarkRows.call(ui),rows);
+ ui.frame.as_of+=60;ui.frame.ranking_snapshot={...ui.frame.ranking_snapshot,id:'next-minute',as_of:ui.frame.as_of};
+ assert.deepEqual(MarketRhythm.computed.benchmarkRows.call(ui),rows); // TD is independent of ranking batches.
+});
+
+test('invalid legacy ranking TD cannot suppress separately published index confirmation values',()=>{
+ const {MarketRhythm}=require('../console/static/market-rhythm');
+ for(const fault of ['missing','duplicate_track','duplicate_count','wrong_minute','gap','wrong_contract','boolean']){
+  const frame=benchmarkFrame(),ui=liveUi(frame),row=frame.tracks[0];
+  if(fault==='missing')frame.tracks.shift();
+  else if(fault==='duplicate_track')frame.tracks.push(row);
+  else if(fault==='duplicate_count')row.td.counts.push([frame.as_of-60,7]);
+  else if(fault==='wrong_minute')row.td.counts.splice(1,1);
+  else if(fault==='gap')row.issue='minute_gap';
+  else if(fault==='wrong_contract')row.td.comparison_bars=3;
+  else row.td.counts[1][1]=true;
+  const rows=MarketRhythm.computed.benchmarkRows.call(ui);
+  assert.equal(rows.length,2);assert.equal(rows[0].tdLabel,'TD +3');assert.equal(rows[1].tdLabel,'TD -4');
+ }
+ assert(MarketRhythm.computed.benchmarkRows.call(liveUi(null)).every(r=>r.tdCount===null));
+ const template=MarketRhythm.template;
+ assert(template.indexOf('v-for="row in benchmarkRows"')<template.indexOf('v-for="row in visibleRankingRows"'));
+ const fixed=template.split('v-for="row in benchmarkRows"')[1].split('v-if="positionOverflow"')[0];
+ assert(!fixed.includes('openRank')&&!fixed.includes('rhythm-open-order'));
+});
+
+test('index EMA9 is projected onto the stock cutoff, without borrowing a later five-minute value',()=>{
+ const now=OPEN+960,stock=series(rising,OPEN+900,'NASDAQ:A');
+ const index=series([...rising,bar(OPEN+900,200)],now,'CAPITALCOM:NAS100');
+ const history=scoreHistory(now);history.push({time:OPEN+900,known_at:OPEN+1200,ema9:999,atr:2});
+ const f=buildFrame({'NASDAQ:A':stock,'CAPITALCOM:NAS100':index},['NASDAQ:A','CAPITALCOM:NAS100'],now,
+  {'CAPITALCOM:NAS100':history,'NASDAQ:A':scoreHistory(OPEN+900)});
+ assert.equal(f.as_of,OPEN+900);
+ assert.equal(f.series['CAPITALCOM:NAS100'].beta_ema9.value,100);
+ assert.equal(f.series['CAPITALCOM:NAS100'].beta_ema9.known_at,f.as_of);
+ assert.equal(f.series['CAPITALCOM:NAS100'].points.at(-1)[0],OPEN+840);
+ assert.deepEqual(f.ranks.map(r=>r.symbol),['NASDAQ:A']);
+});
+
+test('default-session index history supplies confirmed EMA9 and archives it with the minute context',async()=>{
+ const dir=await fs.mkdtemp(path.join(os.tmpdir(),'beta-ema-'));
+ try{
+  const symbol='CAPITALCOM:NAS100',file=path.join(dir,'frame.json');
+  const feed=createMarketRhythm({symbols:[symbol],cachePath:file});
+  feed.observe(symbol,[...warm,...rising],OPEN+900,null,[{time:prior},{time:OPEN}]);
+  const periods=Array.from({length:80},(_,i)=>bar(OPEN+600-i*300,100+i*.01));
+  feed.observeFiveMinute(symbol,periods,new Map(),OPEN+900);await feed.flush(OPEN+905);
+  const frame=JSON.parse(await fs.readFile(file,'utf8')),ref=frame.series[symbol].beta_ema9;
+  assert(ref.value>0);assert.equal(ref.period,9);assert.equal(ref.known_at,OPEN+900);
+  assert.equal(frame.series[symbol].source.session,'default');
+  const {rankingRecord}=require('../service/research_journal');
+  assert.deepEqual(rankingRecord(frame).context[symbol].beta_ema9,ref);
+ }finally{await fs.rm(dir,{recursive:true,force:true});}
+});
 
 test('confirmed prefix is invariant to future prices; single sample cannot create a breakout',()=>{
   const cutoff=OPEN+600;
@@ -35,7 +150,7 @@ test('crossing VWAP ends episode and next breakout starts a separate episode',()
   assert(first.metrics);
   const fail=[...rising,bar(OPEN+900,80)];
   const ended=series(fail,OPEN+960);
-  assert.equal(ended.metrics,null);
+  assert.equal(ended.metrics.direction_sign,-1);
   assert(ended.events.some(e=>e.type==='crossed_vwap'));
   const down=series([...fail,...Array.from({length:12},(_,i)=>bar(OPEN+960+i*60,75-i*2))],OPEN+1680);
   assert.equal(down.metrics.direction_sign,-1);
@@ -49,7 +164,8 @@ test('known minute gaps or missing open stop ranking and do not draw fabricated 
   assert.equal(gap.points.at(-1)[2],null);
   assert.equal(series(rising.slice(1)).issue,'missing_open');
   const noWarm=calculateSeries('TEST',rising,OPEN+900);
-  assert.equal(noWarm.issue,'ema_warmup');assert.equal(noWarm.metrics,null);
+  assert.equal(noWarm.issue,null);assert.equal(noWarm.metrics,null);
+  assert.equal(buildFrame({TEST:noWarm},['TEST'],OPEN+900).ranks.length,1);
 });
 
 test('rank only common-time stocks; ETFs and beta are references',()=>{
@@ -161,17 +277,18 @@ test('accepted score facts retain current strength rank independently of fixed d
   const frame={day:'2026-11-18',as_of:OPEN+900,coverage:{total:2,aligned:2,missing:[]},tracks:[],
     ranks:[{symbol:'NFLX',rank:1,direction_sign:-1,score:70},{symbol:'NVDA',rank:2,direction_sign:-1,score:69}]};
   const prior=rhythmDisplaySlots(null,frame,[]);
-  const next={...frame,as_of:frame.as_of+60,ranks:[{symbol:'NVDA',rank:1,direction_sign:-1,score:88,
+  const next={...frame,as_of:frame.as_of+60,ranks:[{symbol:'NVDA',rank:1,direction_sign:-1,score:2,z:-2,
     classification_rate:1,classification_samples:15,classification_correct:15,ema9_slope_atr:-.5,ema9_bias_atr:-2,
-    score_parts:{vwap:33,slope:35,classification:20}},{symbol:'NFLX',rank:2,direction_sign:-1,score:60}]};
+    vwap_open:100,vwap_aligned_progress_sigma:1,classification_correct:15,
+    score_parts:{position:33,vwap_progress:15,classification:20}},{symbol:'NFLX',rank:2,direction_sign:-1,score:60}]};
   const display=rhythmDisplaySlots(prior,next,[]);
   assert.deepEqual(display.order,['NFLX','NVDA']); // Same ten-minute bucket: no chart reshuffle.
   const ui={frame:next,sourceTracks:{},positions:[],displayState:display};
   const rows=MarketRhythm.computed.rows.call(ui),nvda=rows[1];assert.equal(nvda.rank,2);assert.equal(nvda.candidateRank,1);
   const methods={...MarketRhythm.methods};
   assert(methods.rowDescription.call(methods,nvda).includes('强度#1'));
-  assert(methods.scoreDescription.call(methods,nvda).includes('15/15'));
-  assert(methods.scoreDescription.call(methods,nvda).includes('仅位置参考'));
+  assert(methods.scoreDescription.call(methods,nvda).includes('close'));
+  assert(methods.scoreDescription.call(methods,nvda).includes('VWAP上方只做多'));
 });
 
 test('forming EMA3 is yellow-only data, while TD and confirmed rows remain unchanged',()=>{
@@ -181,7 +298,7 @@ test('forming EMA3 is yellow-only data, while TD and confirmed rows remain uncha
   const saved=JSON.stringify(track);
   const raw={bar:{time,open:100,high:105,low:99,close:104},price_observed_at:time+5};
   const forming=rhythmFormingPoint(track,raw,time,time+5);
-  assert.equal(forming.ema3,102);assert.equal(forming.z,1.5);
+  assert.equal(forming.ema3,102);assert.equal(forming.z,2.5);
   assert.deepEqual(Object.keys(forming).sort(),['ema3','time','z']);
   for(const view of ['price','position']){
     const plot=rhythmChartModel({...track,forming},time-60,time,view,500,150,[-2,3],point[0]);
@@ -248,7 +365,7 @@ test('index minute requests omit session and preload enough overnight history fo
   assert.equal(index.timeframe,'1');
   assert.equal('session' in index,false);
   assert(index.range>=3000);
-  assert.deepEqual(minuteSubscriptionOptions(false),{timeframe:'1',range:4000,session:'extended'});
+  assert.deepEqual(minuteSubscriptionOptions(false),{timeframe:'1',range:4000,session:'regular'});
 });
 
 test('premarket historical curves are distinct from stale RTH data',()=>{
@@ -273,7 +390,7 @@ test('native six-pane focus and eight-pane candidate targets retain their separa
   assert.deepEqual(ui.tvSymbols,['S8','S6','S4','S2','S9','S7','S5','S3']);
   ui.choose('S5');
   assert.deepEqual(ui.tracks.slice(2).map(t=>t.symbol),['S0','S1']);
-  assert.deepEqual(emitted.at(-1),['select','S5']);
+  assert.deepEqual(emitted.at(-1),['select','S5',{view:'mixed'}]);
   ui.publishGrid();assert.deepEqual(emitted.at(-1),['grid',{symbols:ui.tvSymbols,focusSymbols:ui.focusSymbols,force:false}]);
   const oldKey=ui.gridKey;
   ui.frame.ranks=rows.map(r=>({...r,rank:r.rank===3?4:r.rank===4?3:r.rank}));
@@ -284,7 +401,7 @@ test('native six-pane focus and eight-pane candidate targets retain their separa
   const count=emitted.length;ui.frame.ranks=rows.slice(0,6);ui.frame.as_of+=60;ui.reconcileDisplay();ui.publishGrid();
   assert.equal(emitted.length,count+1); // The six-pane focus layout remains usable while eight ranks are incomplete.
   assert.deepEqual(emitted.at(-1)[1].symbols,[]);
-  assert.deepEqual(emitted.at(-1)[1].focusSymbols,['S0','CAPITALCOM:NAS100','CAPITALCOM:SPX500','S1','NASDAQ:QQQ','AMEX:SPY']);
+  assert.deepEqual(emitted.at(-1)[1].focusSymbols,['S0','CAPITALCOM:NAS100','CAPITALCOM:SPX500','S1','NASDAQ:QQQ','NASDAQ:NVDA']);
   assert.equal(ui.tracks.length,4);
 });
 
@@ -294,7 +411,7 @@ test('ranking actions select independently and open the manual card for any of t
   const ui={frame,$emit:(...event)=>emitted.push(event)};
   MarketRhythm.methods.openRank.call(ui,{symbol:'NASDAQ:NVDA',direction_sign:1,rank:10});
   assert.equal(ui.selected,'NASDAQ:NVDA');
-  assert.deepEqual(emitted,[['select','NASDAQ:NVDA'],['open',{symbol:'NASDAQ:NVDA',frame}]]);
+  assert.deepEqual(emitted,[['select','NASDAQ:NVDA',{view:'mixed'}],['open',{symbol:'NASDAQ:NVDA',frame,view:'mixed'}]]);
   MarketRhythm.methods.openRank.call(ui,{symbol:'NASDAQ:MSFT',direction_sign:0});
   assert.equal(emitted.length,2);
   assert(!RhythmTrack.template.includes('rhythm-open-order'));
@@ -361,6 +478,32 @@ test('a provider maintenance break at the daily anchor does not force a fake 09:
 
 const {rhythmPositions,rhythmDisplaySlots,rhythmRankingReady}=require('../console/static/market-rhythm');
 const rankedFrame=(symbols,as_of=OPEN+60)=>({day:'2026-11-18',as_of,coverage:{total:53,aligned:53,missing:[]},ranks:symbols.map((symbol,i)=>({symbol,rank:i+1,direction_sign:1}))});
+
+test('server snapshot identity replaces legacy cached membership and is immutable for the same minute',()=>{
+  const {rhythmDisplaySlots}=require('../console/static/market-rhythm');
+  const a=rankedFrame(['A','B']),legacy=rhythmDisplaySlots(null,a,[]);
+  const server={...rankedFrame(['C','B']),ranking_snapshot:{version:1,id:'accepted-a',as_of:a.as_of,day:a.day}};
+  const one=rhythmDisplaySlots(legacy,server,[]);
+  const two=rhythmDisplaySlots(null,server,[]);
+  assert.deepEqual(one.candidateRows,two.candidateRows);
+  assert.equal(one.candidateSnapshotId,'accepted-a');
+  assert.deepEqual(one.candidates,['C','B']);
+  const ignored=rhythmDisplaySlots(one,{...server,ranks:rankedFrame(['D','E']).ranks},[]);
+  assert.deepEqual(ignored.candidateRows,one.candidateRows);
+});
+
+test('pending progress never replaces accepted scores, TD or TV slots',()=>{
+  const {rhythmDisplaySlots,MarketRhythm}=require('../console/static/market-rhythm');
+  const first=rankedFrame(['A','B']);
+  first.ranking_snapshot={version:1,id:'accepted-first',day:first.day,as_of:first.as_of};
+  const before=rhythmDisplaySlots(null,first,[]);
+  const pending={...first,batch_progress:{waiting:true,as_of:first.as_of+60,
+    coverage:{total:53,aligned:52,missing:['LATE']},message:'等待数据'}};
+  const after=rhythmDisplaySlots(before,pending,[]);
+  assert.deepEqual(after,before);
+  assert.equal(MarketRhythm.computed.rankingPending.call({frame:pending}),true);
+  assert.equal(MarketRhythm.computed.rankingProgress.call({frame:pending}).aligned,52);
+});
 const rankedSymbols=Array.from({length:10},(_,i)=>'NASDAQ:S'+i);
 const held=(symbol,openedAt=1)=>({symbol,qty:10,side:'long',openedAt});
 
@@ -428,7 +571,7 @@ test('twelve holdings fit across reference and candidate cells and shortages nev
  assert.deepEqual(empty.order,[]);assert.deepEqual(empty.referenceSlots,['NASDAQ:X','']);
 });
 
-test('reference cells keep their occupants in place, promote overflow on exit and restore QQQ and SPY when flat',()=>{
+test('reference cells keep their occupants in place, promote overflow on exit and restore QQQ and NVDA when flat',()=>{
  const frame=rankedFrame(rankedSymbols),positions=['X','Y','Z'].map(s=>held('NASDAQ:'+s));
  const initial=rhythmDisplaySlots(null,frame,positions);
  const promoted=rhythmDisplaySlots(initial,frame,positions.slice(1));
@@ -442,7 +585,7 @@ test('reference cells keep their occupants in place, promote overflow on exit an
  assert.deepEqual(MarketRhythm.computed.focusSymbols.call(ui),
   ['NASDAQ:S0','CAPITALCOM:NAS100','CAPITALCOM:SPX500','NASDAQ:S1','NASDAQ:QQQ','NASDAQ:Y']);
  ui.displayState=rhythmDisplaySlots(one,frame,[]);
- assert.deepEqual(MarketRhythm.computed.focusSymbols.call(ui).slice(4),['NASDAQ:QQQ','AMEX:SPY']);
+ assert.deepEqual(MarketRhythm.computed.focusSymbols.call(ui).slice(4),['NASDAQ:QQQ','NASDAQ:NVDA']);
 });
 
 test('a holding in the top ten retains its candidate seat as well as the dedicated position cell',()=>{
@@ -567,4 +710,161 @@ test('holdings still take priority during an incomplete minute without admitting
  const overflow=rhythmDisplaySlots(pinned,partial,[held('NASDAQ:POSITION'),held('NASDAQ:SECOND'),held('NASDAQ:THIRD')]);
  assert.deepEqual(overflow.referenceSlots,['NASDAQ:POSITION','NASDAQ:SECOND']);
  assert.equal(overflow.order[0],'NASDAQ:THIRD');assert(!overflow.order.includes('NASDAQ:PROVISIONAL'));
+});
+
+test('position exit TD reuses confirmed individual series without waiting for ranking coverage',()=>{
+ const feed=createMarketRhythm({symbols:['NASDAQ:A','NASDAQ:MISSING'],marketSession:'regular'});
+ const now=OPEN+900,expected=series(rising,now,'NASDAQ:A').td.counts.at(-1);
+ feed.observe('NASDAQ:A',[...warm,...rising,bar(now,9999)],now);
+ const td=feed.confirmedTd('NASDAQ:A',now);
+ assert.equal(td.time,expected[0]);assert.equal(td.count,expected[1]);assert.equal(td.comparison_bars,4);
+ assert.equal(td.interval_seconds,60);assert.equal(td.session,'regular');
+ feed.observe('NASDAQ:A',[...warm,...rising,bar(now,1)],now+1);
+ assert.deepEqual(feed.confirmedTd('NASDAQ:A',now+1),td);
+ assert.equal(feed.confirmedTd('NASDAQ:A',now+106),null);
+ assert.equal(feed.confirmedTd('NASDAQ:MISSING',now),null);
+ feed.reset('NASDAQ:A');assert.equal(feed.confirmedTd('NASDAQ:A',now),null);
+});
+
+test('confirmed entry and exit observations publish without a full ranking or a following candle',()=>{
+ const now=OPEN+900;let clock=now+.02;
+ const feed=createMarketRhythm({symbols:['NASDAQ:A','NASDAQ:MISSING'],marketSession:'regular',clock:()=>clock});
+ feed.observe('NASDAQ:A',[...warm,...rising,bar(now,9999)],now+.01);
+ clock=now+.03;const fact=feed.confirmedState('NASDAQ:A',clock);
+ assert.equal(fact.time,now-60);assert.equal(fact.close,rising.at(-1).close);
+ assert.equal(fact.td_count,feed.confirmedTd('NASDAQ:A',clock).count);
+ assert.equal(fact.received_at,now+.01);assert.equal(fact.computed_at,now+.02);assert.equal(fact.published_at,now+.03);
+ assert.equal(feed.confirmedState('NASDAQ:MISSING',clock),null);
+ clock=now+1;feed.observe('NASDAQ:A',[...warm,...rising,bar(now,1)],clock);
+ assert.equal(feed.confirmedState('NASDAQ:A',clock).td_count,fact.td_count); // Unclosed prices never change confirmed TD.
+ assert.equal(feed.confirmedState('NASDAQ:A',clock).published_at,fact.published_at);
+ feed.reset('NASDAQ:A');assert.equal(feed.confirmedState('NASDAQ:A',clock),null);
+});
+
+test('TD display retains the known confirmation while stale or future data cannot grant entry readiness',()=>{
+ const {rhythmTdFact}=require('../console/static/market-rhythm');
+ const now=OPEN+900,fact={version:1,source:'confirmed_minute_v1',id:'same-confirmed-value',known:true,ready:true,
+  count:3,bar_time:now-60,confirmed_at:now,quote_bar_time:now,observed_at:now+1};
+ assert(rhythmTdFact(fact,now+5).ready);
+ const stale=rhythmTdFact(fact,now+50);assert(stale.known);assert.equal(stale.count,3);assert.equal(stale.ready,false);
+ assert.equal(rhythmTdFact({...fact,bar_time:now,confirmed_at:now+60},now+5).known,false);
+ assert.equal(rhythmTdFact({...fact,source:'unknown'},now+5).ready,false);
+});
+
+test('exit TD rejects a minute gap instead of inventing a fresh count',()=>{
+ const feed=createMarketRhythm({symbols:['NASDAQ:A'],marketSession:'regular'});
+ feed.observe('NASDAQ:A',[...warm,...rising.filter((_,i)=>i!==4)],OPEN+900);
+ assert.equal(feed.confirmedTd('NASDAQ:A',OPEN+900),null);
+});
+
+test('index gaps cannot crash the whole feed when the speed reference minute is absent',()=>{
+ const make=(time,close)=>({time,open:close,high:close+.1,low:close-.1,close,volume:100});
+ const old=Array.from({length:40},(_,i)=>make(OPEN-86400+i*60,100+i));
+ const today=Array.from({length:45},(_,i)=>make(OPEN+i*60,200+i*2)).filter(b=>b.time!==OPEN+41*60);
+ const row=calculateSessionSeries('CAPITALCOM:NAS100',[...old,...today],OPEN+2700,[{time:OPEN-86400},{time:OPEN}]);
+ assert.equal(row.issue,null);assert(row.metrics);assert.equal(row.metrics.rail_speed,0);
+ assert.equal(row.last_closed,OPEN+2640);
+});
+
+test('explicit extended historical inputs can still calculate premarket curves without changing regular defaults',async()=>{
+ const bars=Array.from({length:100},(_,i)=>bar(OPEN-19800+i*120,100+i));
+ const now=bars.at(-1).time+60,pre=calculateSessionSeries('NASDAQ:A',bars,now,[],{marketSession:'extended'});
+ assert.equal(pre.ranking_phase,'premarket');assert.equal(pre.issue,null);assert(pre.metrics);
+ const hs=Array.from({length:12},(_,i)=>({time:Math.floor(now/300)*300-(i+1)*300,
+  known_at:Math.floor(now/300)*300-i*300,ema9:100-i,atr:2}));
+ const f=buildFrame({'NASDAQ:A':pre},['NASDAQ:A','NASDAQ:MISSING'],now+10,{'NASDAQ:A':hs},{marketSession:'extended'});
+ assert.equal(f.ranking_session.phase,'premarket');assert.equal(f.ranking_session.cohort,'available');
+ assert.deepEqual(f.ranks,[]);assert.equal(f.scoring.pending[0].reason,'opening_range_regular_only');assert.equal(f.coverage.aligned,1);
+ assert.deepEqual(f.coverage.missing,['NASDAQ:MISSING']);
+ assert.equal(f.scoring.model,'opening15_midpoint_v7');
+ const {rhythmDisplaySlots,rhythmRankingReady}=require('../console/static/market-rhythm');
+ f.ranking_snapshot={version:1,id:'pre-accepted',as_of:f.as_of,day:f.day};
+ assert(rhythmRankingReady(f));assert.deepEqual(rhythmDisplaySlots(null,f).candidates,[]);
+ const dir=await fs.mkdtemp(path.join(os.tmpdir(),'pre-batch-'));
+ try{
+  const file=path.join(dir,'frame.json'),feed=createMarketRhythm({symbols:['NASDAQ:A'],cachePath:file,marketSession:'extended'});
+  feed.observe('NASDAQ:A',bars,now);
+  await feed.flush(now+4);await assert.rejects(fs.readFile(file),/ENOENT/);
+  await feed.flush(now+10);assert.equal(JSON.parse(await fs.readFile(file)).ranking_session.phase,'premarket');
+ }finally{await fs.rm(dir,{recursive:true,force:true});}
+});
+
+test('one invalid perception series is removed without terminating other candle processing',()=>{
+ const errors=[],feed=createMarketRhythm({symbols:['BAD','NASDAQ:A'],marketSession:'regular',onError:e=>errors.push(e)});
+ assert.doesNotThrow(()=>feed.observe('BAD',[bar(1e15,100)],1e15+120));
+ assert.equal(errors.length,1);assert.equal(errors[0].symbol,'BAD');
+ feed.observe('NASDAQ:A',[...warm,...rising],OPEN+900);
+ assert(feed.confirmedTd('NASDAQ:A',OPEN+900));
+});
+
+test('only trend rows are shown and retired board controls are absent',()=>{
+ const {MarketRhythm}=require('../console/static/market-rhythm');
+ const rows=[{symbol:'NASDAQ:A'}];
+ assert.equal(MarketRhythm.computed.visibleRankingRows.call({rankingRows:rows}),rows);
+ assert.equal(MarketRhythm.methods.setRankMode,undefined);
+ assert.equal(MarketRhythm.methods.setTdSide,undefined);
+ assert.doesNotMatch(MarketRhythm.template,/setRankMode|setTdSide|TD榜/);
+});
+
+test('side filters select full-pool top tens without changing mixed TV seats and carry the source on manual open',()=>{
+ const {MarketRhythm,rhythmDisplaySlots}=require('../console/static/market-rhythm');
+ const at=OPEN+1200,make=(symbol,rank,d)=>({symbol,rank,direction_sign:d,opening_position:d*(2-rank*.1)});
+ const mixed=[make('NASDAQ:A',1,1),make('NASDAQ:B',2,-1)],long=[make('NASDAQ:A',1,1),make('NASDAQ:L',2,1)],short=[make('NASDAQ:B',1,-1)];
+ const frame={status:'ready',day:'2026-11-18',as_of:at,ranking_snapshot:{version:1,id:'same-three-views',as_of:at,day:'2026-11-18'},
+  coverage:{total:3,aligned:3,missing:[]},ranks:mixed,rankings:{mixed,long,short},tracks:[],ranking_tracks:[],symbols:['NASDAQ:A','NASDAQ:B','NASDAQ:L']};
+ const emitted=[],ui={...MarketRhythm.data(),...MarketRhythm.methods,frame,lots:[],positionsReady:true,market:{},now:at+5,
+  directionSnapshot:{rows:{'NASDAQ:L':{version:1,source:'confirmed_vwap_direction_v1',id:'live-L',known:true,ready:true,close:100,vwap:101,direction:-1,
+   bar_time:at-60,confirmed_at:at,quote_bar_time:at,observed_at:at+1}}},tdSnapshot:{rows:{}},$emit:(...args)=>emitted.push(args)};
+ for(const [name,get]of Object.entries(MarketRhythm.computed))Object.defineProperty(ui,name,{get:()=>get.call(ui)});
+ ui.displayState=rhythmDisplaySlots(null,frame,[]);const original=ui.tvSymbols.join(',');
+ assert.deepEqual(ui.rankingRows.map(r=>r.symbol),['NASDAQ:A','NASDAQ:B']);
+ ui.rankingView='long';assert.deepEqual(ui.rankingRows.map(r=>r.symbol),['NASDAQ:A','NASDAQ:L']);
+ assert.equal(ui.tvSymbols.join(','),original);const row=ui.rankingRows[1];assert.equal(row.direction_sign,1);assert.equal(row.entryDirection,-1);
+ ui.openRank(row);assert.equal(emitted.at(-1)[1].view,'long');assert.equal(emitted.at(-1)[1].symbol,'NASDAQ:L');
+ ui.rankingView='short';assert.deepEqual(ui.rankingRows.map(r=>r.symbol),['NASDAQ:B']);assert.equal(ui.tvSymbols.join(','),original);
+ assert.equal(MarketRhythm.data().rankingView,'mixed');
+});
+
+test('the ranking may open a card before the trading window while actual entry timing remains separate',()=>{
+ const {rhythmEntryWindow,MarketRhythm}=require('../console/static/market-rhythm');
+ const time=s=>Date.parse(s)/1000;
+ for(const day of ['2026-10-07','2026-11-18']){
+  const offset=day.includes('10-07')?'-04:00':'-05:00';
+  assert.equal(rhythmEntryWindow(time(day+'T09:44:59'+offset)),false);
+  assert.equal(rhythmEntryWindow(time(day+'T09:45:00'+offset)),true);
+  assert.equal(rhythmEntryWindow(time(day+'T16:00:00'+offset)),false);
+ }
+ const events=[],ui={entryWindowOpen:false,$emit:(...args)=>events.push(args),manageRank:r=>events.push(['manage',r.symbol])};
+ MarketRhythm.methods.openRank.call(ui,{symbol:'NASDAQ:A',direction_sign:1});assert.equal(events.length,2);
+ assert.equal(events[1][0],'open');
+ MarketRhythm.methods.openRank.call(ui,{symbol:'NASDAQ:HELD',isHeld:true});assert.deepEqual(events.at(-1),['manage','NASDAQ:HELD']);
+});
+
+test('ranking entry opens a card regardless of TD sign, missing TD or direction readiness',()=>{
+ const {MarketRhythm}=require('../console/static/market-rhythm');
+ const frame={rankings:{mixed:[{symbol:'NASDAQ:A',rank:1,direction_sign:1}]}},events=[];
+ const ui={...MarketRhythm.methods,frame,rankingView:'mixed',positions:[],rows:[],entryWindowOpen:false,
+  liveDirection:()=>({known:true,ready:false,direction:1,reason:'freshness is checked in the card'}),
+  tdTitle:()=>'', $emit:(...args)=>events.push(args)};
+ for(const td of [null,-4,0,4]){
+  ui.liveTd=()=>({count:td,ready:false});
+  const row=MarketRhythm.computed.rankingRows.call(ui)[0];assert.equal(row.entryDirection,1);
+  MarketRhythm.methods.openRank.call(ui,row);assert.equal(events.at(-1)[0],'open');
+ }
+ ui.liveDirection=()=>({known:false,ready:false,direction:0});
+ const row=MarketRhythm.computed.rankingRows.call(ui)[0];assert.equal(row.entryDirection,0);
+ MarketRhythm.methods.openRank.call(ui,row);assert.equal(events.at(-1)[0],'open');
+ const button=MarketRhythm.template.match(/<button[^>]*class="rhythm-open-order"[\s\S]*?<\/button>/)[0];
+ assert(!button.includes(':disabled'));assert(!button.includes('待确认'));
+ assert(button.includes('TD仅供参考'));
+});
+
+test('new client refuses an old scoring model instead of presenting its rows as the new ranking',async t=>{
+ const {MarketRhythm}=require('../console/static/market-rhythm');
+ const original=global.fetch;t.after(()=>{global.fetch=original;});
+ global.fetch=async()=>({ok:true,json:async()=>({status:'ready',scoring:{model:'vwap_open_ema5_v6',version:6}})});
+ const ui={...MarketRhythm.data(),...MarketRhythm.methods,active:true,requestId:0,positions:[],$emit(){}};
+ await ui.refresh();assert.equal(ui.frame,null);assert.match(ui.error,/重启控制台/);
+ ui.displayState={candidateRows:[{symbol:'NASDAQ:OLD'}]};ui.rows=[];ui.liveTd=()=>({count:null});
+ assert.deepEqual(MarketRhythm.computed.rankingRows.call(ui),[]);
 });

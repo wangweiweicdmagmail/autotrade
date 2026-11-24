@@ -9,13 +9,21 @@ function canonical(value){
 const digest=value=>crypto.createHash('sha256').update(typeof value==='string'?value:JSON.stringify(canonical(value))).digest('hex');
 function rankingRecord(frame){
   const c=frame?.coverage,s=frame?.scoring;
-  if(!frame?.as_of||frame.as_of%60||!c||c.total<=0||c.aligned!==c.total||c.missing?.length||!s||!Array.isArray(s.pending)||s.pending.length)return null;
-  const symbols=[...(frame.beta||[]),...(frame.ranks||[]).map(r=>r.symbol)];
+  if(!frame?.as_of||frame.as_of%60||!c||c.total<=0||!s||!Array.isArray(s.pending))return null;
+  const pre=frame.ranking_session?.phase==='premarket';
+  if(pre){
+    if(frame.ranking_session.cohort!=='available'||frame.generated_at<frame.as_of+10
+      ||!Number.isInteger(c.aligned)||c.aligned<=0||c.aligned>c.total
+      ||!Array.isArray(c.missing)||c.missing.length!==c.total-c.aligned)return null;
+  }else if(c.aligned!==c.total||c.missing?.length||s.pending.length)return null;
+  const symbols=[...(frame.beta||[]),...Object.values(frame.rankings||{mixed:frame.ranks||[]}).flat().map(r=>r.symbol)];
   const context=Object.fromEntries(symbols.map(symbol=>{
     const series=frame.series?.[symbol],points=series?.points||[];
-    return [symbol,{point:points.findLast(p=>p[0]+60<=frame.as_of)||null,source:series?.source||null}];
+    return [symbol,{point:points.findLast(p=>p[0]+60<=frame.as_of)||null,source:series?.source||null,
+      ...(series?.beta_ema9?{beta_ema9:series.beta_ema9}:{})}];
   }));
-  const payload={day:frame.day,as_of:frame.as_of,scoring:s,coverage:c,ranks:frame.ranks,context};
+  const payload={day:frame.day,as_of:frame.as_of,scoring:s,coverage:c,ranks:frame.ranks,...(frame.rankings?{rankings:frame.rankings}:{}),context,
+    ...(frame.ranking_session?{ranking_session:frame.ranking_session,universe:frame.universe}:{})};
   return {...payload,batch_id:digest(payload),published_at:frame.generated_at};
 }
 function createResearchJournal(directory,{maxPending=2048,maxPendingBytes=32*1024*1024,onError=()=>{},clock=()=>Date.now()/1000}={}){

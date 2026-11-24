@@ -3,7 +3,7 @@
 const {isPriceUpdate,chartSession}=require('./chart_snapshot');
 const {candle}=require('./pinets_live');
 
-async function fetchChart(client,symbol,{timeframe='5',range=601,to=0,session='extended',timeout=25000}={}) {
+async function fetchChart(client,symbol,{timeframe='5',range=601,to=0,session='regular',timeout=25000,replay=false}={}) {
   const chart=new client.Session.Chart();
   let timer;
   try {
@@ -21,7 +21,7 @@ async function fetchChart(client,symbol,{timeframe='5',range=601,to=0,session='e
           bars:periods.slice(0,range).map(candle).sort((a,b)=>a.time-b.time)});
       });
       chart.setMarket(symbol,{timeframe,range,session:session==='default'?undefined:session,
-        adjustment:'splits',...(to>0?{to}:{})});
+        adjustment:'splits',...(to>0?(replay?{replay:to}:{to}):{})});
     });
   } finally {clearTimeout(timer);chart.delete();}
 }
@@ -37,6 +37,6 @@ async function fetchDataset(client,symbol,options={}) {
   return {symbol,...data,daily:daily.bars};
 }
 function symbolSession(symbol,options={}){
-  return (options['default-session-symbols']||'').split(',').includes(symbol)?'default':options.session??'extended';
+  return (options['default-session-symbols']||'').split(',').includes(symbol)?'default':options.session??'regular';
 }
 module.exports={fetchChart,fetchDataset,symbolSession};

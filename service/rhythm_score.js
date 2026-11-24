@@ -1,11 +1,13 @@
 'use strict';
 
 const {emaFromPeriods}=require('./ema');
-const SCORE_MODEL='ema9_15m_v3';
-const SCORE_CONTRACT=Object.freeze({model:SCORE_MODEL,version:3,ema_period:9,ema_interval_seconds:300,
-  classification_interval_seconds:60,classification_window_seconds:900,
-  weights:Object.freeze({vwap:.3,slope:.5,classification:.2}),bias_scored:false,
-  direction_rule:'close_vs_vwap_and_ema9'});
+const {stockSession}=require('./market_session');
+const SCORE_MODEL='opening15_midpoint_v7';
+const SCORE_CONTRACT=Object.freeze({model:SCORE_MODEL,version:7,price_source:'close',interval_seconds:60,
+  normalization:'(close-(opening15_high+opening15_low)/2)/((opening15_high-opening15_low)/2)',sort:'abs_position_desc_then_symbol',score_unit:'opening_range_half_width',
+  weights:Object.freeze({opening_position:1}),direction_rule:'close_vs_opening_midpoint',zero_anchor:'opening15_midpoint',
+  opening_window_minutes:15,opening_range_unit:'half_width',source:'pinets:opening_position',
+  views:Object.freeze(['mixed','long','short'])});
 const positive=n=>Number.isFinite(n)&&n>0;
 
 // Raw TV periods are newest first. ATR is the existing confirmed PineTS output.
@@ -24,53 +26,60 @@ function fiveMinuteHistory(periods,atrByTime,now){
   return out.sort((a,b)=>a.time-b.time);
 }
 
-function scoreInputs(points,history,d,asOf){
-  const unavailable=reason=>({ready:false,reason});
-  if(![-1,1].includes(d)||!Number.isFinite(asOf)||asOf%60!==0)return unavailable('score_alignment');
-  const byTime=new Map();
-  for(const p of history||[])if(Number.isFinite(p?.known_at)&&p.known_at<=asOf
-      &&p.time%300===0&&p.known_at===p.time+300){
-    if(byTime.has(p.known_at))return unavailable('score_duplicate_5m');
-    byTime.set(p.known_at,p);
-  }
-  const known=Math.floor(asOf/300)*300,b=byTime.get(known);
-  // EMA periods count actual bars, including sparse premarket trading. The
-  // classification references below still require exact five-minute anchors.
-  const prior=[...byTime.values()].filter(q=>positive(q.ema9)).sort((a,b)=>a.known_at-b.known_at).at(-4);
-  if(!positive(b?.ema9)||!positive(prior?.ema9)||!positive(b?.atr))return unavailable('score_5m_pending');
-  const minutes=new Map();
-  for(const p of points||[])if(p[0]>=asOf-900&&p[0]+60<=asOf){
-    if(minutes.has(p[0]))return unavailable('score_duplicate_1m');
-    minutes.set(p[0],p);
-  }
-  // The published points contain only the current RTH day. At the open use an
-  // explicit partial window; never borrow yesterday/overnight minutes to fill it.
-  const first=Math.min(...(points||[]).filter(p=>p[0]+60<=asOf).map(p=>p[0]));
-  const start=Math.max(first,asOf-900);
-  let n=0,correct=0;
-  for(let t=start;t<asOf;t+=60){
-    const p=minutes.get(t),ref=byTime.get(Math.floor((t+60)/300)*300);
-    if(!positive(p?.[7])||!positive(ref?.ema9))return unavailable('score_classification_pending');
-    n++;correct+=d*(p[7]-ref.ema9)>0;
-  }
-  if(!n||n>15)return unavailable('score_classification_pending');
-  const slope=(b.ema9-prior.ema9)/(3*b.atr),u=Math.max(0,d*slope);
-  const latest=minutes.get(asOf-60);
-  if(latest?.[0]+60!==asOf||!positive(latest?.[7]))return unavailable('score_alignment');
-  return {ready:true,reason:null,ema9_5m:b.ema9,ema9_known_at:known,ema9_atr:b.atr,
-    ema9_slope_atr:slope,ema9_aligned_slope:d*slope,ema9_slope_score:100*u/(u+.1),
-    classification_rate:correct/n,classification_correct:correct,classification_samples:n,
-    classification_start_bar:start,classification_end_bar:asOf-60,classification_score:100*correct/n,
-    // Latest confirmed 1m close against the latest confirmed 5m EMA9: position only.
-    ema9_bias_atr:(latest[7]-b.ema9)/b.atr,ema9_bias_pct:100*(latest[7]/b.ema9-1)};
-}
-function applyScore(baseScore,facts){
-  const weights=SCORE_CONTRACT.weights;
-  const parts={vwap:weights.vwap*baseScore,slope:weights.slope*facts.ema9_slope_score,
-    classification:weights.classification*facts.classification_score};
-  return {...facts,vwap_score:baseScore,score:parts.vwap+parts.slope+parts.classification,score_parts:parts};
-}
-function compareScores(a,b){return b.score-a.score||b.ema9_aligned_slope-a.ema9_aligned_slope
-  ||b.classification_rate-a.classification_rate||b.vwap_score-a.vwap_score||a.symbol.localeCompare(b.symbol);}
 
-module.exports={SCORE_MODEL,SCORE_CONTRACT,fiveMinuteHistory,scoreInputs,applyScore,compareScores};
+// Consume the same confirmed Z plotted in the perception series. No episode,
+// five-minute EMA/ATR, cross-section percentile or persistence window is needed.
+function scorePosition(point,asOf){
+  if(!Array.isArray(point)||point.length!==11||!Number.isFinite(asOf)||asOf%60!==0
+    ||point[0]+60!==asOf||!positive(point[7])||!positive(point[2])||!positive(point[3])
+    ||point[3]<=Math.max(1e-10,Math.abs(point[2])*1e-12)||!Number.isFinite(point[8]))return null;
+  const z=point[8];if(z===0)return null;
+  return {ready:true,z,score:Math.abs(z),score_parts:{vwap:Math.abs(z)},
+    direction_sign:z>0?1:-1,direction_price:point[7],direction_vwap:point[2],
+    price_source:SCORE_CONTRACT.price_source,phase:point[9],bar_time:point[0],confirmed_at:asOf};
+}
+// EMA5 is read from the existing PineTS trend worker, never recomputed in JS/Python.
+function fiveMinuteEma5History(periods,emaByTime,now){
+  if(!Array.isArray(periods)||!(emaByTime instanceof Map))return [];
+  const unique=new Map();
+  for(const p of periods){
+    const value=emaByTime.get(p?.time);
+    if(Number.isFinite(p?.time)&&p.time%300===0&&p.time+300<=now&&positive(value)
+      &&positive(p.close)&&!unique.has(p.time))unique.set(p.time,{time:p.time,known_at:p.time+300,ema5:value});
+  }
+  return [...unique.values()].sort((a,b)=>a.time-b.time);
+}
+
+const distanceScore=x=>{const n=Math.max(0,x);return 100*(1-1/(1+n));};
+function scoreTrend(row,output,asOf){
+  const point=row?.points?.findLast(p=>p[0]+60<=asOf);
+  if(!point||point[0]+60!==asOf||!positive(point[7]))return {ready:false,reason:'opening_position_minute_pending'};
+  const scope=stockSession(point[0],'regular'),opening=point[0]-(scope.minute-570)*60;
+  if(!scope.regular)return {ready:false,reason:'opening_range_regular_only'};
+  if(asOf<opening+900)return {ready:false,reason:'opening_range_forming',completed_minutes:Math.max(0,(asOf-opening)/60)};
+  if(!output||output.time!==point[0])return {ready:false,reason:'opening_position_pinets_pending'};
+  if(output.ready!==1)return {ready:false,reason:'opening_range_incomplete'};
+  const {day_open:open,opening_high:high,opening_low:low,width,position}=output;
+  if(![open,high,low,width].every(positive)||high<open||low>open||high<=low
+    ||!Number.isFinite(position)||output.opening_start!==opening||output.range_confirmed_at!==opening+900
+    ||output.range_bars!==15||Math.abs(width-(high-low))>Math.max(1e-7,width*1e-9)
+    ||!Number.isFinite(output.range_position)||Math.abs(output.range_position-position)>1e-7
+    ||Math.abs(position-(point[7]-(high+low)/2)/(width/2))>Math.max(1e-6,Math.abs(position)*1e-8))
+      return {ready:false,reason:'opening_position_invalid'};
+  const direction=Math.sign(position);
+  if(output.direction!==direction)return {ready:false,reason:'opening_position_direction_mismatch'};
+  return {ready:true,score:Math.abs(position),score_parts:{opening_position:Math.abs(position)},
+    opening_position:position,range_position:output.range_position,from_open_position:output.from_open_position,day_open:open,opening_high:high,opening_low:low,opening_width:width,
+    opening_midpoint:output.midpoint,opening_start:opening,range_confirmed_at:opening+900,
+    direction_sign:direction,direction_price:point[7],direction_open:open,direction_midpoint:(high+low)/2,
+    direction_vwap:point[2],z:point[8],price_source:'close',bar_time:point[0],confirmed_at:asOf,
+    source:'pinets:opening_position',outside_range:point[7]>high?'above':point[7]<low?'below':'inside'};
+}
+function rankingViews(candidates){
+  const all=[...candidates].filter(r=>r.direction_sign!==0).sort(compareScores);
+  const select=sign=>all.filter(r=>sign===0||r.direction_sign===sign).slice(0,10).map((r,i)=>({...r,rank:i+1}));
+  return {mixed:select(0),long:select(1),short:select(-1)};
+}
+function compareScores(a,b){return b.score-a.score||a.symbol.localeCompare(b.symbol);}
+
+module.exports={SCORE_MODEL,SCORE_CONTRACT,fiveMinuteHistory,fiveMinuteEma5History,scorePosition,scoreTrend,rankingViews,distanceScore,compareScores};

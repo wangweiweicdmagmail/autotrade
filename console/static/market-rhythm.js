@@ -8,17 +8,47 @@ const RHYTHM_EVENTS = {breakout:'突破外轨',first_outside:'首次有效值在
 const RHYTHM_ISSUES = {minute_gap:'历史分钟缺口',missing_session_anchor:'缺少默认交易日锚点',missing_open:'缺少开盘分钟',invalid_bar:'K线无效',ema_warmup:'预热不足',missing_data:'数据待齐'};
 const rhythmTimeFormat = new Intl.DateTimeFormat('en-GB',{timeZone:'America/New_York',hour:'2-digit',minute:'2-digit',hourCycle:'h23'});
 const rhythmSessionClock = new Intl.DateTimeFormat('en-GB',{timeZone:'America/New_York',weekday:'short',hour:'2-digit',minute:'2-digit',hourCycle:'h23'});
-function rhythmSessionState(asOf, now) {
+function rhythmSessionState(asOf, now, rankingSession=null) {
   const p=Object.fromEntries(rhythmSessionClock.formatToParts(new Date(now*1000)).map(p=>[p.type,p.value]));
   const minute=+p.hour*60 + +p.minute;
+  if(rankingSession?.phase==='premarket')return !['Sat','Sun'].includes(p.weekday)&&minute>=240&&minute<570
+    ? now-asOf>120?'stale':'premarket':'history';
   if(['Sat','Sun'].includes(p.weekday)||minute<570||minute>=960)return 'history';
   return now-asOf>120?'stale':'confirmed';
+}
+function rhythmEntryWindow(now){
+  if(!Number.isFinite(now))return false;
+  const p=Object.fromEntries(rhythmSessionClock.formatToParts(new Date(now*1000)).map(p=>[p.type,p.value]));
+  const minute=+p.hour*60 + +p.minute;
+  return !['Sat','Sun'].includes(p.weekday)&&minute>=585&&minute<960;
 }
 const rhythmTime = t => Number.isFinite(t)&&t>0 ? rhythmTimeFormat.format(new Date(t*1000)) : '—';
 const rhythmTicker = s => (s||'').split(':').pop();
 const rhythmNumber = n => Number.isFinite(n) ? n.toFixed(2) : '—';
 const rhythmSigned = n => Number.isFinite(n) ? (n>0?'+':'')+n.toFixed(2) : '—';
 const rhythmTdState = count => count==null?'unknown':count>=3?'up':count<=-3?'down':'range';
+function rhythmTdFact(fact,now) {
+  const known=!!(fact?.version===1&&fact.source==='confirmed_minute_v1'&&fact.known===true
+    &&typeof fact.id==='string'&&fact.id&&Number.isSafeInteger(fact.count)
+    &&Number.isFinite(fact.bar_time)&&fact.bar_time%60===0&&fact.confirmed_at===fact.bar_time+60&&fact.confirmed_at<=now);
+  const fresh=!!(known&&fact.ready===true&&Number.isFinite(fact.observed_at)&&fact.quote_bar_time===fact.confirmed_at
+    &&0<=now-fact.quote_bar_time&&now-fact.quote_bar_time<60
+    &&fact.quote_bar_time<=fact.observed_at&&fact.observed_at<=now&&now-fact.observed_at<=45);
+  return {...fact,known,ready:fresh,count:known?fact.count:null,
+    reason:fresh?'':fact?.reason||'等待本标的有效的一分钟确认TD与新鲜行情'};
+}
+
+function rhythmVwapFact(fact,now){
+  const known=!!(fact?.version===1&&fact.source==='confirmed_vwap_direction_v1'&&fact.known===true
+    &&typeof fact.id==='string'&&fact.id&&Number.isFinite(fact.close)&&fact.close>0&&Number.isFinite(fact.vwap)&&fact.vwap>0
+    &&fact.direction===(fact.close>fact.vwap?1:fact.close<fact.vwap?-1:0)
+    &&Number.isFinite(fact.bar_time)&&fact.bar_time%60===0&&fact.confirmed_at===fact.bar_time+60&&fact.confirmed_at<=now);
+  const ready=!!(known&&fact.ready===true&&Number.isFinite(fact.observed_at)&&fact.quote_bar_time===fact.confirmed_at
+    &&0<=now-fact.quote_bar_time&&now-fact.quote_bar_time<60
+    &&fact.quote_bar_time<=fact.observed_at&&fact.observed_at<=now&&now-fact.observed_at<=45);
+  return {...fact,known,ready,direction:known?fact.direction:0,
+    reason:ready?'':fact?.reason||'等待个股最新收盘价、VWAP与新鲜报价'};
+}
 
 function rhythmPositions(lots=[], universe=[]) {
   const pool=[...new Set(universe.filter(s=>typeof s==='string'))],byTicker=new Map();
@@ -47,6 +77,12 @@ function rhythmPositions(lots=[], universe=[]) {
 // A partial minute is not evidence that a stock has left the cross-section.
 function rhythmRankingReady(frame) {
   const c=frame?.coverage;
+  if(frame?.ranking_session?.phase==='premarket'&&frame.ranking_session.cohort==='available')
+    return Number.isFinite(frame.as_of)&&frame.as_of>0&&frame.as_of%60===0
+      &&frame.ranking_snapshot?.version===1&&!!frame.ranking_snapshot.id
+      &&frame.ranking_snapshot.as_of===frame.as_of&&frame.ranking_snapshot.day===frame.day
+      &&Number.isSafeInteger(c?.total)&&c.total>0&&Number.isSafeInteger(c.aligned)&&c.aligned>0
+      &&c.aligned<=c.total&&Array.isArray(c.missing)&&c.missing.length===c.total-c.aligned;
   return Number.isFinite(frame?.as_of)&&frame.as_of>0&&frame.as_of%60===0
     &&!!c&&Number.isSafeInteger(c.total)&&c.total>0&&c.aligned===c.total
     &&Array.isArray(c.missing)&&c.missing.length===0;
@@ -61,7 +97,12 @@ function rhythmDisplaySlots(previous, frame, positions=[]) {
     &&Array.isArray(previous.referenceSlots)&&previous.referenceSlots.length===2;
   // One accepted, complete, closed-minute snapshot. Later revisions of that minute
   // cannot reshuffle membership while the next candle is forming.
-  const accept=rhythmRankingReady(frame)&&(!valid||!Number.isFinite(previous.candidateAsOf)||frame.as_of>previous.candidateAsOf);
+  const accepted=frame?.ranking_snapshot;
+  const authoritative=accepted?.version===1&&typeof accepted.id==='string'&&accepted.id
+    &&accepted.as_of===frame.as_of&&accepted.day===day;
+  const accept=rhythmRankingReady(frame)&&(authoritative
+    ? !valid||previous.candidateSnapshotId!==accepted.id
+    : !valid||!Number.isFinite(previous.candidateAsOf)||frame.as_of>previous.candidateAsOf);
   const eligible=accept?[...new Set(ranked.map(r=>r.symbol))]:valid?
     [...(Array.isArray(previous.candidates)?previous.candidates:previous.order.filter(s=>!previous.heldOrder.includes(s)))]:[];
   const candidateAsOf=accept?frame.as_of:valid?previous.candidateAsOf??null:null;
@@ -73,7 +114,7 @@ function rhythmDisplaySlots(previous, frame, positions=[]) {
   const bucket=accept?nextBucket:valid?previous.bucket:null;
   const heldOrder=[...new Set([...(valid?previous.heldOrder:[]).filter(s=>held.includes(s)),...held])];
   // Keep occupied reference cells in place. A flat cell admits the oldest
-  // overflow holding before falling back to QQQ / SPY. Only overflow consumes
+  // overflow holding before falling back to QQQ / NVDA. Only overflow consumes
   // the ten candidate display seats.
   const referenceSlots=['',''];
   if(valid)previous.referenceSlots.forEach((s,i)=>{if(held.includes(s)&&!referenceSlots.includes(s))referenceSlots[i]=s;});
@@ -89,14 +130,15 @@ function rhythmDisplaySlots(previous, frame, positions=[]) {
     for(let i=pinned.length;i<10;i++)if(!slots[i])slots[i]=incoming.shift()||'';
     order=slots.filter(Boolean);
   }
-  return {version:2,day,bucket,order,heldOrder,referenceSlots,candidates:eligible,candidateAsOf,candidateRows};
+  const candidateSnapshotId=accept&&authoritative?accepted.id:valid?previous.candidateSnapshotId??null:null;
+  return {version:2,day,bucket,order,heldOrder,referenceSlots,candidates:eligible,candidateAsOf,candidateSnapshotId,candidateRows};
 }
 
 function rhythmConfirmedTd(track,time) {
   const td=track?.td;
   if(td?.version!==1||td.comparison_bars!==4||td.trend_threshold!==3||!Array.isArray(td.counts))return null;
-  const row=td.counts.findLast(p=>Array.isArray(p)&&p.length===2&&p[0]===time&&Number.isSafeInteger(p[1]));
-  return row?row[1]:null;
+  const rows=td.counts.filter(p=>Array.isArray(p)&&p.length===2&&p[0]===time);
+  return rows.length===1&&Number.isSafeInteger(rows[0][1])?rows[0][1]:null;
 }
 
 // Display the actual current-minute EMA3 only. Never compute a provisional TD.
@@ -108,11 +150,11 @@ function rhythmFormingPoint(track,raw,asOf,now) {
     ||bar.time%60!==0||!(bar.time<=now&&now<bar.time+60)||!(0<bar.low&&bar.low<=Math.min(bar.open,bar.close)&&bar.high>=Math.max(bar.open,bar.close))
     ||(!track.is_beta&&rhythmSessionState(asOf,now)!=='confirmed'))return null;
   const ema3=p[1]+.5*(bar.close-p[1]);
-  return {time:bar.time,ema3,z:Number.isFinite(p[2])&&p[3]>0?(ema3-p[2])/p[3]:null};
+  return {time:bar.time,ema3,z:Number.isFinite(p[2])&&p[3]>0?(bar.close-p[2])/p[3]:null};
 }
 
 // Stop pricing is delegated to the ordinary market-order policy in app.js.
-function rhythmTradePreview(frame,symbol,data,now,stopForSide) {
+function rhythmTradePreview(frame,symbol,data,now,stopForSide,entryReference=null) {
   const row=[...(frame?.tracks||[]),...(frame?.watch_tracks||[])].find(t=>t.symbol===symbol&&!t.is_beta);
   const p=row?.points?.at(-1),close=data?.bar?.close,observed=data?.price_observed_at,time=data?.bar?.time;
   const admission=Array.isArray(frame?.rows),candidate=frame?.rows?.find(r=>r.symbol===symbol);
@@ -121,16 +163,17 @@ function rhythmTradePreview(frame,symbol,data,now,stopForSide) {
   const aligned=admission?frame.ready&&!!candidate:row?.aligned&&!row.issue;
   const rawAtr=(data?.ts_c||data?.ts||{}).atr;
   const atr=Number.isFinite(rawAtr)&&rawAtr>0?rawAtr:null;
+  const reference=entryReference??close;
   const stop=side&&typeof stopForSide==='function'?stopForSide(side,atr):null;
   const ready=!!(aligned&&side&&Number.isFinite(pointTime)&&Number.isFinite(stop)&&Number.isFinite(close)&&close>0
     &&now>=pointTime+60&&now-pointTime-60<=120&&Number.isFinite(observed)&&now>=observed&&now-observed<=45
-    &&Number.isFinite(time)&&time<=now&&now<time+300&&stop>0&&(side==='long'?stop<close:stop>close)
+    &&Number.isFinite(time)&&time<=now&&now<time+300&&Number.isFinite(reference)&&reference>0&&stop>0&&(side==='long'?stop<reference:stop>reference)
     &&rhythmSessionState(pointTime+60,now)!=='history');
   const blockReason=ready?'':!Number.isFinite(pointTime)?'等待候选轨道':admission&&!frame.ready?frame.reason:rhythmSessionState(pointTime+60,now)==='history'
     ?'当前为常规盘历史，仅供查看；等待当日常规盘轨道':now-pointTime-60>120
       ?'轨道确认数据已过期':!side?'当前没有有效趋势方向':!aligned
         ?'轨道数据不完整或未对齐':'等待新鲜价格与有效止损';
-  return {side,close,limitPx:close??null,stopPx:stop,atr,sigma,ready,blockReason};
+  return {side,close,limitPx:reference??null,stopPx:stop,atr,sigma,ready,blockReason};
 }
 
 function rhythmChartModel(track,start,end,view,width,height,zDomain,focus,showTime=true) {
@@ -237,22 +280,36 @@ const RhythmTrack = {
 };
 
 const MarketRhythm = {
-  components:{RhythmTrack},props:{active:Boolean,tvSyncStatus:String,market:Object,now:Number,lots:Array,trader:String,
-    positionsReady:{type:Boolean,default:true}},emits:['select','open','manage','frame','grid'],
-  data:()=>({frame:null,error:'',loading:false,selected:'',view:'price',windowMinutes:390,focus:null,locked:false,clockNow:Date.now()/1000,displayState:null}),
+  components:{RhythmTrack},props:{active:Boolean,tvSyncStatus:String,market:Object,directionSnapshot:{type:Object,default:()=>({version:0,rows:{}})},tdSnapshot:{type:Object,default:()=>({version:0,rows:{}})},now:Number,lots:Array,trader:String,
+    positionsReady:{type:Boolean,default:true},rankingSnapshotId:{type:String,default:''}},emits:['select','open','manage','frame','grid'],
+  data:()=>({frame:null,error:'',loading:false,selected:'',view:'price',rankingView:'mixed',windowMinutes:390,focus:null,locked:false,clockNow:Date.now()/1000,displayState:null}),
   mounted(){this.requestId=0;this.loadDisplay();if(this.active)this.start();},
   beforeUnmount(){this.stop();},
   watch:{active(value){if(value){this.start();this.publishGrid();}else this.stop();},
+    rankingSnapshotId(value){
+      if(this.active&&value&&value!==this.frame?.ranking_snapshot?.id)this.refresh(true);
+    },
     gridKey(){this.publishGrid();},
     positionKey(){this.reconcileDisplay();},
     positionsReady(){this.reconcileDisplay();},
     trader(){this.loadDisplay();this.reconcileDisplay();}},
   computed:{
-    sourceTracks(){return Object.fromEntries([...(this.frame?.tracks||[]),...(this.frame?.watch_tracks||[])].filter(t=>t.symbol).map(t=>[t.symbol,t]));},
+    sourceTracks(){return Object.fromEntries([...(this.frame?.tracks||[]),...(this.frame?.watch_tracks||[]),...(this.frame?.ranking_tracks||[])].filter(t=>t.symbol).map(t=>[t.symbol,t]));},
     positions(){return rhythmPositions(this.lots||[],[...(this.frame?.symbols||[]),...(this.frame?.ranks||[]).map(r=>r.symbol),...Object.keys(this.market||{})]);},
     positionKey(){return this.positions.map(p=>p.symbol).join(',');},
     positionOverflow(){return Math.max(0,this.positions.length-12);},
-    rankingPending(){return !!this.frame&&!rhythmRankingReady(this.frame);},
+    rankingPending(){return !!this.frame&&(this.frame.batch_progress?.waiting||!rhythmRankingReady(this.frame));},
+    rankingProgress(){return this.frame?.batch_progress?.coverage||this.frame?.coverage||{};},
+    visibleRankingRows(){return this.rankingRows;},
+    entryWindowOpen(){return rhythmEntryWindow(this.now??this.clockNow);},
+    benchmarkRows(){
+      return ['CAPITALCOM:NAS100','CAPITALCOM:SPX500'].map(symbol=>{
+        const fact=this.liveTd(symbol),td=fact.count;
+        return {symbol,tdCount:td,tdState:rhythmTdState(td),tdLabel:td==null?'TD —':'TD '+(td>0?'+':'')+td,
+          confirmedAt:fact.known?fact.confirmed_at:null,
+          tdTitle:this.tdTitle(fact)};
+      });
+    },
     rows(){if(this.positionsReady===false)return [];return (this.displayState?.order||[]).map((symbol,i)=>{
       const raw=(this.displayState?.candidateRows||this.frame?.ranks||[]).find(r=>r.symbol===symbol),position=this.positions.find(p=>p.symbol===symbol);
       const direction=position?(position.side==='long'?1:position.side==='short'?-1:0):raw?.direction_sign;
@@ -266,24 +323,25 @@ const MarketRhythm = {
     });},
     rankingRows(){
       if(this.positionsReady===false)return [];
-      const candidates=[...(this.displayState?.candidateRows||[])].sort((a,b)=>a.rank-b.rank);
+      const candidates=[...(this.frame?((this.frame.rankings||{})[this.rankingView||'mixed']||this.displayState?.candidateRows||[]):[])].sort((a,b)=>a.rank-b.rank);
       const positions=this.positions||[],held=new Map(positions.map(p=>[p.symbol,p]));
       const bySymbol=new Map(candidates.map(r=>[r.symbol,r]));
       const order=[...positions.map(p=>p.symbol),...candidates.map(r=>r.symbol).filter(s=>!held.has(s))];
       return order.map(symbol=>{
         const raw=bySymbol.get(symbol),position=held.get(symbol),seat=this.rows.find(r=>r.symbol===symbol);
-        const td=raw?.tdCount??null,direction=position?(position.side==='long'?1:position.side==='short'?-1:0):raw?.direction_sign;
+        const fact=this.liveTd(symbol),td=fact.count,direction=position?(position.side==='long'?1:position.side==='short'?-1:0):raw?.direction_sign;
         const referenceSlot=(this.displayState?.referenceSlots||[]).indexOf(symbol);
+        const entry=this.liveDirection(symbol);
         return {...raw,symbol,rank:raw?.rank??null,candidateRank:raw?.rank??null,gridSeat:seat?.rank??null,referenceSlot,
-          isHeld:!!position,position,direction_sign:direction,tdCount:td,tdState:rhythmTdState(td),
-          tdLabel:td==null?'TD —':'TD '+(td>0?'+':'')+td,tdTitle:td==null?'等待TD确认数据':rhythmTime((this.displayState?.candidateAsOf||0)-60)+' K线收盘确认 · TD '+(td>0?'+':'')+td};
+          isHeld:!!position,position,direction_sign:direction,entryDirection:entry.known?entry.direction:0,entryReason:entry.reason,tdCount:td,tdState:rhythmTdState(td),
+          tdLabel:td==null?'TD —':'TD '+(td>0?'+':'')+td,tdTitle:this.tdTitle(fact)};
       });
     },
     // Visual row order on TV: display slots 9/7/5/3 above 10/8/6/4.
     tvSymbols(){return [9,7,5,3,10,8,6,4].map(rank=>this.rows.find(r=>r.rank===rank)?.symbol||'');},
     focusSymbols(){return [this.rows.find(r=>r.rank===1)?.symbol||'','CAPITALCOM:NAS100','CAPITALCOM:SPX500',
       this.rows.find(r=>r.rank===2)?.symbol||'',this.displayState?.referenceSlots?.[0]||'NASDAQ:QQQ',
-      this.displayState?.referenceSlots?.[1]||'AMEX:SPY'];},
+      this.displayState?.referenceSlots?.[1]||'NASDAQ:NVDA'];},
     gridKey(){return [...this.tvSymbols,...this.focusSymbols].join(',');},
     tracks(){
       const beta=['CAPITALCOM:NAS100','CAPITALCOM:SPX500'].map(symbol=>this.sourceTracks[symbol]||{symbol,is_beta:true});
@@ -301,10 +359,13 @@ const MarketRhythm = {
     zDomain(){const values=this.tracks.flatMap(t=>[...(t.points||[]).filter(p=>p[0]>=this.startTime&&p[0]<=this.end).flatMap(p=>t.is_beta&&p[3]>0?[p[8],(p[5]-p[2])/p[3],(p[6]-p[2])/p[3]]:[p[8]]),t.forming?.z]).filter(Number.isFinite);return [Math.min(-1.4,...values)-.1,Math.max(1.4,...values)+.1];},
     events(){return this.tracks.flatMap(t=>(t.events||[]).filter(e=>e.time>=this.startTime&&e.time<=this.end).map(e=>({...e,symbol:t.symbol}))).sort((a,b)=>b.time-a.time||a.symbol.localeCompare(b.symbol)).slice(0,7).reverse();},
     old(){return this.frame?.as_of&&this.clockNow-this.frame.as_of>120;},
-    sessionState(){return rhythmSessionState(this.frame?.as_of||0,this.clockNow);},
+    sessionState(){return rhythmSessionState(this.frame?.as_of||0,this.clockNow,this.frame?.ranking_session);},
     facts(){return this.tracks.filter(t=>t.is_beta).map(t=>{const p=t.points?.at(-1),z=p?.[8];return this.ticker(t.symbol)+' '+(!t.aligned?'数据待齐':!Number.isFinite(z)?'轨道未就绪':z>1?'上轨外':z<-1?'下轨外':z>=0?'上区间':'下区间');}).join(' · ');},
   },
   methods:{issueLabel:reason=>RHYTHM_ISSUES[reason]||reason,eventLabel:type=>RHYTHM_EVENTS[type]||type,clock:rhythmTime,ticker:rhythmTicker,number:rhythmNumber,signed:rhythmSigned,phase:p=>RHYTHM_LABELS[p]||p,
+    liveDirection(symbol){return rhythmVwapFact(this.directionSnapshot?.rows?.[symbol],this.now??this.clockNow);},
+    liveTd(symbol){return rhythmTdFact(this.tdSnapshot?.rows?.[symbol],this.now??this.clockNow);},
+    tdTitle(fact){return fact.known?'K线 '+rhythmTime(fact.bar_time)+' ET · '+rhythmTime(fact.confirmed_at)+' 收盘确认 · TD '+(fact.count>0?'+':'')+fact.count+(fact.ready?'':' · '+fact.reason):fact.reason;},
     loadDisplay(){
       this.displayState=null;
       try{const saved=JSON.parse(localStorage.getItem('rhythm_display_v2:'+(this.trader||'master')));
@@ -336,9 +397,17 @@ const MarketRhythm = {
         const frame=await response.json();if(id!==this.requestId)return;
         this.clockNow=Date.now()/1000;
         if(frame.status!=='ready'){this.error=frame.message||'等待联动行情';return;}
+        if(frame.scoring?.model!=='opening15_midpoint_v7'||frame.scoring.version!==7){
+          this.error='榜单版本未更新，请重启控制台加载小区间排名';return;
+        }
+        const accepted=frame.ranking_snapshot;
+        if(accepted?.version!==1||!accepted.id||accepted.as_of!==frame.as_of||accepted.day!==frame.day){
+          this.error='等待服务端完整分钟榜单契约，请重启控制台加载新版';return;
+        }
         if(this.frame&&frame.as_of<this.frame.as_of)return;
         this.error='';
-        if(this.frame?.revision!==frame.revision||this.frame?.selected!==frame.selected){
+        if(this.frame?.revision!==frame.revision||this.frame?.selected!==frame.selected
+            ||JSON.stringify(this.frame?.batch_progress)!==JSON.stringify(frame.batch_progress)){
           this.frame=frame;
           if(!(this.positions||[]).some(p=>p.symbol===this.selected))this.selected=frame.selected;
           this.$emit('frame',frame);
@@ -351,7 +420,7 @@ const MarketRhythm = {
     },
     choose(symbol){
       if(!symbol)return;
-      this.selected=symbol;this.$emit('select',symbol);this.refresh(true);
+      this.selected=symbol;this.$emit('select',symbol,{view:this.rankingView||'mixed'});this.refresh(true);
     },
     selectPanel(index,symbol){
       if(symbol){this.selected=symbol;this.$emit('select',symbol);}
@@ -363,19 +432,32 @@ const MarketRhythm = {
       else if(row.gridSeat===undefined&&row.rank)locations.push(this.rankLocation(row.rank));
       return locations.join(' / ')||'未分配TV席位';},
     openRank(row){
+      if(row?.rankingType==='td')return; // Retired client-side board source.
       if(row?.isHeld){this.manageRank(row);return;}
       if(!row?.symbol||![1,-1].includes(row.direction_sign))return;
-      this.selected=row.symbol;this.$emit('select',row.symbol);
-      this.$emit('open',{symbol:row.symbol,frame:this.frame});
+      this.selected=row.symbol;this.$emit('select',row.symbol,{view:this.rankingView||'mixed'});
+      this.$emit('open',{symbol:row.symbol,frame:this.frame,view:this.rankingView||'mixed'});
     },
     manageRank(row){if(row?.symbol){this.selected=row.symbol;this.$emit('select',row.symbol);this.$emit('manage',row.symbol);}},
-    rowDescription(row){const rank=row.candidateRank?'强度#'+row.candidateRank:'未入候选';
-      return row.isHeld?row.position.qty+'股 · '+rank:rank+' · '+this.phase(row.phase);},
-    scoreDescription(row){return Number.isFinite(row.score)?'强度#'+row.candidateRank+' · '+this.number(row.score)+'分\n'
-      +'结构 '+this.number(row.score_parts?.vwap)+' + EMA9斜率 '+this.number(row.score_parts?.slope)+' + 分类 '+this.number(row.score_parts?.classification)+'\n'
-      +'5分钟EMA9斜率 '+this.signed(row.ema9_slope_atr)+' ATR/根\n'
-      +'近15分钟同侧 '+this.number(row.classification_rate*100)+'%（'+row.classification_correct+'/'+row.classification_samples+'根；样本'+row.classification_samples+'/15）\n'
-      +'乖离 '+this.signed(row.ema9_bias_atr)+' ATR，仅位置参考\n'+this.gridLocation(row):this.rowDescription(row)+'\n'+this.gridLocation(row);},
+    rowDescription(row){
+      const rank=row.candidateRank?'强度#'+row.candidateRank:'未入候选';
+      if(Number.isFinite(row.opening_position))return (row.isHeld?row.position.qty+'股 · ':'')+'位置 '+this.signed(row.opening_position)+' · '+(row.entryDirection===1?'VWAP方向多':row.entryDirection===-1?'VWAP方向空':'卡片中核对方向');
+      return row.isHeld?row.position.qty+'股 · '+rank:rank+' · '+(row.score_parts?.position!=null?this.number(row.score)+'分 · ':'')+(Number.isFinite(row.z)?this.signed(row.z)+'σ':this.phase(row.phase));},
+    scoreDescription(row){
+      if(Number.isFinite(row.opening_position))return '归一位置 '+this.signed(row.opening_position)+'个小区间半宽\n'
+        +'(1分钟close − 小区间中点) / 区间半宽\n'
+        +'开盘 '+this.number(row.day_open)+' · 区间 '+this.number(row.opening_low)+'–'+this.number(row.opening_high)+'\n'
+        +'位置=(close−小区间中点)/半宽 · '+this.signed(row.range_position)+'，上沿+1／下沿−1\n'
+        +'按距中点的幅度排名；开仓仍由最新收盘价与VWAP决定\n'+this.gridLocation(row);
+      if(row.score_parts?.position==null)return this.rowDescription(row)+'\n'+this.gridLocation(row);
+      return '总分 '+this.number(row.score)+'/100 · 位置50% / VWAP推进30% / EMA5分类20%\n'
+        +'Z = (1分钟close − VWAP) / σ · '+this.signed(row.z)+'σ · 位置 '+this.number(row.score_parts.position)+'/50\n'
+        +'VWAP开盘 '+this.number(row.vwap_open)+' → 当前 '+this.number(row.direction_vwap)
+        +' · 顺趋势推进 '+this.signed(row.vwap_aligned_progress_sigma)+'σ · '+this.number(row.score_parts.vwap_progress)+'/30\n'
+        +'五分钟EMA5分类 '+row.classification_correct+'/'+row.classification_samples+' · '+this.number(row.classification_rate*100)+'%'
+        +' · '+this.number(row.score_parts.classification)+'/20\n'
+        +'VWAP上方只做多，下方只做空；分类是保持率，非交易胜率\n'+this.gridLocation(row);
+    },
     publishGrid(force=false){
       if(!this.active||!this.frame||this.positionsReady===false||!this.displayState)return;
       const symbols=this.tvSymbols.every(Boolean)?this.tvSymbols:[];
@@ -387,22 +469,28 @@ const MarketRhythm = {
     eventFocus(time){this.locked=true;this.focus=time;},
 
   },
-  template:`<div class="market-rhythm rhythm-native" aria-label="前十候选与订单批次工作台">
+  template:`<div class="market-rhythm rhythm-native" aria-label="前十候选与订单批次工作台" :data-ranking-snapshot-id="displayState?.candidateSnapshotId || ''" :data-ranking-as-of="displayState?.candidateAsOf || ''">
     <header class="rhythm-toolbar"><div class="rhythm-protection-controls"><slot name="protection-controls"></slot></div><div class="rhythm-orders-controls"><slot name="order-controls"></slot></div></header>
     <div v-if="error" class="rhythm-message" role="status">{{ error }}<span v-if="frame"> · 保留上次榜单</span></div>
-    <div v-if="rankingPending" class="rhythm-message" role="status">收盘数据 {{ frame?.coverage?.aligned || 0 }}/{{ frame?.coverage?.total || '—' }} · 候选未收齐，保留上批宫格</div>
+    <div v-if="rankingPending" class="rhythm-message" role="status">下一批收盘数据 {{ rankingProgress.aligned || 0 }}/{{ rankingProgress.total || '—' }} · {{ frame?.batch_progress?.message || '候选未收齐' }}，保留上批榜单与宫格</div>
+    <div v-if="frame?.ranking_session?.phase==='premarket'" class="rhythm-message" role="status">盘前观察榜 · {{ clock(frame.as_of) }} ET · 本批对齐 {{ frame.coverage.aligned }}/{{ frame.coverage.total }} · {{ frame.coverage.missing.length }}只缺本分钟数据，{{ frame.scoring.pending.length }}只评分待齐 · 仅供观察，常规盘才可开仓</div>
     <div class="rhythm-board">
-      <aside class="rhythm-ranking" aria-label="持仓与每分钟候选排名"><header><strong>持仓与候选</strong><span>榜单每分钟更新</span></header><p>收盘排名 · 持仓置顶<small>TV席位每10分钟重排 · 进出榜局部替换</small></p>
-        <div v-if="positionOverflow" class="rhythm-message">另有 {{ positionOverflow }} 只持仓未放入TV，请在订单批次查看</div>
-        <div v-if="rankingRows.length" class="rhythm-rank-list" role="list"><div v-for="row in rankingRows" :key="row.symbol" class="rhythm-rank-row" role="listitem" :class="[row.direction_sign===1?'rhythm-long':row.direction_sign===-1?'rhythm-short':'',{'rhythm-rank-selected':selected===row.symbol,'rhythm-held':row.isHeld}]">
-          <button type="button" class="rhythm-rank-pick" :aria-label="'选中'+ticker(row.symbol)" :aria-pressed="selected===row.symbol" @click="choose(row.symbol)"><span class="rhythm-rank" :title="row.rank?'本分钟候选排名 '+row.rank:'榜外持仓'">{{ row.rank || '持' }}</span><span><b class="rhythm-rank-name"><span>{{ ticker(row.symbol) }} <i>{{ row.isHeld ? (row.position.side==='long'?'持多':row.position.side==='short'?'持空':'持仓') : row.direction_sign===1?'多':'空' }}</i></span><span class="rhythm-rank-td" :class="'rhythm-td-'+row.tdState" :title="row.tdTitle">{{ row.tdLabel }}</span></b><small :title="scoreDescription(row)">{{ rowDescription(row) }}</small></span></button>
-          <button type="button" class="rhythm-open-order" :aria-label="ticker(row.symbol)+(row.isHeld?'管理持仓':'开仓')" :disabled="!row.isHeld&&![1,-1].includes(row.direction_sign)" @click="openRank(row)">{{ row.isHeld?'管理':'开仓' }}</button>
+      <aside class="rhythm-ranking" aria-label="固定指数与每分钟候选排名"><header><strong>趋势榜</strong><span>小区间归一化</span></header>
+        <div class="rhythm-view-switch" role="group" aria-label="候选方向筛选"><button v-for="option in [{value:'mixed',label:'混合'},{value:'long',label:'只看多头'},{value:'short',label:'只看空头'}]" :key="option.value" type="button" :aria-pressed="rankingView===option.value" :class="{selected:rankingView===option.value}" @click="rankingView=option.value">{{ option.label }}</button></div>
+        <p>一分钟收盘更新 · 持仓置顶<small>TV席位每10分钟重排 · 进出榜局部替换</small></p>
+        <div class="rhythm-benchmarks" role="list" aria-label="固定大盘指数TD"><div v-for="row in benchmarkRows" :key="row.symbol" class="rhythm-benchmark-row" role="listitem" :data-symbol="row.symbol" :title="row.tdTitle">
+          <span class="rhythm-benchmark-kind">指</span><b>{{ ticker(row.symbol) }}</b><time>{{ row.confirmedAt ? clock(row.confirmedAt)+' ET' : '待确认' }}</time><span class="rhythm-rank-td" :class="'rhythm-td-'+row.tdState">{{ row.tdLabel }}</span>
         </div></div>
-        <div v-if="!rankingRows.length" class="rhythm-track-empty">{{ positionsReady===false?'正在同步持仓':'等待持仓或有效候选' }}</div><footer><button type="button" @click="refresh(true)">刷新数据</button><small title="榜单每分钟收盘更新；TV席位每10分钟重排，进出榜只局部替换">持仓即时更新</small></footer>
+        <div v-if="positionOverflow" class="rhythm-message">另有 {{ positionOverflow }} 只持仓未放入TV，请在订单批次查看</div>
+        <div v-if="visibleRankingRows.length" class="rhythm-rank-list" role="list"><div v-for="row in visibleRankingRows" :key="row.symbol" class="rhythm-rank-row" role="listitem" :class="[row.direction_sign===1?'rhythm-long':row.direction_sign===-1?'rhythm-short':'',{'rhythm-rank-selected':selected===row.symbol,'rhythm-held':row.isHeld}]">
+          <button type="button" class="rhythm-rank-pick" :aria-label="'选中'+ticker(row.symbol)" :aria-pressed="selected===row.symbol" @click="choose(row.symbol)"><span class="rhythm-rank" :title="row.rank?'本分钟候选排名 '+row.rank:'榜外持仓'">{{ row.rank || '持' }}</span><span><b class="rhythm-rank-name"><span>{{ ticker(row.symbol) }} <i>{{ row.isHeld ? (row.position.side==='long'?'持多':row.position.side==='short'?'持空':'持仓') : row.direction_sign===1?'多':row.direction_sign===-1?'空':row.tdCount==null?'待确认':'中性' }}</i></span><span class="rhythm-rank-td" :class="'rhythm-td-'+row.tdState" :title="row.tdTitle">{{ row.tdLabel }}</span></b><small :title="scoreDescription(row)">{{ rowDescription(row) }}</small></span></button>
+          <button type="button" class="rhythm-open-order" :class="!row.isHeld ? (row.entryDirection===1?'rhythm-long':row.entryDirection===-1?'rhythm-short':'') : ''" :title="row.isHeld?'管理现有批次':'打开开仓卡片；按VWAP趋势方向交易，TD仅供参考'" :aria-label="ticker(row.symbol)+(row.isHeld?'管理持仓':'开仓')" @click="openRank(row)">{{ row.isHeld?'管理':row.entryDirection===1?'开多':row.entryDirection===-1?'开空':'开仓' }}</button>
+        </div></div>
+        <div v-if="!visibleRankingRows.length" class="rhythm-track-empty">{{ positionsReady===false?'正在同步持仓':'等待持仓或有效趋势候选' }}</div><footer><button type="button" @click="refresh(true)">刷新数据</button><small title="榜单每分钟收盘更新；TV席位每10分钟重排，进出榜只局部替换">持仓即时更新</small></footer>
       </aside>
       <section class="rhythm-orders" aria-label="订单批次"><slot><div class="rhythm-track-empty">等待订单批次</div></slot></section>
     </div>
-    <footer class="rhythm-bottom"><span>前十候选同向开仓 · 卡片确认后下单</span><span>{{ sessionState==='history'?'历史榜单 · ':sessionState==='stale'?'确认数据滞后 · ':'' }}auto_trade 八格 / auto_trade2 六格 / 控制台独立窗口</span></footer>
+    <footer class="rhythm-bottom"><span>{{ frame?.ranking_session?.phase==='premarket'?'盘前观察候选 · 等常规盘完整榜单后开仓':'榜单按小区间中点位置 · 开仓按VWAP方向 · 09:45起允许新开仓' }}</span><span>{{ sessionState==='premarket'?'盘前观察 · ':sessionState==='history'?'历史榜单 · ':sessionState==='stale'?'排名批次滞后 · ':'' }}auto_trade 八格 / auto_trade2 六格 / 控制台独立窗口</span></footer>
   </div>`,
 };
-if(typeof module!=='undefined')module.exports={MarketRhythm,RhythmTrack,rhythmChartModel,rhythmTime,rhythmSessionState,rhythmTradePreview,rhythmConfirmedTd,rhythmFormingPoint,rhythmPositions,rhythmDisplaySlots,rhythmRankingReady};
+if(typeof module!=='undefined')module.exports={MarketRhythm,RhythmTrack,rhythmChartModel,rhythmTime,rhythmSessionState,rhythmTradePreview,rhythmConfirmedTd,rhythmFormingPoint,rhythmPositions,rhythmDisplaySlots,rhythmRankingReady,rhythmTdFact,rhythmVwapFact,rhythmEntryWindow};

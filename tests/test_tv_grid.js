@@ -141,7 +141,7 @@ test('auto_trade2 six panes put candidates at left and the four beta charts at t
  assert.equal(f.grid('NASDAQ:TSLA').ok,false);assert.equal(f.writes.length,count);
 });
 
-test('holding allocation changes only QQQ and SPY until the third position needs a candidate cell',()=>{
+test('holding allocation changes only QQQ and NVDA until the third position needs a candidate cell',()=>{
  const {rhythmDisplaySlots,MarketRhythm}=require('../console/static/market-rhythm');
  const focus=fixture(6,true),candidates=fixture(8);
  const frame={day:'2026-11-18',as_of:Date.parse('2026-11-18T15:00:00Z')/1000,
@@ -154,7 +154,8 @@ test('holding allocation changes only QQQ and SPY until the third position needs
   assert(candidates.grid(MarketRhythm.computed.tvSymbols.call(ui)).ok);
  };
  const positions=['A','B','C'].map(symbol=>({symbol:'NASDAQ:'+symbol}));
- sync([]);focus.writes.length=0;candidates.writes.length=0;
+ sync([]);assert.equal(focus.widgets[4].current,'NASDAQ:QQQ');assert.equal(focus.widgets[5].current,'NASDAQ:NVDA');
+ focus.writes.length=0;candidates.writes.length=0;
  sync(positions.slice(0,1));assert.deepEqual(focus.writes,[{i:4,s:'NASDAQ:A'}]);
  sync(positions.slice(0,2));assert.deepEqual(focus.writes,[{i:4,s:'NASDAQ:A'},{i:5,s:'NASDAQ:B'}]);
  assert.deepEqual(candidates.writes,[]);
@@ -164,7 +165,7 @@ test('holding allocation changes only QQQ and SPY until the third position needs
  assert.deepEqual(focus.writes,[{i:0,s:'NASDAQ:S0'},{i:4,s:'NASDAQ:C'}]);
  assert.deepEqual(candidates.writes,[]); // Releasing the overflow seat restores only that candidate cell.
  focus.writes.length=0;sync([]);
- assert.deepEqual(focus.writes,[{i:4,s:'NASDAQ:QQQ'},{i:5,s:'AMEX:SPY'}]);
+ assert.deepEqual(focus.writes,[{i:4,s:'NASDAQ:QQQ'},{i:5,s:'NASDAQ:NVDA'}]);
  assert.equal(focus.widgets[1].current,'CAPITALCOM:NAS100');
  assert.equal(focus.widgets[2].current,'CAPITALCOM:SPX500');
 });

@@ -15,6 +15,11 @@
 .candidate-protection-toolbar .el-input-number { width:76px; }
 .candidate-protection-toolbar .el-select { width:140px; }
 .candidate-protection-toolbar .el-switch__label { font-size:12px; }
+.candidate-protection-toolbar .intelligent-exit-summary { color:#8fa4b8; font-size:11px; line-height:1.3; }
+.intelligent-exit-control .intelligent-exit-rules { color:#9cb2c9; font-size:12px; }
+.intelligent-exit-details { line-height:1.6; }
+.intelligent-exit-details p { margin:8px 0; }
+.intelligent-exit-details small { color:#94a3b8; }
 .rhythm-toolbar strong { font-size:13px; }
 .rhythm-controls { gap:4px; }
 .rhythm-controls label { display:flex; align-items:center; gap:3px; }
@@ -108,6 +113,13 @@
 .rhythm-ranking header>span { color:var(--muted); font-size:11px; }
 .rhythm-ranking p { padding:0 7px 5px; margin:0; color:var(--rhythm-gold); font-size:12px; }
 .rhythm-ranking p small { font-size:11px; }
+.rhythm-benchmarks { flex:none; position:sticky; top:0; z-index:2; margin:0 4px 5px; padding:2px; border:1px solid #e8c36944; border-radius:4px; background:var(--panel); }
+.rhythm-benchmark-row { display:flex; align-items:center; gap:6px; min-height:30px; padding:2px 5px; }
+.rhythm-benchmark-row+.rhythm-benchmark-row { border-top:1px solid var(--panel-border); }
+.rhythm-benchmark-kind { flex:none; color:var(--rhythm-gold); font-size:11px; }
+.rhythm-benchmark-row>b { font-size:14px; }
+.rhythm-benchmark-row time { margin-left:auto; color:var(--muted); font-size:10px; font-variant-numeric:tabular-nums; white-space:nowrap; }
+.rhythm-benchmark-row .rhythm-rank-td { min-width:51px; text-align:center; }
 .rhythm-rank-list { flex:1; min-height:min-content; display:grid; grid-auto-rows:minmax(42px,1fr); gap:3px; padding:0 4px 4px; }
 .market-rhythm .rhythm-rank-row { display:flex; gap:4px; align-items:center; min-width:0; padding:3px 4px; border:1px solid transparent; border-radius:4px; background:transparent; }
 .market-rhythm .rhythm-rank-pick { flex:1; min-width:0; display:grid; grid-template-columns:18px minmax(0,1fr); gap:4px; align-items:center; padding:0; text-align:left; background:transparent; border:0; }
@@ -131,3 +143,5 @@
 .market-rhythm .rhythm-open-order { flex:0 0 64px; min-width:64px; min-height:34px; font-size:14px; font-weight:600; padding:7px 8px; line-height:1.2; text-align:center; color:inherit; border-color:currentColor; }
 .market-rhythm .rhythm-open-order:disabled { opacity:.45; cursor:default; }
 .market-rhythm .rhythm-tv-status { max-width:420px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
+.rhythm-view-switch{display:flex;gap:4px;padding:2px 7px 6px;flex-shrink:0}.rhythm-view-switch button{flex:1;min-width:0;padding:5px 2px;border:1px solid var(--panel-border);border-radius:4px;background:transparent;color:var(--muted);font-size:12px;cursor:pointer}.rhythm-view-switch button.selected{border-color:var(--rhythm-gold);color:var(--rhythm-gold);background:rgba(222,183,83,.09)}

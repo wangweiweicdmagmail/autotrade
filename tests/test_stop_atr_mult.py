@@ -89,6 +89,14 @@ def test_snapshot_carries_value(app):
     assert snap["status"]["manual_market_st_interval_seconds"] == 60
     assert snap["status"]["risk_per_trade_usd"] == config.RISK_PER_TRADE_USD
     assert app.risk_gate.cfg.per_trade_usd == config.RISK_PER_TRADE_USD
+    assert app.risk_gate.cfg.max_direction_positions == config.RISK_MAX_DIRECTION_POSITIONS == 0
+    assert snap['status']['max_direction_positions'] == 0
+    assert snap['status']['direction_position_counts'] == {'long':0,'short':0}
+    assert app.risk_gate.cfg.single_direction_only is config.RISK_SINGLE_DIRECTION_ONLY is True
+    assert snap['status']['single_direction_only'] is True
+    assert app.risk_gate.cfg.per_trade_usd == snap['status']['risk_per_trade_usd'] == 1000
+    assert app.risk_gate.cfg.max_total_risk_usd == snap['status']['max_total_risk_usd'] == 2200
+    assert app.risk_gate.cfg.max_direction_risk_usd == snap['status']['max_direction_risk_usd'] == 2200
 
 
 def test_manual_market_order_uses_current_one_minute_st(app, monkeypatch):

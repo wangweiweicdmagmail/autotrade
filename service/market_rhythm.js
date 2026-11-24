@@ -3,7 +3,7 @@
 // Read-only perception model. Never imports an execution model or broker adapter.
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const {SCORE_CONTRACT,fiveMinuteHistory,scoreInputs,applyScore,compareScores}=require('./rhythm_score');
+const {SCORE_CONTRACT,fiveMinuteHistory,fiveMinuteEma5History,scoreTrend,compareScores,rankingViews}=require('./rhythm_score');
 const {STOCK_SESSION,MINUTE_HISTORY,stockSession,hasSessionPrefix}=require('./market_session');
 const BETA = ['CAPITALCOM:NAS100', 'CAPITALCOM:SPX500'];
 const REFERENCES = new Set([...BETA, 'BLACKBULL:WTI', 'NASDAQ:QQQ', 'AMEX:SPY', 'NASDAQ:SMH',
@@ -29,6 +29,7 @@ function calculateSeries(symbol, bars, now, daily=[],{marketSession=STOCK_SESSIO
   let day,calculationDay, ema, weight=0, mean=0, m2=0, positive=0, opened=false,calculationReady=false,
     calculationInvalid=false,last, warmup=0, priorCount=0;
   let points=[], events=[], episode=null, number=0, previous=null, gap=null;
+  let displayPhase=null;
   // Confirmed TD for coloring and shared entry admission, aligned with indicators/td-price-line.pine defaults.
   // Carry the close history and count across daily VWAP resets.
   let tdCount=0, tdCounts=[]; const tdCloses=[];
@@ -57,21 +58,23 @@ function calculateSeries(symbol, bars, now, daily=[],{marketSession=STOCK_SESSIO
       if (positive===1) {mean=value; m2=0;}
     }
     const sigma=positive >= 2 && weight>0 ? Math.sqrt(Math.max(0,m2/weight)) : 0;
-    // Warm indicators on the entire extended session; stock ranking episodes
-    // and their displayed clock still start at the regular open.
-    if(!beta&&!s.regular)continue;
-    if(key!==day){
+    // Premarket observation is a separate segment. Keep the original regular
+    // session algorithm at 09:30; EMA/TD/VWAP themselves stay continuously warm.
+    if(!beta&&s.minute>=960)continue;
+    const phase=beta?'default':s.minute<570?'premarket':'regular';
+    if(key!==day||!beta&&phase!==displayPhase){
       day=key;opened=false;last=null;warmup=warmBefore;
+      displayPhase=phase;
       if(!beta){points=[];events=[];tdCounts=[];}
       episode=previous=null;number=0;gap=null;
     }
-    if(beta?calculationReady:s.minute===570)opened=true;
-    if(!opened||!calculationReady||calculationInvalid||(!beta&&last!=null&&bar.time!==last+60)){
+    if(beta||phase==='premarket'?calculationReady:s.minute===570)opened=true;
+    if(!opened||!calculationReady||calculationInvalid||(!beta&&phase==='regular'&&last!=null&&bar.time!==last+60)){
       gap ||= !calculationReady?'missing_session_anchor':!opened?'missing_open':calculationInvalid?'invalid_bar':'minute_gap';
       episode=previous=null;
     }
     last=bar.time;
-    const z=!gap && sigma>Math.max(1e-10,Math.abs(mean)*1e-12) ? (ema-mean)/sigma : null;
+    const z=!gap && sigma>Math.max(1e-10,Math.abs(mean)*1e-12) ? (bar.close-mean)/sigma : null;
     const point={time:bar.time,ema3:ema,vwap:gap||!weight?null:mean,sigma:gap?null:sigma,
       open:bar.open,high:bar.high,low:bar.low,close:bar.close,z};
     if (episode && z != null && episode.direction*z < 0) {
@@ -98,16 +101,16 @@ function calculateSeries(symbol, bars, now, daily=[],{marketSession=STOCK_SESSIO
       }
       previous=point;
     }
-    const phase=gap?'data_gap':z==null?'warming':!episode?'waiting':z===0?'touch_vwap':
+    const pointPhase=gap?'data_gap':z==null?'warming':!episode?'waiting':z===0?'touch_vwap':
       episode.points.length<3?'new_breakout':episode.direction*z>1?'outside_progress':'pullback_inside';
-    points.push([point.time,...['ema3','vwap','sigma','open','high','low','close','z'].map(k=>round(point[k])),phase,episode?.direction||0]);
+    points.push([point.time,...['ema3','vwap','sigma','open','high','low','close','z'].map(k=>round(point[k])),pointPhase,episode?.direction||0]);
     tdCounts.push([point.time,tdCount]);
   }
   let metrics=null;
-  if (episode && !gap && warmup>=30) {
+  if (episode && !gap && (displayPhase==='premarket'?priorCount:warmup)>=30) {
     const ps=episode.points,p=ps.at(-1),first=ps[0],d=episode.direction;
     const ref=ps.find(x=>x.time===Math.max(first.time,p.time-180)), a=ps.find(x=>x.time===p.time-180),b=ps.find(x=>x.time===p.time-360);
-    const dt=(p.time-ref.time)/60, n=ps.length;
+    const dt=ref?(p.time-ref.time)/60:0, n=ps.length;
     metrics={episode_id:episode.id,direction_sign:d,episode_start_bar:first.time,breakout_known_at:first.time+60,
       age_points:n,outer_fraction:episode.outside/n,confidence:Math.min(n/10,1),
       rail_speed:dt?d*(p.vwap-ref.vwap)/(dt*p.sigma):0,
@@ -115,16 +118,9 @@ function calculateSeries(symbol, bars, now, daily=[],{marketSession=STOCK_SESSIO
       maximum_drawdown_sigma:episode.drawdown/p.sigma,drawdown_quality:1/(1+episode.drawdown/p.sigma),
       z:p.z,phase:points.at(-1)[9]};
   }
-  return {symbol,day,points,events:beta?events:events.slice(-48),metrics,warmup,
+  return {symbol,day,ranking_phase:displayPhase,points,events:beta?events:events.slice(-48),metrics,warmup,
     td:{version:1,comparison_bars:4,trend_threshold:3,counts:tdCounts},
-    issue:gap || ((beta?priorCount:warmup)<30?'ema_warmup':null),last_closed:points.at(-1)?.[0]??null};
-}
-function percentile(value,values) {
-  if (!(value>0) || !values.length) return 0;
-  if (values.length<2) return .5;
-  const equal=x=>Math.abs(x-value)<=Math.max(1e-12,1e-12*Math.max(Math.abs(x),Math.abs(value)));
-  const less=values.filter(x=>x<value&&!equal(x)).length, ties=values.filter(equal).length;
-  return Math.min(1,Math.max(0,(less+Math.max(0,ties-1)/2)/(values.length-1)));
+    issue:gap,last_closed:points.at(-1)?.[0]??null};
 }
 function referenceEvents(row) {
   const range=row.previous_range;
@@ -144,76 +140,111 @@ function referenceEvents(row) {
   }
   return events.sort((a,b)=>a.time-b.time||a.type.localeCompare(b.type)).slice(-48);
 }
-function buildFrame(series, symbols, now, fiveMinute={}) {
+function buildFrame(series, symbols, now, fiveMinute={}, {marketSession=STOCK_SESSION,openingPositions={}}={}) {
   const all=Object.values(series), stocks=all.filter(s=>!BETA.includes(s.symbol));
   const day=stocks.map(s=>s.day).filter(Boolean).sort().at(-1);
   const current=stocks.filter(s=>s.day===day);
   const asOf=Math.max(0,...(current.length?current:all).map(s=>(s.last_closed||0)+60));
+  const premarket=asOf>0&&stockSession(asOf-60,marketSession).active&&!stockSession(asOf-60,marketSession).regular
+    &&stockSession(asOf-60,marketSession).minute<570;
   // Always-live indices cannot advance the stock ranking clock overnight.
   // Project their fully calculated default-session history onto the same cutoff.
   for(const row of all.filter(s=>BETA.includes(s.symbol))) {
     const points=row.points.filter(p=>p[0]+60<=asOf&&p[0]>=asOf-36*3600);
     const issue=points.at(-1)?.[2]==null?'missing_session_anchor':null;
+    const ema=fiveMinute[row.symbol]?.find(p=>p.known_at===Math.floor(asOf/300)*300);
+    const betaEma=ema&&ema.ema9>0?{version:1,period:9,interval_seconds:300,
+      time:ema.time,known_at:ema.known_at,value:round(ema.ema9)}:null;
     const td=row.td?{...row.td,counts:row.td.counts.filter(p=>p[0]+60<=asOf&&p[0]>=asOf-36*3600)}:undefined;
-    current.push({...row,day,points,td,events:row.events.filter(e=>e.time+60<=asOf),metrics:null,
+    current.push({...row,day,points,td,beta_ema9:betaEma,events:row.events.filter(e=>e.time+60<=asOf),metrics:null,
       issue,last_closed:points.at(-1)?.[0]??null});
   }
   const fresh=current.filter(s=>s.last_closed+60===asOf), candidates=[],ranks=[],pending=[];
-  for (const row of fresh) if (row.metrics && !REFERENCES.has(row.symbol)) {
-    const facts=scoreInputs(row.points,fiveMinute[row.symbol],row.metrics.direction_sign,asOf);
-    if(!facts.ready){pending.push({symbol:row.symbol,reason:facts.reason});continue;}
-    const point=row.points.at(-1),price=point[7],vwap=point[2],ema=facts.ema9_5m;
-    const direction=price>vwap&&price>ema?1:price<vwap&&price<ema?-1:0;
-    // Keep the breakout episode for continuity, but only rank a confirmed price
-    // on the same side of both references. Mixed/equal positions are neutral.
-    if(direction!==row.metrics.direction_sign)continue;
-    candidates.push({symbol:row.symbol,...row.metrics,direction_price:price,direction_vwap:vwap,facts});
+  for(const row of fresh){
+    if(REFERENCES.has(row.symbol))continue;
+    const facts=scoreTrend(row,openingPositions[row.symbol],asOf);
+    if(facts?.ready)candidates.push({symbol:row.symbol,...facts});
+    else if(facts)pending.push({symbol:row.symbol,reason:facts.reason,...(facts.completed_minutes!=null?{completed_minutes:facts.completed_minutes}:{})});
   }
-  const speeds=candidates.map(r=>Math.max(0,r.rail_speed)), accelerations=candidates.map(r=>Math.max(0,r.rail_acceleration||0));
-  for (const {facts,...row} of candidates) {
-    row.rail_component=.75*percentile(Math.max(0,row.rail_speed),speeds)+.25*percentile(Math.max(0,row.rail_acceleration||0),accelerations);
-    const base=100*(.4*row.outer_fraction+.2*row.confidence+.2*row.rail_component+.2*row.drawdown_quality);
-    ranks.push({...row,...applyScore(base,facts)});
-  }
+  ranks.push(...candidates);
   ranks.sort(compareScores);
   ranks.forEach((r,i)=>r.rank=i+1);
-  return {version:1,generated_at:now,as_of:asOf,day,columns:COLUMNS,beta:BETA,ranks:ranks.slice(0,10),
-    scoring:{...SCORE_CONTRACT,pending,eligible:candidates.length+pending.length,ready:ranks.length},
+  const rankings=rankingViews(ranks);
+  return {version:1,generated_at:now,as_of:asOf,day,columns:COLUMNS,beta:BETA,ranks:rankings.mixed,rankings,
+    universe:[...symbols],
+    ranking_session:{version:1,phase:premarket?'premarket':'regular',
+      cohort:premarket?'available':'complete',ready_after:premarket?asOf+10:asOf},
+    scoring:{...SCORE_CONTRACT,stock_session:marketSession,pending,eligible:candidates.length+pending.length,ready:ranks.length},
     coverage:{received:current.length,aligned:fresh.length,ready:fresh.filter(s=>!s.issue).length,total:symbols.length,
       missing:symbols.filter(s=>!fresh.some(row=>row.symbol===s)),
       excluded:fresh.filter(s=>s.issue).map(s=>({symbol:s.symbol,reason:s.issue}))},
     series:Object.fromEntries(current.map(s=>[s.symbol,{...s,metrics:undefined,events:referenceEvents(s)}]))};
 }
-function createMarketRhythm({symbols,cachePath,marketSession=STOCK_SESSION,onFrame=null}) {
-  const series={},signatures=new Map(),fiveMinute={},fiveKeys=new Map(); let dirty=false,busy=false,changedAt=0;
+function createMarketRhythm({symbols,cachePath,marketSession=STOCK_SESSION,onFrame=null,onError=()=>{},clock=()=>Date.now()/1000}) {
+  const series={},signatures=new Map(),openingPositions={},openingKeys=new Map(),fiveMinute={},fiveKeys=new Map(),published=new Map(); let dirty=false,busy=false,changedAt=0;
   function changed(now){if(!dirty)changedAt=now;dirty=true;}
   return {
-    observeFiveMinute(symbol,periods,atrByTime,now){
+    observeOpeningPosition(symbol,output,now){
       if(REFERENCES.has(symbol))return;
+      const key=JSON.stringify(output??null);if(openingKeys.get(symbol)===key)return;
+      openingKeys.set(symbol,key);openingPositions[symbol]=output??null;changed(now);
+    },
+    observeFiveMinute(symbol,periods,atrByTime,now,ema5ByTime=new Map()){
+      if(!BETA.includes(symbol))return; // Five-minute EMA/ATR remain index observation only, never stock ranking inputs.
       // Overnight/pre-open, 1m RTH still refers to the previous close. Keep
       // the matching history rather than the newest overnight32 bars.
       const cutoff=Math.min(now,(series[symbol]?.last_closed??now-60)+60);
       const closed=(periods||[]).filter(p=>p.time+300<=cutoff);
-      const key=JSON.stringify([closed.map(p=>[p.time,p.close]),closed.slice(0,32).map(p=>[p.time,atrByTime?.get(p.time)??null])]);
+      const key=JSON.stringify([closed.map(p=>[p.time,p.close]),closed.slice(0,32).map(p=>[p.time,atrByTime?.get(p.time)??null,ema5ByTime?.get(p.time)??null])]);
       if(fiveKeys.get(symbol)===key)return;
-      fiveKeys.set(symbol,key);fiveMinute[symbol]=fiveMinuteHistory(periods,atrByTime,cutoff);changed(now);
+      fiveKeys.set(symbol,key);fiveMinute[symbol]=BETA.includes(symbol)?fiveMinuteHistory(periods,atrByTime,cutoff):fiveMinuteEma5History(periods,ema5ByTime,cutoff);changed(now);
     },
-    observe(symbol,bars,now,previousRange=null,daily=[]) {
+    observe(symbol,bars,now,previousRange=null,daily=[],receivedAt=now) {
       const closed=bars.filter(b=>b.time+60<=now);
       const signature=closed.map(b=>[b.time,b.open,b.high,b.low,b.close,b.volume].join(',')).join(';')+JSON.stringify([previousRange,daily.map(b=>b.time)]);
       if (!closed.length || signatures.get(symbol)===signature) return;
       signatures.set(symbol,signature);
-      series[symbol]={...calculateSeries(symbol,closed,now,daily,{marketSession}),previous_range:previousRange,
+      try {series[symbol]={...calculateSeries(symbol,closed,now,daily,{marketSession}),previous_range:previousRange,
         source:{interval_seconds:60,session:BETA.includes(symbol)?'default':marketSession,
           last_bar_time:bars.at(-1)?.time??null,last_closed_bar_time:closed.at(-1)?.time??null,
-          received_at:now,bar_count:bars.length}};
+          received_at:receivedAt,computed_at:clock(),bar_count:bars.length}};
+      }catch(error){
+        // A perception failure must not terminate candle ingestion for every
+        // stock. Remove this row instead of passing its old rank as fresh data.
+        delete series[symbol];
+        try{onError({symbol,message:String(error.message||error)});}catch{}
+      }
       changed(now);
+    },
+    confirmedState(symbol, now) {
+      const row=series[symbol],last=row?.td?.counts?.at(-1),point=row?.points?.at(-1);
+      if(!row||!last||!point||last[0]!==row.last_closed||point[0]!==last[0]
+          ||now-(last[0]+60)<0||now-(last[0]+60)>105)return null;
+      const key=JSON.stringify([last,point.slice(1,4),point[7],row.issue,row.source.computed_at]);
+      if(published.get(symbol)?.key!==key)published.set(symbol,{key,at:clock()});
+      return {version:1,symbol,time:last[0],td_count:last[1],comparison_bars:4,interval_seconds:60,
+        session:row.source.session,issue:row.issue||null,close:point[7],ema3:point[1],vwap:point[2],sigma:point[3],
+        received_at:row.source.received_at,computed_at:row.source.computed_at,published_at:published.get(symbol).at};
+    },
+    confirmedTd(symbol, now) {
+      // Reuse the same confirmed series as the chart/ranking; independent of
+      // cross-sectional scoring completeness and the stock still being ranked.
+      const row=series[symbol],last=row?.td?.counts?.at(-1);
+      if(!row||row.issue||!last||last[0]!==row.last_closed
+          ||now-(last[0]+60)<0||now-(last[0]+60)>105)return null;
+      return {version:1,time:last[0],count:last[1],comparison_bars:4,
+        interval_seconds:60,session:row.source.session};
     },
     async flush(now) {
       if (!dirty||busy||!cachePath||now-changedAt<3) return;
       busy=true; dirty=false;
       try {
-        const frame=buildFrame(series,symbols,now,fiveMinute);
+        const frame=buildFrame(series,symbols,now,fiveMinute,{marketSession,openingPositions});
+        // Give simultaneous subscriptions ten seconds to coalesce. No per-stock
+        // publication, and no frozen batch containing only the first arrival.
+        if(frame.ranking_session.phase==='premarket'&&now<frame.ranking_session.ready_after){
+          dirty=true;return;
+        }
         // Research is a side channel; it cannot change ranking or prevent publishing.
         try{const id=onFrame?.(frame);if(id)frame.ranking_batch_id=id;}catch{}
         await fs.mkdir(path.dirname(cachePath),{recursive:true});
@@ -222,7 +253,7 @@ function createMarketRhythm({symbols,cachePath,marketSession=STOCK_SESSION,onFra
         await fs.rename(temporary,cachePath);
       } catch(error) {dirty=true; throw error;} finally {busy=false;}
     },
-    reset(symbol) {signatures.delete(symbol);fiveKeys.delete(symbol);delete fiveMinute[symbol];delete series[symbol];dirty=true;},
+    reset(symbol) {delete openingPositions[symbol];openingKeys.delete(symbol);signatures.delete(symbol);fiveKeys.delete(symbol);published.delete(symbol);delete fiveMinute[symbol];delete series[symbol];dirty=true;},
   };
 }
 module.exports={BETA,COLUMNS,REFERENCES,calculateSeries,buildFrame,createMarketRhythm,session,minuteSubscriptionOptions};

@@ -59,7 +59,6 @@ WATCHLIST: List[str] = [
     "NASDAQ:SMH",
     "NYSE:BA",
     "NYSE:ORCL",
-    "NASDAQ:MSTR",
     "CAPITALCOM:NAS100",
     "NASDAQ:ARM",
     "NASDAQ:QQQ",
@@ -78,7 +77,6 @@ WATCHLIST: List[str] = [
     "NASDAQ:META",
     "AMEX:XLV",
     "NASDAQ:WMT",
-    "NYSE:CRCL",
     "NASDAQ:APP",
     "NASDAQ:SNDK",
     "NYSE:UNH",
@@ -164,11 +162,14 @@ RISK_PER_TRADE_USD = 1000.0       # 控制台手动单笔风险、执行实例�
 RISK_MAX_SYMBOL_POSITION_PCT = 140.0  # 同一股票全部未结束批次合计名义仓位上限
 RISK_MAX_ORDER_QTY = 100000       # 单笔最大股数硬顶（仅极端兜底，不再干扰以损定量）
 RISK_MAX_OPEN_POSITIONS = 0       # 最大同时持仓数；0 = 不限制（2026-10-22 用户要求取消三笔上限）
+RISK_MAX_DIRECTION_POSITIONS = 0  # 0=不限方向笔数；同向可多笔，仍检查风险金额
+RISK_SINGLE_DIRECTION_ONLY = True  # 同向可多笔/同股加仓；实际未结束订单禁止多空并存
 # 总风险敞口预算：全部开放 lot 的剩余风险（PENDING 全额计划风险 /
 # 已成交按「当前止损到成本的不利距离」，保本后归 0）合计超过该预算即拦截新开仓；
 # 0 = 不限制
 RISK_MAX_TOTAL_RISK_USD = float(_os.environ.get("RISK_MAX_TOTAL_RISK_USD", "2200"))
-RISK_MAX_DIRECTION_RISK_USD = 1100.0  # 多头、空头各自剩余风险上限，保本后释放
+RISK_MAX_DIRECTION_RISK_USD = RISK_MAX_TOTAL_RISK_USD  # 单向交易共用2200总预算，不保留旧1100子限额
+BETA_ABSOLUTE_ENTRY_FILTER_ENABLED = False  # 保留大盘状态观察口径；当前个股TD准入不依赖大盘过滤
 RISK_DAILY_LOSS_LIMIT_USD = 1000.0  # 日亏损熔断（SOD 净值锚点口径）
 ALLOW_SHORT = True                # 是否允许做空（2026-10-17 起双向交易：
                                   # 方向 = trend_state/ST 方向，无反向订单）
@@ -248,8 +249,8 @@ SLOW_BREAK_SECONDS = 900
 AUTO_BREAKEVEN_R = 2.0
 
 
-# 股票的一分钟与五分钟统一使用真实盘前盘后行情；交易窗口独立检查。
-TV_MARKET_SESSION = _os.environ.get("TV_MARKET_SESSION", "extended")
+# 股票的一分钟与五分钟统一使用常规交易时段行情；交易窗口独立检查。
+TV_MARKET_SESSION = _os.environ.get("TV_MARKET_SESSION", "regular")
 # 这些报价使用数据商的默认时段，不请求美股的 24h 子时段。
 TV_DEFAULT_SESSION_SYMBOLS = ("BLACKBULL:WTI", "CAPITALCOM:NAS100", "CAPITALCOM:SPX500")
 
@@ -260,8 +261,8 @@ def validate_config() -> None:
             raise RuntimeError("clientId=0 保留给 TWS 外部手动单绑定和撤单")
         if EXTERNAL_MANUAL_GUARD_FA_SCOPE == bool(EXTERNAL_MANUAL_GUARD_TEST_ACCOUNT):
             raise RuntimeError("外部手动单处理需明确选择 FA 组范围或指定测试账户")
-    if TV_MARKET_SESSION not in ("24h", "extended"):
-        raise RuntimeError("TV_MARKET_SESSION 必须为 24h 或 extended")
+    if TV_MARKET_SESSION not in ("regular", "24h", "extended"):
+        raise RuntimeError("TV_MARKET_SESSION 必须为 regular、extended 或 24h")
     required = (
         "TOOL_ORDER_ID_BASE", "TOOL_ORDER_ID_MAX", "TOOL_ORDER_ID_STATE_PATH",
         "AUTO_CLOSE_ON_ST_FLIP", "STOP_GUARD_ENABLED",

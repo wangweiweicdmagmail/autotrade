@@ -735,11 +735,29 @@ class MonitoringService:
                 now = time.time()
                 for lot in active:
                     lot_id = lot.get("lot_id")
-                    if lot.get("external_managed") or self.context.monitoring._is_pyramid_lot(lot):
+                    if lot.get("external_managed"):
                         continue
                     if lot.get("state") != "ACTIVE":
                         continue
                     side = lot.get("side")
+                    if trading_hours and self.context.settings._intelligent_exit().get('enabled') is True:
+                        outcome = await self.context.order_mgr.protect_intelligent_exit(
+                            lot_id, market.get(lot.get('symbol'), {}), now=now)
+                        action = outcome['action']
+                        if action not in ('waiting',):
+                            if outcome['ok']:
+                                self.context.events.record_event('intelligent_exit_action',
+                                    lot_id=lot_id, symbol=lot.get('symbol'), side=side, **outcome)
+                                logger.info('智能退出 %s %s: %s', lot_id, lot.get('symbol'), outcome)
+                            elif now-last_error.get('intelligent:'+lot_id, 0) >= 30:
+                                last_error['intelligent:'+lot_id] = now
+                                self.context.events.record_event('intelligent_exit_failed',
+                                    lot_id=lot_id, symbol=lot.get('symbol'), side=side, **outcome)
+                                logger.warning('智能退出未完成 %s: %s', lot_id, outcome)
+                        if action in ('close_submitted', 'half_submitted') or not outcome['ok']:
+                            continue
+                    if self.context.monitoring._is_pyramid_lot(lot):
+                        continue
                     if 'candidate_order_policy' in (lot.get('signal_snapshot') or {}):
                         # Explicit per-order settings supersede the ordinary R guard,
                         # including when its timer switch is off. Other models retain their rules.

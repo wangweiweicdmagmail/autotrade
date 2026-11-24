@@ -20,16 +20,29 @@ class ResearchService:
         self._backtest_history = OrderedDict()
         self._backtest_history_lock = asyncio.Lock()
         self._local_pine_history = LocalPineHistory(context.paths.data_dir / "backtest_history.sqlite3")
-        self._market_rhythm = MarketRhythmReader(context.paths.data_dir / "market_rhythm.json")
+        self._market_rhythm = MarketRhythmReader(context.paths.data_dir / "market_rhythm.json",
+            symbols=[s for s in config.WATCHLIST if s not in config.TV_DEFAULT_SESSION_SYMBOLS
+                     or s in ('CAPITALCOM:NAS100', 'CAPITALCOM:SPX500')])
 
-    def entry_candidates(self, now=None):
+    def entry_candidates(self, now=None, *, ranking='trend', view='mixed'):
         from execution.entry_admission import candidate_snapshot
         now=time.time() if now is None else now
-        return candidate_snapshot(self._market_rhythm.read(now=now),now,self.context.collector.latest())
+        return candidate_snapshot(self._market_rhythm.read(now=now, latest_only=True),now,self.context.collector.latest(),ranking=ranking,view=view)
 
-    def check_candidate_entry(self, symbol, side, now):
+    def check_candidate_entry(self, symbol, side, now, *, ranking='trend', view='mixed'):
         from execution.entry_admission import check_candidate
-        return check_candidate(self.entry_candidates(now),symbol,side)
+        return check_candidate(self.entry_candidates(now,ranking=ranking,view=view),symbol,side)
+
+    def entry_candidate_snapshots(self, now=None):
+        from execution.entry_admission import candidate_snapshot
+        from execution.confirmed_minute import build_snapshot
+        now=time.time() if now is None else now
+        frame=self._market_rhythm.read(now=now,latest_only=True)
+        market=self.context.collector.latest()
+        td=build_snapshot(market,now)
+        direction=build_snapshot(market,now,require_td=False)
+        views={view:candidate_snapshot(frame,now,market,view=view,td_snapshot=td,direction_snapshot=direction) for view in ('mixed','long','short')}
+        return {'trend':views['mixed'],'views':views,'confirmed_td':td,'confirmed_vwap':direction}
 
     async def api_market_rhythm(self, symbol: str = "", watch: str = "") -> dict:
         return await asyncio.to_thread(self._market_rhythm.read, symbol, watch=watch)

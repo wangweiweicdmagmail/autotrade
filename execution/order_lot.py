@@ -27,6 +27,7 @@ import math
 import time
 import uuid
 from execution.candidate_policy import POLICY_KEY, TIMER_RULE, breakeven_due_at, confirmed_minute_end, confirmed_candidate_st, valid_policy, vwap_entry_check, protection_price, trailing_reference
+from execution.intelligent_exit import STATE_KEY as INTELLIGENT_EXIT_STATE, plan_exit, valid_options
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
@@ -239,6 +240,8 @@ class OrderManager:
         self.market_health = None
         self.entry_admission = None  # Production injects confirmed candidate/direction admission.
         self.candidate_protection_options = None  # Shared live controls; only opted-in candidate lots.
+        self.intelligent_exit_options = None  # Explicit global opt-in, all console-managed positions.
+        self.intelligent_exit_market = None
         self.position_equity = None  # 生产运行时注入账户净值；离线执行可不启用
         self._load()
 
@@ -413,31 +416,15 @@ class OrderManager:
                         and row.symbol.split(":")[-1] == symbol.split(":")[-1]
                         and datetime.fromtimestamp(old_time, ET).date() == day):
                     return None, "该标的本日已有突破订单记录，不重复开仓"
-        if manual_entry and any(
-            lot.symbol.split(":")[-1] == symbol.split(":")[-1]
-            and lot.state in (ACTIVE, PENDING, CLOSING)
-            and lot.filled_qty > 0
-            and (
-                lot.trader == "auto"
-                or lot.limit_type.startswith("auto_")
-                or any(lot.signal_snapshot.get(key) for key in
-                       ("strategy_id", "auto_strategy", "pyramid_seed"))
-            )
-            for lot in self._lots.values()
-        ):
-            return None, "该标的已有自动策略仓位，禁止手动加仓"
-        if manual_entry and limit_type == "market" and any(
-            lot.symbol.split(":")[-1] == symbol.split(":")[-1]
-            and (lot.state in _OPEN_STATES or lot.entry_submission_pending)
-            for lot in self._lots.values()
-        ):
-            return None, "该股票已有未结束建仓批次，手动市价单只允许建仓一次"
         side = side.strip().lower()
         if side not in ("long", "short"):
             return None, f"方向非法: {side}（应为 long / short）"
         def admission():
+            ranking = (signal_snapshot or {}).get('candidate_ranking','trend')
+            if ranking!='trend':
+                return {'ok':False,'reason':'TD榜已移除，仅支持趋势榜开仓'}
             policy = (signal_snapshot or {}).get(POLICY_KEY)
-            if policy is not None and (not valid_policy(policy) or not manual_entry or limit_type != 'market'):
+            if policy is not None and (not valid_policy(policy) or not manual_entry or limit_type not in ('market','vwap_limit')):
                 return {'ok': False, 'reason': '候选预订单设置无效'}
             if policy is not None and self.candidate_protection_options is not None:
                 policy = self._effective_candidate_policy(policy)
@@ -450,14 +437,21 @@ class OrderManager:
                     return {'ok': False, 'reason': 'VWAP区间过滤：候选准入服务未启用'}
                 return {'ok':True}
             try:
-                result=self.entry_admission(symbol,side,time.time())
+                view=(signal_snapshot or {}).get('candidate_view','mixed')
+                if view not in ('mixed','long','short') or not manual_entry and view!='mixed':
+                    return {'ok':False,'reason':'候选方向榜仅用于手动开仓'}
+                result=self.entry_admission(symbol,side,time.time(),**({'view':view} if view!='mixed' else {}))
                 if not isinstance(result,dict) or result.get('ok') is not True:
                     return {'ok':False,'reason':(result or {}).get('reason','候选入场限制：候选验证失败')}
-                if policy and policy['vwap_outside_only']:
+                simple_entry=(result.get('evidence') or {}).get('entry_policy')=='stock_vwap_side_v1'
+                if simple_entry and policy is not None:
+                    policy={**policy,'vwap_outside_only':False}
+                    signal_snapshot[POLICY_KEY]=policy
+                if not simple_entry and policy and policy['vwap_outside_only']:
                     check = vwap_entry_check(result.get('evidence'), side, time.time())
                     if not check['ok']:
                         return check
-                if policy and policy['trailing_enabled'] and policy['trailing_source']=='st_1m_10_3':
+                if not simple_entry and policy and policy['trailing_enabled'] and policy['trailing_source']=='st_1m_10_3':
                     st=(result.get('evidence') or {}).get('candidate_st')
                     if not st or st.get('direction') != (1 if side=='long' else -1):
                         return {'ok':False,'reason':'ST跟踪入场：等待确认的一分钟ST（10，3）与仓位同向'}
@@ -562,11 +556,14 @@ class OrderManager:
         audit("risk_check_started", placement_requested_at=placement_received_at.get())
         realized = await self._gw.realized_pnl()  # 熔断基准：今日已实现盈亏
         exposure = self.risk_exposure()
+        directions = self.direction_position_counts()
         ok, why = self._risk.check_new_order(
             symbol, side, limit_px, stop_px, qty,
             open_positions=open_positions, daily_pnl=realized, risk_usd=risk_usd,
             open_risk_usd=exposure["total"],
             open_direction_risk_usd=exposure.get(side, 0),
+            open_direction_positions=directions[side],
+            open_opposite_positions=directions['short' if side == 'long' else 'long'],
             risk_ref_px=risk_ref_px)
         audit("risk_check_finished", allowed=ok, reason=why)
         if not ok:
@@ -721,7 +718,8 @@ class OrderManager:
 
     async def close_lot(self, lot_id: str,
                         ref_px: Optional[float] = None,
-                        exit_reason: str = "manual", *, market_exit: bool = False) -> Tuple[bool, str]:
+                        exit_reason: str = "manual", *, market_exit: bool = False,
+                        _pre_submit=None) -> Tuple[bool, str]:
         """提交平仓并进入 CLOSING；只有 watcher 确认实际成交后才 CLOSED。"""
         if exit_reason in ("st_flip", "trend_reverse", "fvg_reverse"):
             return False, "ST/反向FVG仅提醒，必须由用户明确手动平仓"
@@ -741,13 +739,16 @@ class OrderManager:
                 return False, "lot 没有可平仓的实际余仓"
             if self._gw.enabled and not self._gw._connected:
                 return False, "实盘券商未连接，平仓未提交"
-
             is_live = bool(self._gw.enabled and self._gw._connected)
             px = ref_px or lot.last_px or lot.avg_fill
             if not is_live:
                 # dry-run 没有券商异步成交，允许立即按虚拟成交价闭环。
                 if px <= 0:
                     return False, "无法确定平仓参考价"
+                if _pre_submit is not None:
+                    blocked = _pre_submit(lot)
+                    if blocked:
+                        return False, blocked
                 closed_before = lot.close_filled_qty
                 amount = lot.close_avg_fill * closed_before + px * lot.filled_qty
                 lot.close_filled_qty = closed_before + lot.filled_qty
@@ -782,6 +783,10 @@ class OrderManager:
 
             # 先持久化 CLOSING，再撤保护单；崩溃后也不会被当作普通 ACTIVE 重发。
             # 旧 ID 只留在所有权白名单，当前字段必须清空，避免重启把旧终态当新单。
+            if _pre_submit is not None:
+                blocked = _pre_submit(lot)
+                if blocked:
+                    return False, blocked
             self._remember_order(lot, lot.close_order_id, lot.close_permId,
                                  self._trade_perm_id(lot.close_trade))
             lot.close_order_id = None
@@ -881,7 +886,8 @@ class OrderManager:
     async def close_half(self, lot_id: str,
                          ref_px: Optional[float] = None,
                          exit_reason: str = "partial", *,
-                         quantity: Optional[int] = None) -> Tuple[bool, str]:
+                         quantity: Optional[int] = None, market_exit: bool = False,
+                         _pre_submit=None) -> Tuple[bool, str]:
         """平仓一半：先收缩 STOP 保护单到剩余数量，再 marketable 平一半；lot 保持 ACTIVE。
 
         关键顺序（防裸仓）：先减保护单数量 → 再平一半。平掉后 STOP 只保护剩余余仓。
@@ -913,6 +919,10 @@ class OrderManager:
             if not is_live:
                 if px <= 0:
                     return False, "无法确定平仓参考价"
+                if _pre_submit is not None:
+                    blocked = _pre_submit(lot)
+                    if blocked:
+                        return False, blocked
                 self._apply_partial_fill(lot, close_qty, px, exit_reason)
                 lot.note = f"平仓一半（dry-run）：平 {close_qty}，余 {remain_qty}"
                 lot.updated_at = time.time()
@@ -929,7 +939,12 @@ class OrderManager:
                 # 缺句柄则券商侧 STOP 数量未知，平一半后会留下超额 STOP
                 # （触发即变反向仓）；与 close_lot 同款守卫
                 return False, "缺保护单句柄，无法安全收缩保护数量；请先对账恢复句柄"
-            lot.partial_exit = {"qty": close_qty, "ref": f"autotrade:{lot.lot_id}:partial:{uuid.uuid4().hex}"}
+            if _pre_submit is not None:
+                blocked = _pre_submit(lot)
+                if blocked:
+                    return False, blocked
+            lot.partial_exit = {"qty": close_qty, "reason": exit_reason,
+                                "ref": f"autotrade:{lot.lot_id}:partial:{uuid.uuid4().hex}"}
             lot.close_order_id = None
             lot.close_trade = None
             self._save()  # persist before shrinking protection or submitting the reduction
@@ -938,6 +953,11 @@ class OrderManager:
                     lot.partial_exit = {}
                     self._save()
                     return False, "收缩止损单数量失败，中止平仓一半"
+                if int(trail.orderStatus.filled or 0) > lot.trail_order_filled_qty:
+                    lot.partial_exit = {}
+                    self._save()
+                    self._start_exit_watch(lot)
+                    return False, "保护单在减仓前发生成交，等待余仓核对，未提交减仓单"
 
             if px <= 0:
                 px = await self._ref_px(lot.symbol) or lot.avg_fill
@@ -951,7 +971,8 @@ class OrderManager:
             # 2. 平一半（marketable LIMIT，place_close 内部 2.5s 核对）
             result = await self._gw.place_close(lot.symbol, lot.side, close_qty, px,
                 **({"order_ref": lot.partial_exit["ref"]}
-                   if getattr(self._gw, "supports_order_refs", False) is True else {}))
+                   if getattr(self._gw, "supports_order_refs", False) is True else {}),
+                **({"market": True} if market_exit else {}))
             lot.close_order_id = result.get("order_id")
             lot.close_trade = result.get("trade")
             lot.close_permId = (result.get("permId")
@@ -984,7 +1005,7 @@ class OrderManager:
             return False
         actual = min(event.cumulative_qty, close_qty)
         if actual > 0:
-            self._apply_partial_fill(lot, actual, event.average_price, "partial")
+            self._apply_partial_fill(lot, actual, event.average_price, lot.partial_exit.get('reason', 'partial'))
             self._emit_fill(lot, event, actual)
         lot.partial_exit = {}
         lot.note = f"部分退出已核对：平 {actual}，余 {lot.filled_qty}"
@@ -2338,6 +2359,19 @@ class OrderManager:
     # 查询与聚合
     # ------------------------------------------------------------------
 
+    def direction_position_counts(self) -> dict:
+        """仅统计未结束批次或受理结果未知的方向。
+
+        同一FA批次分配到多个成员仍算一笔；不同批次不按标的合并。
+        CLOSED可为复盘保留filled_qty，它不是当前余仓，不能再次计为持仓。
+        未知受理仍按原恢复流程核对，不通过删除历史成交数量释放。
+        """
+        counts = {"long": 0, "short": 0}
+        for lot in self._lots.values():
+            if lot.side in counts and (lot.state in _OPEN_STATES or lot.entry_submission_pending):
+                counts[lot.side] += 1
+        return counts
+
     def risk_exposure(self) -> dict:
         """总风险敞口：全部开放 lot 的剩余风险合计（四舍五入 2 位）。
 
@@ -2677,7 +2711,106 @@ class OrderManager:
         if not isinstance(shared, dict) or shared.get('version') != 1:
             return None
         keys = ('version', 'timed_breakeven_enabled', 'breakeven_minutes', 'trailing_enabled', 'trailing_source')
-        return {**policy, **{k: shared.get(k) for k in keys}}
+        merged = {**policy, **{k: shared.get(k) for k in keys}}
+        if self.intelligent_exit_options is not None:
+            # The global module owns the timer, including when switched off.
+            merged['timed_breakeven_enabled'] = False
+        return merged
+
+    async def protect_intelligent_exit(self, lot_id: str, snapshot: dict, *, now: float) -> dict:
+        """Global, opt-in timer + confirmed TD exits, with durable deduplication.
+
+        Selection is serialized with stop operations. Exit/reduction is rechecked
+        inside its own public operation lock, so queued calls cannot reduce twice
+        or ignore a newly disabled switch. Unknown broker outcomes use the normal
+        CLOSING/partial_exit reconciliation and are never resent here.
+        """
+        waiting = {'ok': True, 'action': 'waiting'}
+        options = self.intelligent_exit_options() if self.intelligent_exit_options else None
+        if not valid_options(options) or not options['enabled']:
+            return waiting
+        lot = self._lots.get(lot_id)
+        if lot is None:
+            return {'ok': False, 'action': 'missing', 'detail': '订单不存在'}
+        if (lot.external_managed or lot.state != ACTIVE or lot.filled_qty <= 0
+                or lot.entry_submission_pending or lot.partial_exit):
+            return waiting
+        if getattr(self._gw, 'enabled', False) and not getattr(self._gw, '_connected', False):
+            return waiting
+        if self.market_health is not None and self.market_health().get('stale', True):
+            return waiting
+        started = time.monotonic()
+        async with self._operations.run(lot_id, OperationKind.STOP, lock=self._lot_lock(lot)) as decision:
+            if not decision.allowed or lot.state != ACTIVE or lot.partial_exit or lot.filled_qty <= 0:
+                return waiting
+            state = lot.signal_snapshot.setdefault(INTELLIGENT_EXIT_STATE, {'version': 1})
+            entry = lot.entry_broker_time or lot.entry_time
+            if not state.get('entry_time') and entry and 0 < entry <= now:
+                state.update(entry_time=entry, timer_rule=TIMER_RULE)
+                self._save()
+            plan = plan_exit(lot, snapshot, self.intelligent_exit_options(), now)
+            action = plan['action']
+            if action == 'waiting':
+                return waiting
+            if action == 'half' and self._gw.enabled:
+                trail = lot.trail_trade
+                if (trail is None or trail.isDone()
+                        or trail.orderStatus.status not in ('Submitted', 'PreSubmitted')
+                        or float(trail.orderStatus.filled or 0) > lot.trail_order_filled_qty):
+                    return waiting
+            if action == 'half' and lot.filled_qty <= 1:
+                state.update(td_consumed_bar=plan['td']['bar_time'], half_episode=plan['episode'],
+                             half_unavailable='余仓不足2股，不能减半；保留余仓等待后续保护')
+                self._save()
+                return {**waiting, 'action': 'half_skipped', 'detail': state['half_unavailable']}
+            if action in ('stop', 'protected'):
+                trail = lot.trail_trade
+                if action == 'stop' and ((self._gw.enabled and trail is None) or (trail is not None and
+                    (trail.isDone() or trail.orderStatus.status not in ('Submitted', 'PreSubmitted')
+                     or float(trail.orderStatus.filled or 0) > 0)) or lot.trail_order_filled_qty > 0):
+                    return waiting
+                if action == 'protected':
+                    state.update(timed_breakeven_done=True, due_at=plan['due_at'])
+                    self._save()
+                    return waiting
+                ok, detail = await self._update_trail_unlocked(lot, plan['target_stop'])
+                outcome = {**plan, 'ok': ok, 'action': 'stop_updated' if ok else 'failed', 'detail': detail}
+                if ok:
+                    state.update(timed_breakeven_done=True, breakeven_minutes=plan['breakeven_minutes'],
+                                 due_at=plan['due_at'], breakeven_applied_at=now)
+                state['last_result'] = dict(outcome, observed_at=now)
+                self._save()
+                return outcome
+
+        def pre_submit(current):
+            if self.market_health is not None and self.market_health().get('stale', True):
+                return '行情已陈旧，跳过旧智能退出请求'
+            current_now = now+max(0, time.monotonic()-started)
+            current_data = ((self.intelligent_exit_market() or {}).get(current.symbol, {})
+                            if self.intelligent_exit_market else snapshot)
+            current_plan = plan_exit(current, current_data, self.intelligent_exit_options(), current_now)
+            if (current.entry_submission_pending or current_plan['action'] != action
+                    or current_plan.get('exit_reason') != plan['exit_reason']
+                    or current_plan.get('episode') != plan.get('episode')):
+                return '智能退出设置或行情已变化，跳过旧请求'
+            state = current.signal_snapshot.setdefault(INTELLIGENT_EXIT_STATE, {'version': 1})
+            if current_plan.get('td'):
+                state['td_consumed_bar'] = current_plan['td']['bar_time']
+                if action == 'half':
+                    state['half_episode'] = current_plan['episode']
+            state['last_decision'] = dict(current_plan, observed_at=current_now, remaining_qty=current.filled_qty)
+            # The public operation atomically saves this evidence with its
+            # CLOSING or partial_exit intent before calling the broker.
+            return ''
+
+        if action == 'half':
+            ok, detail = await self.close_half(lot_id, ref_px=plan['price'], exit_reason=plan['exit_reason'],
+                                               market_exit=True, _pre_submit=pre_submit)
+        else:
+            ok, detail = await self.close_lot(lot_id, ref_px=plan['price'], exit_reason=plan['exit_reason'],
+                                              market_exit=True, _pre_submit=pre_submit)
+        return {**plan, 'ok': ok, 'action': ('half_submitted' if action == 'half' else 'close_submitted') if ok else 'failed',
+                'detail': detail}
 
     async def protect_candidate_order(self, lot_id: str, snapshot: dict, *, now: float) -> dict:
         """Apply the explicitly selected per-lot timer/trailing policy to the existing STOP.

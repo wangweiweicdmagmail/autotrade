@@ -65,3 +65,16 @@ test('production journal setup archives all model definitions without enabling c
   const config=rows.map(r=>JSON.parse(r.body)).find(r=>r.kind==='configuration');assert(config.payload.series.some(s=>s.interval==='1m'));
  }finally{await fs.rm(root,{recursive:true,force:true});}
 });
+
+test('one archive record preserves all three accepted views and context for side-only candidates',()=>{
+ const {rankingRecord}=require('../service/research_journal');
+ const at=Date.parse('2026-11-18T15:50:00Z')/1000;
+ const row=symbol=>({symbol,rank:1});
+ const frame={as_of:at,day:'2026-11-18',generated_at:at+5,beta:[],
+  ranks:[row('NASDAQ:A')],rankings:{mixed:[row('NASDAQ:A')],long:[row('NASDAQ:L')],short:[row('NASDAQ:S')]},
+  scoring:{pending:[]},coverage:{total:3,aligned:3,missing:[]},
+  series:Object.fromEntries(['NASDAQ:A','NASDAQ:L','NASDAQ:S'].map(s=>[s,{points:[[at-60,1,2]],source:{session:'regular'}}]))};
+ const record=rankingRecord(frame);assert.deepEqual(record.rankings,frame.rankings);
+ assert.deepEqual(Object.keys(record.context).sort(),['NASDAQ:A','NASDAQ:L','NASDAQ:S']);
+ assert.equal(record.context['NASDAQ:L'].point[0],at-60);
+});

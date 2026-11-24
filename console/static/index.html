@@ -9,7 +9,7 @@
   <link rel="stylesheet" href="https://unpkg.com/element-plus@2.9.1/theme-chalk/dark/css-vars.css" />
   <link rel="stylesheet" href="/static/style.css?v=candidate-policy-live-v11" />
   <link rel="stylesheet" href="/static/vwap-distribution.css?v=vwap-display-grace" />
-  <link rel="stylesheet" href="/static/market-rhythm.css?v=candidate-protection-live-v9" />
+  <link rel="stylesheet" href="/static/market-rhythm.css?v=opening15-midpoint-v7" />
   <link rel="stylesheet" href="/static/research-review.css?v=1" />
 </head>
 <body>
@@ -219,10 +219,10 @@
             <span class="price-value">{{ slot.close }}</span>
           </div>
 
-          <!-- 当前仅开放轨道市价；其他手动入口保留代码，暂时隐藏。 -->
+          <!-- 趋势开仓提供市价／VWAP限价；其他手动入口保留兼容代码并隐藏。 -->
           <el-tabs v-model="slots[i].limitType" class="tile-tabs" stretch>
             <el-tab-pane v-if="false" label="市价单" name="market"></el-tab-pane>
-            <el-tab-pane label="轨道市价" name="rhythm_market"></el-tab-pane>
+            <el-tab-pane label="趋势开仓" name="rhythm_market"></el-tab-pane>
             <el-tab-pane v-if="false" label="EMA快线" name="ema"></el-tab-pane>
             <el-tab-pane v-if="false" label="通道边沿" name="channel"></el-tab-pane>
             <el-tab-pane v-if="false" label="中点限价单" name="midpoint"></el-tab-pane>
@@ -246,16 +246,23 @@
           </div>
 
           <div v-if="!status.candidate_entry_required && slot.limitType === 'rhythm_market'" class="market-direction-control"><b>{{ slot.side === 'long' ? '趋势做多' : slot.side === 'short' ? '趋势做空' : '等待候选趋势' }}</b><small v-if="!slot.ready">{{ slot.blockReason || '候选或行情未就绪' }}</small></div>
+          <div v-if="slot.limitType === 'rhythm_market'" class="market-direction-control">
+            <el-radio-group :model-value="slot.orderType" :disabled="placing" @change="setCandidateOrderType(i,$event)"><el-radio-button value="MKT">市价单</el-radio-button><el-radio-button value="LMT">限价单</el-radio-button></el-radio-group>
+            <el-select v-if="slot.orderType==='LMT'" v-model="slots[i].limitLevel" :disabled="placing" style="width:180px" aria-label="VWAP回踩限价">
+              <el-option label="VWAP 中线" value="vwap"></el-option>
+              <el-option v-if="slot.side==='long'" label="多头上轨 +1σ" value="upper"></el-option>
+              <el-option v-if="slot.side==='short'" label="空头下轨 −1σ" value="lower"></el-option>
+            </el-select>
+          </div>
           <div class="market-direction-control"><label>初始止损 <el-select v-model="slots[i].stopMode" :disabled="placing" style="width:230px"><el-option label="5分钟 2×ATR（至少K线外）" value="atr_2"></el-option><el-option label="1分钟 VWAP 1σ" value="vwap_sigma" :disabled="!status.manual_stop_modes?.includes('vwap_sigma')"></el-option></el-select></label></div>
           <section v-if="slot.limitType === 'rhythm_market'" class="candidate-order-settings" aria-label="候选预订单设置">
-            <div><el-switch v-model="slots[i].vwapOutsideOnly" :disabled="placing" active-text="VWAP 区间内不开仓"></el-switch><small>多头在上轨外，空头在下轨外</small></div>
             <small>保本和跟踪止盈在“候选与订单”顶部统一设置。</small>
           </section>
 
           <!-- 当前 tab 的限价 + 止损（止损行合并显示距离幅度百分比） -->
           <div class="tile-quote">
             <div class="quote-row">
-              <span class="indic-label">{{ slots[i].limitType === 'ema' ? 'EMA快线 限价' : (slots[i].limitType === 'channel' ? '通道边沿 限价' : (slots[i].limitType === 'retest' ? '回踩 限价' : (['market','rhythm_market'].includes(slots[i].limitType) ? '市价（约）' : '中点 限价'))) }}</span>
+              <span class="indic-label">{{ slots[i].limitType === 'ema' ? 'EMA快线 限价' : (slots[i].limitType === 'rhythm_market' && slot.orderType==='LMT' ? 'VWAP 回踩限价' : slots[i].limitType === 'channel' ? '通道边沿 限价' : (slots[i].limitType === 'retest' ? '回踩 限价' : (['market','rhythm_market'].includes(slots[i].limitType) ? '市价（约）' : '中点 限价'))) }}</span>
               <b class="accent quote-val">{{ slot.limitPx ?? '—' }}</b>
             </div>
             <div class="quote-row">
@@ -280,8 +287,8 @@
             </li></ul>
           </section>
           <!-- Downstream policy rechecks these conditions before broker submission. -->
-          <el-button :type="slot.side === 'long' ? 'success' : (slot.side === 'short' ? 'danger' : 'info')" class="tile-btn" :disabled="!slot.ready || !slot.qty || placing || hasAutoPosition(slot.symbol) || manualEntryChecks(slot).some(c => !c.ok)" :title="hasAutoPosition(slot.symbol) ? '已有自动策略仓位，禁止手动加仓' : ''" @click="placeOrder(slot)">
-            {{ slot.minuteMarket && !slot.stSide ? '等待 1 分钟 ST' : (slot.side === 'long' ? '买入' : (slot.side === 'short' ? '卖出' : '震荡')) + ' ' + slot.qty + ' 股 · ' + typeLabel(slots[i].limitType) }}
+          <el-button :type="slot.side === 'long' ? 'success' : (slot.side === 'short' ? 'danger' : 'info')" class="tile-btn" :disabled="!slot.ready || !slot.qty || placing || manualEntryChecks(slot).some(c => !c.ok)" @click="placeOrder(slot)">
+            {{ slot.minuteMarket && !slot.stSide ? '等待 1 分钟 ST' : (slot.side === 'long' ? '买入' : (slot.side === 'short' ? '卖出' : '震荡')) + ' ' + slot.qty + ' 股 · ' + (slots[i].limitType==='rhythm_market' ? (slot.orderType==='LMT'?'限价单':'市价单') : typeLabel(slots[i].limitType)) }}
           </el-button>
         </div>
       </section>
@@ -391,11 +398,11 @@
               <research-review-panel :active="bottomTab === 'review'"></research-review-panel>
             </el-tab-pane>
             <el-tab-pane class="workspace-pane pane-rhythm" v-if="workspaceGroup === 'execution'" label="候选与订单" name="rhythm" lazy>
-              <market-rhythm ref="rhythmPanel" :active="bottomTab === 'rhythm'" :market="market" :now="now" :lots="lots" :positions-ready="lotsReady" :trader="traderName" :tv-sync-status="tvGridStatus+' · '+tvMarkerStatus" @select="selectRhythmStock" @manage="manageRhythmPosition" @grid="syncRhythmGrid" @open="openRhythmTrade" @frame="rhythmFrame=$event">
+              <market-rhythm ref="rhythmPanel" :active="bottomTab === 'rhythm'" :market="market" :td-snapshot="confirmedTd" :direction-snapshot="confirmedVwap" :now="now" :lots="lots" :positions-ready="lotsReady" :trader="traderName" :tv-sync-status="tvGridStatus+' · '+tvMarkerStatus" :ranking-snapshot-id="entryCandidates.ranking_snapshot?.id || ''" :data-admission-snapshot-id="entryCandidates.ranking_snapshot?.id || ''" @select="selectRhythmStock" @manage="manageRhythmPosition" @grid="syncRhythmGrid" @open="openRhythmTrade" @frame="rhythmFrame=$event">
               <template #protection-controls>
-                <div class="candidate-protection-toolbar" aria-label="候选持仓实时保护设置" title="作用于已有候选持仓及后续候选订单；排除入场分钟后计时，到期移至成本或立即市价退出；ST模式确认反向退出，其他策略不变">
-                  <div><el-switch :model-value="candidateProtection.timed_breakeven_enabled" :disabled="candidateProtectionSaving || demoMode || status.candidate_protection_live_version !== 1" active-text="持仓保本" @change="saveCandidateProtection('timed_breakeven_enabled',$event)"></el-switch><el-input-number :model-value="candidateProtection.breakeven_minutes" :disabled="candidateProtectionSaving || demoMode || !candidateProtection.timed_breakeven_enabled || status.candidate_protection_live_version !== 1" :min="1" :max="120" :step="1" step-strictly size="small" controls-position="right" @change="saveCandidateProtection('breakeven_minutes',$event)"></el-input-number><span>分钟</span></div>
-                  <div><el-switch :model-value="candidateProtection.trailing_enabled" :disabled="candidateProtectionSaving || demoMode || status.candidate_protection_live_version !== 1" active-text="跟踪止盈" @change="saveCandidateProtection('trailing_enabled',$event)"></el-switch><el-select :model-value="candidateProtection.trailing_source" :disabled="candidateProtectionSaving || demoMode || !candidateProtection.trailing_enabled || status.candidate_protection_live_version !== 1" size="small" @change="saveCandidateProtection('trailing_source',$event)"><el-option label="5分钟 EMA9" value="ema9_5m"></el-option><el-option label="1分钟 ST(10,3)" value="st_1m_10_3"></el-option></el-select></div>
+                <div class="candidate-protection-toolbar" aria-label="持仓退出与保护设置">
+                  <div class="intelligent-exit-control"><el-switch aria-label="智能退出仓位" :model-value="intelligentExit.enabled" :disabled="intelligentExitSaving || demoMode || status.intelligent_exit_version !== 1" active-text="智能退出仓位" @change="saveIntelligentExit('enabled',$event)"></el-switch><span class="intelligent-exit-summary">{{ intelligentExit.breakeven_minutes ?? 5 }}分钟保本</span><el-popover placement="bottom-start" :width="310" trigger="click"><template #reference><el-button link class="intelligent-exit-rules">细则</el-button></template><div class="intelligent-exit-details"><strong>全部控制台持仓</strong><p>定时保本：排除入场分钟，再数完整一分钟；浮盈时移止损至成本，成本或亏损侧市价退出。</p><div>保本时间 <el-input-number :model-value="intelligentExit.breakeven_minutes" :disabled="intelligentExitSaving || demoMode || status.intelligent_exit_version !== 1" :min="1" :max="120" :step="1" step-strictly size="small" controls-position="right" @change="saveIntelligentExit('breakeven_minutes',$event)"></el-input-number> 分钟</div><p>个股确认一分钟TD反向达3：收益≤0.3R全平，收益&gt;0.3R减半；达4余仓全平。</p><small>R按成交价到初始止损的距离；每段反向TD仅减半一次。关闭后停止新判断，已提交订单继续对账。跟踪止盈独立设置。</small></div></el-popover></div>
+                  <div><el-switch aria-label="候选跟踪止盈" :model-value="candidateProtection.trailing_enabled" :disabled="candidateProtectionSaving || demoMode || status.candidate_protection_live_version !== 1" active-text="跟踪止盈" @change="saveCandidateProtection('trailing_enabled',$event)"></el-switch><el-select :model-value="candidateProtection.trailing_source" :disabled="candidateProtectionSaving || demoMode || !candidateProtection.trailing_enabled || status.candidate_protection_live_version !== 1" size="small" @change="saveCandidateProtection('trailing_source',$event)"><el-option label="5分钟 EMA9" value="ema9_5m"></el-option><el-option label="1分钟 ST(10,3)" value="st_1m_10_3"></el-option></el-select></div>
                 </div>
               </template>
               <template #order-controls>
@@ -464,9 +471,6 @@
                         <el-button v-if="row.state === 'ACTIVE'" size="small" type="danger" plain :disabled="demoMode" @click="closeLot(row)">平仓</el-button>
                         <el-button v-if="row.state === 'ACTIVE'" size="small" type="danger" plain :disabled="demoMode || row.filled_qty <= 1" @click="closeHalf(row)">平掉一半</el-button>
                         <el-button v-if="row.state === 'PENDING' || (status.dry_run && row.state === 'ACTIVE')" size="small" type="warning" plain :disabled="demoMode" @click="cancelLot(row)">撤单</el-button>
-                        <el-dropdown v-if="row.state === 'ACTIVE' && !String(row.limit_type || '').startsWith('auto_') && !(row.signal_snapshot && (row.signal_snapshot.pyramid_seed || row.signal_snapshot.strategy_id))" trigger="click"><el-button size="small">更多 ▾</el-button><template #dropdown><el-dropdown-menu>
-                          <el-dropdown-item :disabled="demoMode" @click="adoptManualLot(row)">交由所选执行实例接管</el-dropdown-item>
-                        </el-dropdown-menu></template></el-dropdown>
                         <span v-if="!['ACTIVE', 'PENDING'].includes(row.state)" class="muted">{{ row.state === 'CLOSING' ? '等待退出回报' : '已结束' }}</span>
                       </div>
                     </template>
@@ -532,8 +536,8 @@
                               <span v-if="ev.retested" class="retested">已回踩</span>
                               <span v-else :class="ev.state">{{ fvgStateText(ev.state) }}</span>
                               <button v-if="fvgCanChase(ev)" class="fvg-chase-btn" :class="side"
-                                      :disabled="placing || hasAutoPosition(ev.symbol)"
-                                      :title="hasAutoPosition(ev.symbol) ? '已有自动策略仓位，禁止手动加仓' : '现价贴近缺口边缘，按市价追价'" @click.stop="chaseFvg(ev)">追</button>
+                                      :disabled="placing"
+                                      title="现价贴近缺口边缘，按市价追价" @click.stop="chaseFvg(ev)">追</button>
                             </div>
                           </div>
                         </template>
@@ -1862,8 +1866,8 @@
   <script src="https://unpkg.com/element-plus@2.9.1/dist/index.full.min.js"></script>
   <script src="/static/range-distribution.js?v=13"></script>
   <script src="/static/vwap-distribution.js?v=vwap-display-grace"></script>
-<script src="/static/market-rhythm.js?v=holdings-reference-slots-v2"></script>
+<script src="/static/market-rhythm.js?v=ranking-open-card-v7"></script>
   <script src="/static/research-review.js?v=1"></script>
-  <script src="/static/app.js?v=research-review-v1"></script>
+  <script src="/static/app.js?v=direction-risk-2200-v1"></script>
 </body>
 </html>

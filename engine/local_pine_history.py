@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import sqlite3
 from zoneinfo import ZoneInfo
+import config
 
 
 EMA7_MODEL = "ema7_autotrade_v2"
@@ -30,6 +31,14 @@ CREATE TABLE IF NOT EXISTS tv_5m_extended_splits (
     bar_limit INTEGER NOT NULL,
     dataset TEXT NOT NULL,
     PRIMARY KEY (symbol, cutoff, bar_limit)
+);
+CREATE TABLE IF NOT EXISTS tv_5m_session_splits (
+    symbol TEXT NOT NULL,
+    cutoff INTEGER NOT NULL,
+    bar_limit INTEGER NOT NULL,
+    session TEXT NOT NULL,
+    dataset TEXT NOT NULL,
+    PRIMARY KEY (symbol, cutoff, bar_limit, session)
 );
 CREATE TABLE IF NOT EXISTS pine_calculations (
     revision TEXT PRIMARY KEY,
@@ -83,10 +92,10 @@ async def _node(script: str, *args: str, payload=None):
         raise LocalPineHistoryError("本地历史数据进程返回了无效结果") from error
 
 
-def _validate_dataset(dataset: dict, cutoff: int, limit: int) -> dict:
+def _validate_dataset(dataset: dict, cutoff: int, limit: int, session='regular') -> dict:
     metadata = dataset["metadata"]
-    if metadata.get("session") != "extended":
-        raise LocalPineHistoryError("TradingView 未确认扩展交易时段")
+    if metadata.get("session") != session:
+        raise LocalPineHistoryError("TradingView 未确认所请求的交易时段")
     ZoneInfo(metadata["timezone"])
     if not all(math.isfinite(metadata[k]) and metadata[k] > 0 for k in ("minmove", "pricescale")):
         raise LocalPineHistoryError("TradingView 未返回有效的最小价格跳动")
@@ -128,8 +137,11 @@ def _target_day(symbol: str, day: str, rows: list) -> str:
 
 
 class LocalPineHistory:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, market_session=None):
         self.path = path
+        self.market_session=market_session or config.TV_MARKET_SESSION
+        if self.market_session not in ('regular','extended','24h'):
+            raise ValueError('历史K线时段无效')
 
     def _sql(self, statement: str, params: tuple, *, write=False):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -149,23 +161,24 @@ class LocalPineHistory:
             anchor -= timedelta(days=1)
         cutoff = int(anchor.timestamp())
         limit = max(600, bars)
-        window = (symbol, cutoff, limit)
+        session='default' if symbol in config.TV_DEFAULT_SESSION_SYMBOLS else self.market_session
+        window = (symbol, cutoff, limit, session)
         stored = await asyncio.to_thread(
-            self._sql, "SELECT dataset FROM tv_5m_extended_splits WHERE symbol=? AND cutoff=? AND bar_limit=?", window,
+            self._sql, "SELECT dataset FROM tv_5m_session_splits WHERE symbol=? AND cutoff=? AND bar_limit=? AND session=?", window,
         )
         if stored is None:
             requested = min(5000, limit + 1)
-            data = await _node("tv_backtest_bars.js", symbol, str(requested), str(cutoff))
+            data = await _node("tv_backtest_bars.js", symbol, str(requested), str(cutoff), session)
             try:
-                dataset = _validate_dataset(data, cutoff, limit)
+                dataset = _validate_dataset(data, cutoff, limit, session)
             except (KeyError, TypeError, ValueError) as error:
                 raise LocalPineHistoryError("TradingView 返回的 K 线或元数据格式无效") from error
         else:
-            dataset = json.loads(stored[0])
+            dataset = _validate_dataset(json.loads(stored[0]), cutoff, limit, session)
         resolved = _target_day(symbol, day, dataset["bars"])
         if stored is None:
             await asyncio.to_thread(
-                self._sql, "INSERT OR REPLACE INTO tv_5m_extended_splits VALUES (?, ?, ?, ?)",
+                self._sql, "INSERT OR REPLACE INTO tv_5m_session_splits VALUES (?, ?, ?, ?, ?)",
                 (*window, _encode(dataset)), write=True,
             )
 
@@ -179,7 +192,7 @@ class LocalPineHistory:
             "pine_inputs": INPUTS,
             "pinets_version": version,
             "candle_revision": _digest(_encode({"symbol": symbol, **dataset}).encode()),
-            "session": "extended",
+            "session": session,
             "adjustment": "splits",
             "bar_interval": "5m",
             "warmup_bars": WARMUP_BARS,

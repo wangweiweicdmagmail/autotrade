@@ -10,7 +10,6 @@ from fastapi import WebSocket, WebSocketDisconnect
 import config
 from console.shared import logger
 from execution.copy_channel import copy_channel_token
-from execution.entry_admission import TD_THRESHOLD
 
 
 class SnapshotService:
@@ -25,12 +24,16 @@ class SnapshotService:
         external = getattr(self.context, "external_guard_gateway", None)
         verified_accounts = (external._guard_verified_accounts if external and external._connected
                              and external._guard_verified_connection is not None else ())
+        candidates = self.context.research.entry_candidate_snapshots()
         return {
             "type": "snapshot",
             "ts": time.time(),
             "market_frame_id": self.context.collector.market_frame_id,
             "ipo_openings": self.context.ipo_alerts.snapshot(self.context.collector,time.time()),
-            "entry_candidates": self.context.research.entry_candidates(),
+            "entry_candidates": candidates['trend'],
+            "entry_candidate_views": candidates['views'],
+            "confirmed_td": candidates['confirmed_td'],
+            "confirmed_vwap": candidates['confirmed_vwap'],
             "status": {
                 "execution_enabled": bool(self.context.gateway.enabled),
                 "connected": bool(self.context.gateway._connected),
@@ -57,6 +60,9 @@ class SnapshotService:
                 "total_risk_usd": self.context.order_mgr.risk_exposure()["total"],
                 "max_total_risk_usd": config.RISK_MAX_TOTAL_RISK_USD,
                 "max_direction_risk_usd": config.RISK_MAX_DIRECTION_RISK_USD,
+                "max_direction_positions": self.context.risk_gate.cfg.max_direction_positions,
+                "single_direction_only": self.context.risk_gate.cfg.single_direction_only,
+                "direction_position_counts": self.context.order_mgr.direction_position_counts(),
                 "long_risk_usd": self.context.order_mgr.risk_exposure()["long"],
                 "short_risk_usd": self.context.order_mgr.risk_exposure()["short"],
                 "total_position_pct": self.context.accounts._total_position_pct(
@@ -73,12 +79,21 @@ class SnapshotService:
                 "tv_grid_cells": 8,
                 "tv_grid_layouts": {'candidates': 8, 'focus': 6},
                 "candidate_entry_required": getattr(self.context.order_mgr,'entry_admission',None) is not None,
-                "candidate_td_threshold": TD_THRESHOLD,
-                "candidate_ema9_filter": {"period": 9, "interval_seconds": 300, "price_source": "bar.close", "ema_source": "ts.ema_9"},
+                "candidate_ranking_modes": ['trend'],
+                "candidate_entry_data_version": 4,
+                "candidate_entry_policy": "stock_vwap_side_v1",
+                "candidate_beta_filter_version": 1,
+                "candidate_td_threshold": None,
+                "candidate_td_required": False,
+                "candidate_ema9_filter": {"required": False, "period": 9, "interval_seconds": 300, "price_source": "bar.close", "ema_source": "ts.ema_9"},
+                "manual_entry_types": ["market","vwap_limit"],
+                "vwap_limit_levels": {"long":["vwap","upper"],"short":["vwap","lower"]},
                 "manual_stop_modes": ['atr_2','vwap_sigma'],
                 "candidate_order_policy_version": 1,
                 "candidate_protection_live_version": 1,
                 "candidate_order_protection": self.context.settings._candidate_order_protection(),
+                "intelligent_exit_version": 1,
+                "intelligent_exit": self.context.settings._intelligent_exit(),
                 "tv_entry_markers": True,
                 "fvg_chase_max_ratio": config.FVG_CHASE_MAX_ATR_RATIO,
                 "stop_atr_mult": self.context.settings._stop_atr_mult(),

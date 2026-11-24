@@ -4,6 +4,7 @@ const reviewActionNames = {entry:'开仓',entry_intent:'开仓计划',exit:'平�
   manual_stop_changed:'调整止损',manual_stop_failed:'止损调整失败',order_close_requested:'请求平仓',
   order_close_half:'减半仓',order_cancelled:'撤单',broker_order:'券商回报',
   candidate_order_protection:'候选持仓保护',candidate_order_protection_failed:'保护操作失败',
+  intelligent_exit_action:'智能退出仓位',intelligent_exit_failed:'智能退出未完成',
   auto_breakeven:'自动保本',pyramid_breakeven:'自动保本',execution_entry_stage:'执行阶段'};
 const reviewActorNames = {human:'人工操作',automatic:'自动规则',protective_stop:'保护止损',
   external_guard:'外部订单守卫',broker_report:'券商确认',system_execution:'执行流程',notice:'系统提醒',unknown:'意图待核实'};

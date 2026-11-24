@@ -142,7 +142,7 @@ def test_ema7_reuses_persistent_pine_outputs_when_start_changes(console_app, mon
         price = 100 + index * 0.03
         history.append({"time": stamp, "open": price, "high": price + 0.25,
                         "low": price - 0.25, "close": price + 0.05, "volume": 100})
-    dataset = {"metadata": {"timezone": "America/New_York", "session": "extended",
+    dataset = {"metadata": {"timezone": "America/New_York", "session": "regular",
                             "minmove": 1, "pricescale": 100}, "bars": history}
     calls = []
     run_node = local._node
@@ -150,7 +150,7 @@ def test_ema7_reuses_persistent_pine_outputs_when_start_changes(console_app, mon
     async def node(script, *args, **kwargs):
         calls.append(script)
         if script == "tv_backtest_bars.js":
-            assert args == (SYMBOL, "601", str(int(first_bar.timestamp()) + 78 * 300))
+            assert args == (SYMBOL, "601", str(int(first_bar.timestamp()) + 78 * 300), "regular")
             return dataset
         return await run_node(script, *args, **kwargs)
 
@@ -209,7 +209,7 @@ def test_ema7_rejects_incomplete_session_without_caching(console_app, monkeypatc
 
     async def node(script, *args, **kwargs):
         calls.append(script)
-        return {"metadata": {"timezone": "America/New_York", "session": "extended",
+        return {"metadata": {"timezone": "America/New_York", "session": "regular",
                              "minmove": 1, "pricescale": 100}, "bars": bars}
 
     monkeypatch.setattr(local, "_node", node)

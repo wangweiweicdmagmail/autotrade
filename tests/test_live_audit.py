@@ -15,6 +15,7 @@ def test_audit_keeps_exact_market_frames_and_decision_link(tmp_path):
         events = EventsService(context)
         symbol = "NASDAQ:TEST"
         row = {
+            "session": {"requested":"regular","resolved":"regular","accepted":True},
             "bar": {"time": 1800, "close": 101},
             "bar_c": {"time": 1500, "close": 100},
             "e9": {"time": 1800, "touch": 1},

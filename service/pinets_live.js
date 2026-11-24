@@ -96,7 +96,7 @@ function createLocalIndicators({ onError = () => {}, onReady = () => {}, onResul
       state.busy = true;
       state.nextAt = now + REFRESH_MS;
       slot.job = candidate;
-      const missing = indicatorKeys ? indicatorKeys.some(key => !state.history[key]) : intervalSeconds === 60 ? !state.history.vwap_pullback :
+      const missing = indicatorKeys ? indicatorKeys.some(key => !state.history[key]) : intervalSeconds === 60 ? !state.history.vwap_pullback || !state.history.opening_position :
         !state.history.e9 || !state.history.trend || (candidate.dataset.daily.length > 0 && !state.history.attack);
       candidate.history = state.historyKey !== candidate.historyKey || missing;
       const previous = state.completed;

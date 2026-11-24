@@ -62,7 +62,8 @@ async def fetch_history(symbol: str, bars: int = 500,
         out_path = f.name
     cmd = ["node", str(DUMP_JS), "--symbols", symbol,
            "--range", str(bars), "--out", out_path,
-           "--default-session-symbols", ",".join(sorted(config.TV_DEFAULT_SESSION_SYMBOLS))]
+           "--default-session-symbols", ",".join(sorted(config.TV_DEFAULT_SESSION_SYMBOLS)),
+           "--session", config.TV_MARKET_SESSION]
     if day:
         anchor = datetime.fromisoformat(day).replace(
             hour=16, minute=0, tzinfo=ET)

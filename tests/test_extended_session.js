@@ -1,17 +1,22 @@
 'use strict';
 const {test}=require('node:test'),assert=require('node:assert/strict');
 const fs=require('node:fs'),path=require('node:path'),vm=require('node:vm');
-const {calculateVwap1m,candidateProtectionSnapshot,openingVwapSnapshot}=require('../service/vwap_1m');
-const {calculateSeries,createMarketRhythm,minuteSubscriptionOptions}=require('../service/market_rhythm');
+const {calculateVwap1m:sessionVwap,candidateProtectionSnapshot:sessionProtection,openingVwapSnapshot:sessionOpening}=require('../service/vwap_1m');
+const {calculateSeries:sessionSeries,createMarketRhythm,minuteSubscriptionOptions}=require('../service/market_rhythm');
 const {createCalculator,getDefinition}=require('../service/pinets_runtime');
 const {emaFromPeriods}=require('../service/ema');
+// Extended remains an explicit historical-input compatibility option. Production defaults are regular.
+const calculateVwap1m=(bars,options={})=>sessionVwap(bars,{marketSession:'extended',...options});
+const candidateProtectionSnapshot=(bars,now)=>sessionProtection(bars,now,{marketSession:'extended'});
+const openingVwapSnapshot=(bars,now)=>sessionOpening(bars,now,{marketSession:'extended'});
+const calculateSeries=(symbol,bars,now,daily=[])=>sessionSeries(symbol,bars,now,daily,{marketSession:'extended'});
 const OPEN=Date.parse('2026-11-20T14:30:00Z')/1000;
 const bar=(time,p,i=0)=>({time,open:p-.12,high:p+.4,low:p-.3,close:p,volume:100+i*3});
 const minutes=(n=400)=>Array.from({length:n},(_,i)=>bar(OPEN-19800+i*60,100+i*.02+Math.sin(i/13),i));
 const meta={timezone:'America/New_York',minmove:1,pricescale:100,session:'extended',type:'fund'};
 const near=(a,b,tolerance=1e-6)=>assert(Math.abs(a-b)<tolerance,`${a} != ${b}`);
 
-test('both production resolutions request extended hours, while index minute requests omit session',async()=>{
+test('both production resolutions request regular hours, while index minute requests omit session',async()=>{
   for(const symbol of ['NASDAQ:QQQ','CAPITALCOM:NAS100']){
     const charts=[],timers=[];
     class Chart{constructor(){charts.push(this);}onUpdate(){}onError(){}setMarket(symbol,options){this.symbol=symbol;this.options=options;}}
@@ -28,10 +33,10 @@ test('both production resolutions request extended hours, while index minute req
     vm.runInContext(fs.readFileSync(file,'utf8').replace('main().catch','globalThis.done=main().catch'),context);
     await context.done;timers.find(t=>t.fn.name==='subscribeMinute').fn();
     const five=charts[0].options,minute=charts[1].options;
-    if(symbol==='NASDAQ:QQQ'){assert.equal(five.session,'extended');assert.equal(minute.session,'extended');assert.equal(minute.range,4000);}
+    if(symbol==='NASDAQ:QQQ'){assert.equal(five.session,'regular');assert.equal(minute.session,'regular');assert.equal(minute.range,4000);}
     else{assert.equal(five.session,undefined);assert(!Object.hasOwn(minute,'session'));}
   }
-  assert.equal(minuteSubscriptionOptions(false).session,'extended');
+  assert.equal(minuteSubscriptionOptions(false).session,'regular');
 });
 
 test('EMA7, standard session VWAP bands, position and seven-minute speed agree with the Pine original across the open',async()=>{
@@ -88,11 +93,12 @@ test('sparse premarket is real warm-up, while missing session prefix and missing
   assert.equal(calculateSeries('NASDAQ:QQQ',dense.filter(b=>b.time!==OPEN+120),OPEN+1200).issue,'minute_gap');
 });
 
-test('a new day resets VWAP at its first extended bar without resetting EMA or polluting yesterday RTH display',()=>{
+test('a new day starts a premarket observation ranking and regular ranking still resets at 09:30',()=>{
   const prior=minutes(350),next=minutes(350).map(b=>bar(b.time+3*86400,b.close+20));
   const before=calculateSeries('NASDAQ:QQQ',prior,prior.at(-1).time+60);
   const overnight=calculateSeries('NASDAQ:QQQ',[...prior,...next.slice(0,100)],next[99].time+60);
-  assert.deepEqual(overnight.points,before.points);assert.equal(overnight.day,before.day);
+  assert.equal(overnight.ranking_phase,'premarket');assert.notEqual(overnight.day,before.day);
+  assert.equal(overnight.points[0][0],next[0].time);assert.equal(overnight.points.length,100);
   const first=calculateVwap1m([...prior,next[0]]);
   near(first.vwap,(next[0].high+next[0].low+next[0].close)/3);
   assert.notEqual(first.ema,next[0].close);assert.equal(first.speed,null);
@@ -112,4 +118,20 @@ test('five-minute EMA9 is unchanged standard close EMA and shares the extended i
   let expected=periods.at(-1).close;
   for(const b of [...periods].reverse().slice(1))expected=.2*b.close+.8*expected;
   near(emaFromPeriods(periods,0,9),expected,1e-10);
+});
+
+test('read-only historical replay is explicit and leaves ordinary chart requests unchanged',async()=>{
+ const {fetchChart}=require('../service/history_bars');
+ for(const replay of [false,true]){
+  let requested,callback;
+  class Chart{
+   constructor(){this.infos={subsession_id:'regular',timezone:'America/New_York',pricescale:100,minmov:1};this.periods=[{time:300,open:100,max:101,min:99,close:100,volume:100}];}
+   onError(){}onUpdate(fn){callback=fn;}delete(){}
+   setMarket(symbol,options){requested=options;callback(['$prices']);}
+  }
+  const result=await fetchChart({Session:{Chart}},'NASDAQ:A',{timeframe:'1',range:1,to:600,session:'regular',replay});
+  assert.equal(requested.session,'regular');assert.equal(result.bars[0].time,300);
+  assert.equal(requested[replay?'replay':'to'],600);
+  assert.equal(requested[replay?'to':'replay'],undefined);
+ }
 });

@@ -10,6 +10,15 @@ class UpdateTrailRequest(BaseModel):
     stop_px: float = Field(..., gt=0)
 
 
+class IntelligentExitOptions(BaseModel):
+    version: Literal[1] = 1
+    enabled: StrictBool = False
+    breakeven_minutes: conint(strict=True, ge=1, le=120) = 5
+
+    class Config:
+        extra = 'forbid'
+
+
 class CandidateProtectionOptions(BaseModel):
     version: Literal[1] = 1
     timed_breakeven_enabled: StrictBool = True
@@ -38,6 +47,9 @@ class LimitStopOrderRequest(BaseModel):
     force: bool = False
     market_direction_mode: Literal["st", "manual", "candidate"] = "st"
     manual_stop_mode: Literal["atr_2", "vwap_sigma"] = "atr_2"
+    candidate_ranking: Literal["trend"] = "trend"
+    candidate_view: Literal["mixed", "long", "short"] = "mixed"
+    vwap_limit_level: Literal["vwap", "upper", "lower"] = "vwap"
     range_direction_confirmed: bool = False
     entry_mode: Literal["default", "rhythm_atr", "rhythm_sigma"] = "default"
     candidate_order: Optional[CandidateOrderOptions] = None
@@ -110,6 +122,7 @@ class CopyCmdRequest(BaseModel):
 
 
 class SettingsRequest(BaseModel):
+    intelligent_exit: Optional[IntelligentExitOptions] = None
     candidate_order_protection: Optional[CandidateProtectionOptions] = None
     stop_atr_mult: Optional[float] = Field(None, description="止损 ATR 倍数（0.2~5.0）")
     screen_premarket_filter: Optional[bool] = Field(

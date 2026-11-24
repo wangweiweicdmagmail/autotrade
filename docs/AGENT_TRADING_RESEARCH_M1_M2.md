@@ -1,3 +1,5 @@
+> 2026-11-24本轮最终规则：[开盘小区间中点归一化前十榜](OPENING_POSITION_RANKING.md)。中点为0、半宽为1，默认混合，可查看全池多头／空头前十；09:45起新开仓，开仓方向仍按最新确认close／VWAP。此前VWAP／EMA评分描述仅供历史追溯。
+
 # Agent 研究归档与逐单复盘使用说明
 
 M1与M2已实现。本版增加旁路行情归档、历史补取、榜单版本、订单研究投影、逐单问题、方法记录和离线CLI。M3完整策略实验与M4影子决策仍按[开发方案](AGENT_TRADING_RESEARCH_PLAN.md)后续实施。
@@ -107,3 +109,6 @@ python research.py --data-dir logs backup --to /path/to/new-research-backup.sqli
 2026-11-23在不含生产日志、凭据和历史导出数据的临时项目副本中完成完整回归：Python 994项通过、13项跳过、4项live测试排除；Node 233项通过。Python保留一条既有跟单测试中FakeProc.wait未等待的RuntimeWarning。代码及文档通过`git diff --check`。本次未重启正式控制台，新增采集的正式运行验收留待下次正常启动。
 
 性能样本使用合成的54个标的订阅矩阵，共245534根已确认K线。本机单次测量中，Node预载归档回调合计约63ms，含异步持久日志约282ms；已保存4000根的重复更新回调平均约0.39ms，后台SQLite导入约3.54秒，零丢弃、零归档问题。该样本验证新增归档开销，不代表真实开盘的端到端行情或交易延迟；正式采集需在用户正常重启后另行观察。
+
+
+2026-11-24：新增数据库优先的`cache-ranking-day`与`rank-at`，目标日完整1m／5m直接入现有archive.sqlite3，指定时刻严格截断并使用同一生产评分；不写真实历史榜单。股票当前默认regular，指数default；具体版本与命令见[评分及历史重建](TREND_SCORE_V6.md)。
