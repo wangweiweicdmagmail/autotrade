@@ -90,9 +90,9 @@
 .rhythm-orders .order-title { flex-wrap:wrap; justify-content:flex-start; gap:6px; padding:4px 0 8px; }
 .rhythm-orders .order-title>span:first-child { margin-right:0; }
 /* Keep a clear title/controls row and moderate breathing room around the board. */
-.rhythm-native { padding:4px 8px; gap:6px; }
-.rhythm-native .rhythm-board { grid-template-columns:288px minmax(0,1fr); }
-.rhythm-native .rhythm-orders { display:flex; flex-direction:column; }
+.rhythm-native { padding:4px 4px; gap:6px; }
+.rhythm-native .rhythm-board { grid-template-columns:240px minmax(0,1fr); gap:6px; }
+.rhythm-native .rhythm-orders { display:flex; flex-direction:column; container-type:inline-size; container-name:candidate-orders; }
 .rhythm-native .rhythm-orders>.orders-tab-panel { flex:1; min-height:0; height:auto; }
 .rhythm-order-header { display:flex; flex-wrap:wrap; flex:none; align-items:center; gap:4px 12px; padding:2px 6px 5px; }
 .rhythm-native .rhythm-title { flex-direction:column; align-items:flex-start; gap:4px; }
@@ -123,7 +123,7 @@
 .rhythm-benchmark-row .rhythm-rank-td { min-width:51px; text-align:center; }
 .rhythm-rank-list { flex:1; min-height:min-content; display:grid; grid-auto-rows:minmax(28px,1fr); gap:2px; padding:0 4px 4px; }
 .market-rhythm .rhythm-rank-row { display:flex; gap:4px; align-items:center; min-width:0; padding:1px 4px; border:1px solid transparent; border-radius:4px; background:transparent; }
-.market-rhythm .rhythm-rank-pick { flex:1; min-width:0; display:grid; grid-template-columns:34px minmax(0,1fr); gap:4px; align-items:center; padding:0; text-align:left; background:transparent; border:0; }
+.market-rhythm .rhythm-rank-pick { flex:1; min-width:0; display:grid; grid-template-columns:28px minmax(0,1fr); gap:4px; align-items:center; padding:0; text-align:left; background:transparent; border:0; }
 .market-rhythm .rhythm-rank-pick[aria-pressed=true] { background:transparent; color:inherit; }
 .rhythm-rank-selected { border-color:var(--rhythm-blue)!important; background:#273e5e!important; }
 .market-rhythm .rhythm-held { border-left:3px solid var(--rhythm-gold); padding-left:2px; background:#e8c3690b; }
@@ -132,7 +132,9 @@
 .rhythm-held .rhythm-rank-name i { color:var(--rhythm-gold); font-size:11px; }
 .rhythm-rank-row .rhythm-rank { font-size:14px; }
 .rhythm-rank-row b { font-size:15px; line-height:1.25; }.rhythm-rank-row i { font-style:normal; font-size:13px; }
-.rhythm-rank-name { display:flex; align-items:center; justify-content:space-between; gap:4px; }
+.rhythm-rank-name { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:0 3px; }
+.rhythm-rank-name>small { grid-column:1; grid-row:2; }
+.rhythm-rank-name>.rhythm-rank-td { grid-column:2; grid-row:1 / span 2; }
 .rhythm-rank-name>span:first-child { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .rhythm-rank-td { flex:none; font-size:13px; font-weight:600; line-height:1.2; font-variant-numeric:tabular-nums; white-space:nowrap; padding:1px 3px; border:1px solid currentColor; border-radius:3px; }
 .rhythm-rank-td.rhythm-td-up { color:#22c55e; }.rhythm-rank-td.rhythm-td-down { color:#f23645; }.rhythm-rank-td.rhythm-td-range { color:#919191; }.rhythm-rank-td.rhythm-td-unknown { color:var(--muted); }
@@ -142,8 +144,39 @@
 @media(max-width:600px) { .rhythm-board { flex:none; min-height:auto; display:flex; flex-direction:column; }.rhythm-ranking { max-height:none; overflow:visible; }.rhythm-orders { min-height:360px; } }
 .rhythm-track-pick strong.rhythm-long small { color:var(--rhythm-green); }
 .rhythm-track-pick strong.rhythm-short small { color:var(--rhythm-red); }
-.market-rhythm .rhythm-open-order { flex:0 0 64px; min-width:64px; min-height:24px; font-size:12px; font-weight:600; padding:3px 6px; line-height:1.2; text-align:center; color:inherit; border-color:currentColor; }
+.market-rhythm .rhythm-open-order { flex:0 0 50px; min-width:50px; min-height:24px; font-size:12px; font-weight:600; padding:3px 6px; line-height:1.2; text-align:center; color:inherit; border-color:currentColor; }
 .market-rhythm .rhythm-open-order:disabled { opacity:.45; cursor:default; }
 .market-rhythm .rhythm-tv-status { max-width:420px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 
 .rhythm-view-switch{display:flex;gap:4px;padding:2px 7px 6px;flex-shrink:0}.rhythm-view-switch button{flex:1;min-width:0;padding:5px 2px;border:1px solid var(--panel-border);border-radius:4px;background:transparent;color:var(--muted);font-size:12px;cursor:pointer}.rhythm-view-switch button.selected{border-color:var(--rhythm-gold);color:var(--rhythm-gold);background:rgba(222,183,83,.09)}
+
+/* Keep the complete order row in the available pane, including narrow windows. */
+.rhythm-orders .order-batch-table .cell { padding-inline:4px; }
+.rhythm-orders .order-batch-table .lot-price-line { gap:4px; }
+.rhythm-orders .order-batch-table .lot-order-note { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.rhythm-orders .order-batch-table .lot-history { font-size:11px; }
+.rhythm-orders .order-batch-table .lot-time { display:flex; align-items:baseline; gap:4px; width:100%; }
+.rhythm-orders .order-batch-table .lot-time>span { flex:none; color:var(--muted); }
+.rhythm-orders .order-batch-table .lot-time time { min-width:0; font-variant-numeric:tabular-nums; }
+.rhythm-orders .order-batch-table .lot-exit-price { white-space:nowrap; }
+@container candidate-orders (max-width:703px) {
+  .order-batch-table .el-table__header-wrapper { display:none; }
+  .order-batch-table .el-table__body { width:100%!important; }
+  .order-batch-table .el-table__body colgroup { display:none; }
+  .order-batch-table .el-table__body tbody { display:block; }
+  .order-batch-table .el-table__row { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:2px 8px; padding:6px 4px; border-bottom:1px solid var(--panel-border); }
+  .order-batch-table .el-table__cell { display:block; min-width:0; border:0; }
+  .order-batch-table .el-table__cell .cell { white-space:normal; }
+  .order-batch-table .el-table__cell::before { display:block; padding:0 4px 2px; font-size:10px; color:var(--muted); }
+  .order-batch-table .lot-col-symbol { grid-column:1; grid-row:1 / span 2; }
+  .order-batch-table .lot-col-state { grid-column:2; grid-row:1; }
+  .order-batch-table .lot-col-quantity { grid-column:3; grid-row:1; }
+  .order-batch-table .lot-col-pnl { grid-column:2; grid-row:2; }
+  .order-batch-table .lot-col-pnl::before { content:'盈亏'; }
+  .order-batch-table .lot-col-prices { grid-column:3; grid-row:2; }
+  .order-batch-table .lot-col-actions { grid-column:1; grid-row:3; }
+  .order-batch-table .lot-col-history { grid-column:2 / span 2; grid-row:3; }
+  .order-batch-table .lot-history .lot-time { flex-wrap:wrap; }
+  .order-batch-table .lot-closed-start td { border-top:0!important; }
+  .order-batch-table .lot-closed-start { border-top:12px solid var(--bg); }
+}
