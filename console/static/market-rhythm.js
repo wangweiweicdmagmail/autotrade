@@ -89,8 +89,9 @@ function rhythmRankingReady(frame) {
 }
 
 // Presentation slots only. Raw ranks and execution admission remain independent.
-function rhythmDisplaySlots(previous, frame, positions=[]) {
-  const ranked=[...(frame?.ranks||[])].filter(r=>r?.symbol).sort((a,b)=>a.rank-b.rank).slice(0,10);
+function rhythmDisplaySlots(previous, frame, positions=[], rankingView='mixed') {
+  const sourceRows=frame?.rankings?.[rankingView]??(rankingView==='mixed'?frame?.ranks:null);
+  const ranked=[...(sourceRows||[])].filter(r=>r?.symbol).sort((a,b)=>a.rank-b.rank).slice(0,10);
   const held=positions.map(p=>p.symbol);
   const day=frame?.day||'',nextBucket=Number.isFinite(frame?.as_of)?Math.floor(frame.as_of/600):0;
   const valid=previous?.version===2&&previous.day===day&&Array.isArray(previous.order)&&Array.isArray(previous.heldOrder)
@@ -100,9 +101,12 @@ function rhythmDisplaySlots(previous, frame, positions=[]) {
   const accepted=frame?.ranking_snapshot;
   const authoritative=accepted?.version===1&&typeof accepted.id==='string'&&accepted.id
     &&accepted.as_of===frame.as_of&&accepted.day===day;
-  const accept=rhythmRankingReady(frame)&&(authoritative
+  const changedView=valid&&(previous.rankingView||'mixed')!==rankingView;
+  const ready=rhythmRankingReady(frame)&&Array.isArray(sourceRows);
+  if(changedView&&!ready)return previous;
+  const accept=ready&&(changedView||(authoritative
     ? !valid||previous.candidateSnapshotId!==accepted.id
-    : !valid||!Number.isFinite(previous.candidateAsOf)||frame.as_of>previous.candidateAsOf);
+    : !valid||!Number.isFinite(previous.candidateAsOf)||frame.as_of>previous.candidateAsOf));
   const eligible=accept?[...new Set(ranked.map(r=>r.symbol))]:valid?
     [...(Array.isArray(previous.candidates)?previous.candidates:previous.order.filter(s=>!previous.heldOrder.includes(s)))]:[];
   const candidateAsOf=accept?frame.as_of:valid?previous.candidateAsOf??null:null;
@@ -122,7 +126,7 @@ function rhythmDisplaySlots(previous, frame, positions=[]) {
   referenceSlots.forEach((s,i)=>{if(!s)referenceSlots[i]=waiting.shift()||'';});
   const pinned=heldOrder.filter(s=>!referenceSlots.includes(s)).slice(0,10),rest=eligible.filter(s=>!pinned.includes(s));
   let order;
-  if(!valid||previous.bucket!==bucket)order=[...pinned,...rest].slice(0,10);
+  if(!valid||changedView||previous.bucket!==bucket)order=[...pinned,...rest].slice(0,10);
   else {
     const slots=Array(10).fill('');pinned.forEach((s,i)=>{slots[i]=s;});
     previous.order.slice(0,10).forEach((s,i)=>{if(i>=pinned.length&&rest.includes(s)&&!slots.includes(s))slots[i]=s;});
@@ -131,7 +135,7 @@ function rhythmDisplaySlots(previous, frame, positions=[]) {
     order=slots.filter(Boolean);
   }
   const candidateSnapshotId=accept&&authoritative?accepted.id:valid?previous.candidateSnapshotId??null:null;
-  return {version:2,day,bucket,order,heldOrder,referenceSlots,candidates:eligible,candidateAsOf,candidateSnapshotId,candidateRows};
+  return {version:2,day,bucket,rankingView,order,heldOrder,referenceSlots,candidates:eligible,candidateAsOf,candidateSnapshotId,candidateRows};
 }
 
 function rhythmConfirmedTd(track,time) {
@@ -290,6 +294,7 @@ const MarketRhythm = {
       if(this.active&&value&&value!==this.frame?.ranking_snapshot?.id)this.refresh(true);
     },
     gridKey(){this.publishGrid();},
+    rankingView(){this.reconcileDisplay();},
     positionKey(){this.reconcileDisplay();},
     positionsReady(){this.reconcileDisplay();},
     trader(){this.loadDisplay();this.reconcileDisplay();}},
@@ -377,7 +382,7 @@ const MarketRhythm = {
     },
     reconcileDisplay(){
       if(!this.frame||this.positionsReady===false)return;
-      const next=rhythmDisplaySlots(this.displayState,this.frame,this.positions);
+      const next=rhythmDisplaySlots(this.displayState,this.frame,this.positions,this.rankingView);
       if(JSON.stringify(next)===JSON.stringify(this.displayState))return;
       this.displayState=next;
       try{localStorage.setItem('rhythm_display_v2:'+(this.trader||'master'),JSON.stringify(next));}catch{}
@@ -459,9 +464,14 @@ const MarketRhythm = {
         +'VWAP上方只做多，下方只做空；分类是保持率，非交易胜率\n'+this.gridLocation(row);
     },
     publishGrid(force=false){
-      if(!this.active||!this.frame||this.positionsReady===false||!this.displayState)return;
-      const symbols=this.tvSymbols.every(Boolean)?this.tvSymbols:[];
-      const focusSymbols=this.focusSymbols.every(Boolean)?this.focusSymbols:[];
+      const view=this.rankingView||'mixed',state=this.displayState;
+      if(!this.active||!this.frame||this.positionsReady===false||!state||(state.rankingView||'mixed')!==view)return;
+      const completeView=state.candidateSnapshotId&&Array.isArray(this.frame.rankings?.[view]);
+      // TV always expects a full layout. Benchmark charts replace unused candidate seats.
+      const fill=symbols=>completeView
+        ?symbols.map((symbol,i)=>symbol||this.focusSymbols[1+(i%2)])
+        :symbols.every(Boolean)?symbols:[];
+      const symbols=fill(this.tvSymbols),focusSymbols=fill(this.focusSymbols);
       if(symbols.length||focusSymbols.length)this.$emit('grid',{symbols,focusSymbols,force});
     },
     hover(time){if(!this.locked)this.focus=time;},

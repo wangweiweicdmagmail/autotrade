@@ -806,22 +806,36 @@ test('only trend rows are shown and retired board controls are absent',()=>{
  assert.doesNotMatch(MarketRhythm.template,/setRankMode|setTdSide|TD榜/);
 });
 
-test('side filters select full-pool top tens without changing mixed TV seats and carry the source on manual open',()=>{
+test('side filters sync both TV layouts and carry the selected view on manual open',()=>{
  const {MarketRhythm,rhythmDisplaySlots}=require('../console/static/market-rhythm');
  const at=OPEN+1200,make=(symbol,rank,d)=>({symbol,rank,direction_sign:d,opening_position:d*(2-rank*.1)});
  const mixed=[make('NASDAQ:A',1,1),make('NASDAQ:B',2,-1)],long=[make('NASDAQ:A',1,1),make('NASDAQ:L',2,1)],short=[make('NASDAQ:B',1,-1)];
  const frame={status:'ready',day:'2026-11-18',as_of:at,ranking_snapshot:{version:1,id:'same-three-views',as_of:at,day:'2026-11-18'},
   coverage:{total:3,aligned:3,missing:[]},ranks:mixed,rankings:{mixed,long,short},tracks:[],ranking_tracks:[],symbols:['NASDAQ:A','NASDAQ:B','NASDAQ:L']};
- const emitted=[],ui={...MarketRhythm.data(),...MarketRhythm.methods,frame,lots:[],positionsReady:true,market:{},now:at+5,
+ const emitted=[],ui={...MarketRhythm.data(),...MarketRhythm.methods,active:true,frame,lots:[],positionsReady:true,market:{},now:at+5,
   directionSnapshot:{rows:{'NASDAQ:L':{version:1,source:'confirmed_vwap_direction_v1',id:'live-L',known:true,ready:true,close:100,vwap:101,direction:-1,
    bar_time:at-60,confirmed_at:at,quote_bar_time:at,observed_at:at+1}}},tdSnapshot:{rows:{}},$emit:(...args)=>emitted.push(args)};
  for(const [name,get]of Object.entries(MarketRhythm.computed))Object.defineProperty(ui,name,{get:()=>get.call(ui)});
- ui.displayState=rhythmDisplaySlots(null,frame,[]);const original=ui.tvSymbols.join(',');
+ ui.displayState=rhythmDisplaySlots(null,frame,[]);
  assert.deepEqual(ui.rankingRows.map(r=>r.symbol),['NASDAQ:A','NASDAQ:B']);
- ui.rankingView='long';assert.deepEqual(ui.rankingRows.map(r=>r.symbol),['NASDAQ:A','NASDAQ:L']);
- assert.equal(ui.tvSymbols.join(','),original);const row=ui.rankingRows[1];assert.equal(row.direction_sign,1);assert.equal(row.entryDirection,-1);
+ const changeView=view=>{
+  ui.rankingView=view;
+  MarketRhythm.watch.rankingView.call(ui);
+  MarketRhythm.watch.gridKey.call(ui);
+  return emitted.at(-1)[1];
+ };
+ const longGrid=changeView('long');
+ assert.deepEqual(ui.rankingRows.map(r=>r.symbol),['NASDAQ:A','NASDAQ:L']);
+ assert.deepEqual(longGrid.focusSymbols,['NASDAQ:A','CAPITALCOM:NAS100','CAPITALCOM:SPX500','NASDAQ:L','NASDAQ:QQQ','NASDAQ:NVDA']);
+ assert.equal(longGrid.symbols.length,8);
+ assert(longGrid.symbols.every(s=>s==='CAPITALCOM:NAS100'||s==='CAPITALCOM:SPX500'));
+ const row=ui.rankingRows[1];assert.equal(row.direction_sign,1);assert.equal(row.entryDirection,-1);
  ui.openRank(row);assert.equal(emitted.at(-1)[1].view,'long');assert.equal(emitted.at(-1)[1].symbol,'NASDAQ:L');
- ui.rankingView='short';assert.deepEqual(ui.rankingRows.map(r=>r.symbol),['NASDAQ:B']);assert.equal(ui.tvSymbols.join(','),original);
+ const shortGrid=changeView('short');
+ assert.deepEqual(ui.rankingRows.map(r=>r.symbol),['NASDAQ:B']);
+ assert.equal(shortGrid.focusSymbols[0],'NASDAQ:B');
+ assert(!shortGrid.focusSymbols.includes('NASDAQ:L'));
+ assert.equal(changeView('mixed').focusSymbols[3],'NASDAQ:B');
  assert.equal(MarketRhythm.data().rankingView,'mixed');
 });
 
