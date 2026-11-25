@@ -7,9 +7,8 @@
 .market-rhythm small { display:block; font-size:11px; color:var(--muted); }
 .rhythm-toolbar,.rhythm-toolbar>div,.rhythm-controls,.rhythm-context { display:flex; flex-wrap:wrap; align-items:center; gap:3px 8px; }
 .rhythm-toolbar { justify-content:space-between; flex-shrink:0; }
-.rhythm-toolbar>.rhythm-protection-controls { justify-content:flex-start; }
-.candidate-protection-toolbar>div { display:flex; align-items:center; justify-content:space-between; gap:8px; }
-.candidate-protection-toolbar { display:grid; grid-template-columns:1fr; gap:4px; width:288px; padding:5px 8px; border:0; border-radius:0; background:transparent; }
+.candidate-protection-toolbar>div { display:flex; align-items:center; gap:6px; }
+.candidate-protection-toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:4px 12px; margin-left:auto; }
 .candidate-protection-toolbar .el-switch { height:26px; flex:none; white-space:nowrap; }
 .candidate-protection-toolbar .el-switch__label { white-space:nowrap; }
 .candidate-protection-toolbar .el-input-number { width:76px; }
@@ -93,40 +92,43 @@
 /* Keep a clear title/controls row and moderate breathing room around the board. */
 .rhythm-native { padding:4px 8px; gap:6px; }
 .rhythm-native .rhythm-board { grid-template-columns:288px minmax(0,1fr); }
-.rhythm-native>.rhythm-toolbar { display:grid; grid-template-columns:288px minmax(0,1fr); gap:8px; min-height:66px; align-items:center; }
+.rhythm-native .rhythm-orders { display:flex; flex-direction:column; }
+.rhythm-native .rhythm-orders>.orders-tab-panel { flex:1; min-height:0; height:auto; }
+.rhythm-order-header { display:flex; flex-wrap:wrap; flex:none; align-items:center; gap:4px 12px; padding:2px 6px 5px; }
 .rhythm-native .rhythm-title { flex-direction:column; align-items:flex-start; gap:4px; }
 .rhythm-native .rhythm-orders-controls { min-width:0; }
 .rhythm-native .rhythm-orders-controls .order-title { display:flex; flex-wrap:wrap; align-items:center; justify-content:flex-start; gap:8px; margin:0; padding:0 0 0 9px; min-height:28px; font-size:14px; }
 .rhythm-native .rhythm-orders-controls .order-title>span:first-child { margin-right:4px; }
-.rhythm-native .rhythm-protection-controls { position:static; margin-left:0; }
-.rhythm-native .rhythm-orders .order-title { min-height:36px; padding:4px 0 8px; }
+.rhythm-native .rhythm-orders .order-title { min-height:30px; padding:0; }
 #app:has(> .workspace-nav.is-rhythm-active) .auto-main.workspace-expanded { padding:8px 10px; }
 #app:has(> .workspace-nav.is-rhythm-active) .log-panel { padding-top:2px; }
 @media(max-width:650px) {
-  .rhythm-native>.rhythm-toolbar { grid-template-columns:1fr; }
-  .rhythm-native .rhythm-orders-controls { grid-column:1; }
+  .candidate-protection-toolbar { margin-left:0; }
 }
 
 .rhythm-target { border-color:var(--rhythm-gold); box-shadow:inset 0 0 0 1px #e8c36955; }
 .rhythm-ranking { min-height:0; min-width:0; display:flex; flex-direction:column; border:1px solid var(--panel-border); border-radius:4px; background:var(--panel); overflow:auto; }
-.rhythm-ranking header { display:flex; justify-content:space-between; gap:5px; padding:5px 7px; }
-.rhythm-ranking header>span { color:var(--muted); font-size:11px; }
-.rhythm-ranking p { padding:0 7px 5px; margin:0; color:var(--rhythm-gold); font-size:12px; }
-.rhythm-ranking p small { font-size:11px; }
+.rhythm-ranking-tools { display:flex; align-items:center; flex:none; gap:4px; padding:3px 5px; }
+.rhythm-ranking-tools>strong { white-space:nowrap; }
+.rhythm-ranking-tools .rhythm-view-switch { flex:1; padding:0; min-width:0; }
+.rhythm-ranking-tools .rhythm-view-switch button { padding:3px 2px; white-space:nowrap; }
+.rhythm-ranking-tools .rhythm-refresh { flex:none; padding:2px 5px; }
+.rhythm-compact-status { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:none; }
 .rhythm-benchmarks { flex:none; position:sticky; top:0; z-index:2; margin:0 4px 5px; padding:2px; border:1px solid #e8c36944; border-radius:4px; background:var(--panel); }
-.rhythm-benchmark-row { display:flex; align-items:center; gap:6px; min-height:30px; padding:2px 5px; }
+.rhythm-benchmark-row { display:flex; align-items:center; gap:6px; min-height:22px; padding:1px 5px; }
 .rhythm-benchmark-row+.rhythm-benchmark-row { border-top:1px solid var(--panel-border); }
 .rhythm-benchmark-kind { flex:none; color:var(--rhythm-gold); font-size:11px; }
 .rhythm-benchmark-row>b { font-size:14px; }
 .rhythm-benchmark-row time { margin-left:auto; color:var(--muted); font-size:10px; font-variant-numeric:tabular-nums; white-space:nowrap; }
 .rhythm-benchmark-row .rhythm-rank-td { min-width:51px; text-align:center; }
-.rhythm-rank-list { flex:1; min-height:min-content; display:grid; grid-auto-rows:minmax(42px,1fr); gap:3px; padding:0 4px 4px; }
-.market-rhythm .rhythm-rank-row { display:flex; gap:4px; align-items:center; min-width:0; padding:3px 4px; border:1px solid transparent; border-radius:4px; background:transparent; }
-.market-rhythm .rhythm-rank-pick { flex:1; min-width:0; display:grid; grid-template-columns:18px minmax(0,1fr); gap:4px; align-items:center; padding:0; text-align:left; background:transparent; border:0; }
+.rhythm-rank-list { flex:1; min-height:min-content; display:grid; grid-auto-rows:minmax(28px,1fr); gap:2px; padding:0 4px 4px; }
+.market-rhythm .rhythm-rank-row { display:flex; gap:4px; align-items:center; min-width:0; padding:1px 4px; border:1px solid transparent; border-radius:4px; background:transparent; }
+.market-rhythm .rhythm-rank-pick { flex:1; min-width:0; display:grid; grid-template-columns:34px minmax(0,1fr); gap:4px; align-items:center; padding:0; text-align:left; background:transparent; border:0; }
 .market-rhythm .rhythm-rank-pick[aria-pressed=true] { background:transparent; color:inherit; }
 .rhythm-rank-selected { border-color:var(--rhythm-blue)!important; background:#273e5e!important; }
 .market-rhythm .rhythm-held { border-left:3px solid var(--rhythm-gold); padding-left:2px; background:#e8c3690b; }
 .rhythm-held .rhythm-rank { color:var(--rhythm-gold); font-weight:700; }
+.rhythm-held .rhythm-rank.rhythm-rank-out { color:var(--rhythm-red); }
 .rhythm-held .rhythm-rank-name i { color:var(--rhythm-gold); font-size:11px; }
 .rhythm-rank-row .rhythm-rank { font-size:14px; }
 .rhythm-rank-row b { font-size:15px; line-height:1.25; }.rhythm-rank-row i { font-style:normal; font-size:13px; }
@@ -140,7 +142,7 @@
 @media(max-width:600px) { .rhythm-board { flex:none; min-height:auto; display:flex; flex-direction:column; }.rhythm-ranking { max-height:none; overflow:visible; }.rhythm-orders { min-height:360px; } }
 .rhythm-track-pick strong.rhythm-long small { color:var(--rhythm-green); }
 .rhythm-track-pick strong.rhythm-short small { color:var(--rhythm-red); }
-.market-rhythm .rhythm-open-order { flex:0 0 64px; min-width:64px; min-height:34px; font-size:14px; font-weight:600; padding:7px 8px; line-height:1.2; text-align:center; color:inherit; border-color:currentColor; }
+.market-rhythm .rhythm-open-order { flex:0 0 64px; min-width:64px; min-height:24px; font-size:12px; font-weight:600; padding:3px 6px; line-height:1.2; text-align:center; color:inherit; border-color:currentColor; }
 .market-rhythm .rhythm-open-order:disabled { opacity:.45; cursor:default; }
 .market-rhythm .rhythm-tv-status { max-width:420px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 

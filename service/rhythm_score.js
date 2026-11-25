@@ -75,9 +75,9 @@ function scoreTrend(row,output,asOf){
     direction_vwap:point[2],z:point[8],price_source:'close',bar_time:point[0],confirmed_at:asOf,
     source:'pinets:opening_position',outside_range:point[7]>high?'above':point[7]<low?'below':'inside'};
 }
-function rankingViews(candidates){
+function rankingViews(candidates,limit=10){
   const all=[...candidates].filter(r=>r.direction_sign!==0).sort(compareScores);
-  const select=sign=>all.filter(r=>sign===0||r.direction_sign===sign).slice(0,10).map((r,i)=>({...r,rank:i+1}));
+  const select=sign=>all.filter(r=>sign===0||r.direction_sign===sign).slice(0,limit).map((r,i)=>({...r,rank:i+1}));
   return {mixed:select(0),long:select(1),short:select(-1)};
 }
 function compareScores(a,b){return b.score-a.score||a.symbol.localeCompare(b.symbol);}

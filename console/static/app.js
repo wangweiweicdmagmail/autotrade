@@ -87,6 +87,8 @@ createApp({
       logs: [],                 // 运行日志（后端环形缓冲区）
       bottomTab: 'rhythm',
       rhythmFrame: null,
+      holdingRankState: null,
+      holdingRankNotice: null,
       entryCandidates: {ready:false,reason:'等待候选榜单',rows:[]},
       entryCandidateViews: {},
       confirmedVwap: {version:0,rows:{}},
@@ -837,7 +839,9 @@ createApp({
     // 每秒刷新前端时钟，让 TV/IBKR 时钟走秒；同时扫掉信号栏里超过
     // 4 分钟的 FVG 卡片（自动到期，与手动删除并存）
     setInterval(() => {
+      const lastMinute = Math.floor(this.now / 60);
       this.now = Date.now() / 1000;
+      if (Math.floor(this.now / 60) !== lastMinute) this.checkHoldingRankChanges();
       const cutoff = this.now - 240;
       if (this.fvgFeed.length && this.fvgFeed.some(c => c.ts < cutoff)) {
         this.fvgFeed = this.fvgFeed.filter(c => c.ts >= cutoff);
@@ -1266,6 +1270,9 @@ createApp({
     logoutTrader() {
       this.traderToken = '';
       this.traderName = '';
+      this.holdingRankState = null;
+      this.holdingRankNotice?.close?.();
+      this.holdingRankNotice = null;
       try {
         localStorage.removeItem('trader_token');
         localStorage.removeItem('trader_name');
@@ -1992,6 +1999,7 @@ createApp({
           this.checkAlerts();
           this.lots = msg.lots || [];
           this.lotsReady = true;
+          this.checkHoldingRankChanges(msg.holding_rank_monitor);
           this.tvEntryMarkers = msg.tv_entry_markers || [];
           this.syncTvEntryMarkers();
           this.market = msg.market || {};
@@ -2121,6 +2129,30 @@ createApp({
         }
         speech.speak(u);
       } catch (e) { release?.(); }
+    },
+
+    checkHoldingRankChanges(monitor, now=this.now) {
+      if (this.demoMode) return;
+      const {state,outside,remind,stale}=rhythmHoldingRankChanges(this.holdingRankState,monitor,this.lots,now);
+      this.holdingRankState=state;
+      if(!outside.length) {
+        this.holdingRankNotice?.close?.();
+        this.holdingRankNotice=null;
+        return;
+      }
+      if(!remind)return;
+      const summary=({symbol,rank},spoken=false)=>{
+        const ticker=this.tickerOf(symbol);
+        const name=spoken?ticker.split('').join(' '):ticker;
+        return rank?name+' 第 '+rank+' 名':name+' 无确认名次';
+      };
+      const age=stale?'沿用上次确认榜单，':'';
+      const time=this.hmET(state.board.snapshot.as_of)+' ET 确认';
+      this.speak('持仓仍在混合榜前十之外，'+age+outside.map(row=>summary(row,true)).join('，'),{queue:true,priority:true});
+      this.holdingRankNotice?.close?.();
+      this.holdingRankNotice=this.$notify({title:'持仓仍在前十之外',
+        message:(stale?'沿用 ': '')+time+' · '+outside.map(row=>summary(row)).join('；'),
+        type:'warning',duration:0,position:'bottom-right'});
     },
 
     speakStrategyFailure(action, symbols) {

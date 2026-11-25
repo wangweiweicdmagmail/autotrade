@@ -3,7 +3,7 @@
 // Read-only perception model. Never imports an execution model or broker adapter.
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const {SCORE_CONTRACT,fiveMinuteHistory,fiveMinuteEma5History,scoreTrend,compareScores,rankingViews}=require('./rhythm_score');
+const {SCORE_CONTRACT,fiveMinuteHistory,fiveMinuteEma5History,scoreTrend,rankingViews}=require('./rhythm_score');
 const {STOCK_SESSION,MINUTE_HISTORY,stockSession,hasSessionPrefix}=require('./market_session');
 const BETA = ['CAPITALCOM:NAS100', 'CAPITALCOM:SPX500'];
 const REFERENCES = new Set([...BETA, 'BLACKBULL:WTI', 'NASDAQ:QQQ', 'AMEX:SPY', 'NASDAQ:SMH',
@@ -159,22 +159,22 @@ function buildFrame(series, symbols, now, fiveMinute={}, {marketSession=STOCK_SE
     current.push({...row,day,points,td,beta_ema9:betaEma,events:row.events.filter(e=>e.time+60<=asOf),metrics:null,
       issue,last_closed:points.at(-1)?.[0]??null});
   }
-  const fresh=current.filter(s=>s.last_closed+60===asOf), candidates=[],ranks=[],pending=[];
+  const fresh=current.filter(s=>s.last_closed+60===asOf), candidates=[],pending=[];
   for(const row of fresh){
     if(REFERENCES.has(row.symbol))continue;
     const facts=scoreTrend(row,openingPositions[row.symbol],asOf);
     if(facts?.ready)candidates.push({symbol:row.symbol,...facts});
     else if(facts)pending.push({symbol:row.symbol,reason:facts.reason,...(facts.completed_minutes!=null?{completed_minutes:facts.completed_minutes}:{})});
   }
-  ranks.push(...candidates);
-  ranks.sort(compareScores);
-  ranks.forEach((r,i)=>r.rank=i+1);
-  const rankings=rankingViews(ranks);
-  return {version:1,generated_at:now,as_of:asOf,day,columns:COLUMNS,beta:BETA,ranks:rankings.mixed,rankings,
+  const allRankings=Object.entries(rankingViews(candidates,Infinity));
+  const rankings=Object.fromEntries(allRankings.map(([view,rows])=>[view,rows.slice(0,10)]));
+  const rankPositions=Object.fromEntries(allRankings.map(([view,rows])=>
+    [view,Object.fromEntries(rows.map(({symbol,rank})=>[symbol,rank]))]));
+  return {version:1,generated_at:now,as_of:asOf,day,columns:COLUMNS,beta:BETA,ranks:rankings.mixed,rankings,rank_positions:rankPositions,
     universe:[...symbols],
     ranking_session:{version:1,phase:premarket?'premarket':'regular',
       cohort:premarket?'available':'complete',ready_after:premarket?asOf+10:asOf},
-    scoring:{...SCORE_CONTRACT,stock_session:marketSession,pending,eligible:candidates.length+pending.length,ready:ranks.length},
+    scoring:{...SCORE_CONTRACT,stock_session:marketSession,pending,eligible:candidates.length+pending.length,ready:candidates.length},
     coverage:{received:current.length,aligned:fresh.length,ready:fresh.filter(s=>!s.issue).length,total:symbols.length,
       missing:symbols.filter(s=>!fresh.some(row=>row.symbol===s)),
       excluded:fresh.filter(s=>s.issue).map(s=>({symbol:s.symbol,reason:s.issue}))},

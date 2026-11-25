@@ -145,6 +145,20 @@ def _validate(frame):
                 if view!='mixed' and r.get('direction_sign')!=(1 if view=='long' else -1):
                     raise ValueError('方向榜方向无效')
 
+    positions = frame.get('rank_positions')
+    if positions is not None:
+        if not isinstance(positions, dict) or views is None or positions.keys() != views.keys():
+            raise ValueError('全池名次视图无效')
+        for view, by_symbol in positions.items():
+            if (not isinstance(by_symbol, dict)
+                    or any(symbol not in frame['series'] or type(rank) is not int
+                           for symbol, rank in by_symbol.items())
+                    or set(by_symbol.values()) != set(range(1, len(by_symbol) + 1))):
+                raise ValueError('全池名次无效')
+            top = sorted((rank, symbol) for symbol, rank in by_symbol.items() if rank <= 10)
+            if top != [(row['rank'], row['symbol']) for row in views[view]]:
+                raise ValueError('全池名次与前十榜不一致')
+
 
 class MarketRhythmReader:
     def __init__(self, path: Path, *, symbols=None):
@@ -289,5 +303,5 @@ class MarketRhythmReader:
                 "selected": selected, "symbols": sorted(available), "ranks": ranks,
                 "tracks": tracks[:base_count],
                 "watch_tracks": tracks[base_count:watch_end], "ranking_tracks":tracks[watch_end:],
-                "rankings":ranked_views, "revision": self._accepted_id}
+                "rankings":ranked_views, "rank_positions":frame.get('rank_positions'), "revision": self._accepted_id}
             return deepcopy(result)

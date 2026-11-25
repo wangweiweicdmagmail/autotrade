@@ -1,11 +1,12 @@
 #!/bin/bash
 # 一键实盘重启（restart_live.sh）
 # ================================================
-# 流程：TWS 预检 → 杀旧 console/daemon → EXECUTION_ENABLED=1 启动
+# 流程：TWS 预检 → 等待旧进程退出和订单写锁释放 → EXECUTION_ENABLED=1 启动
 #       → 轮询验证（API / TV 数据按股票池就绪 / IBKR 连接）→ 打印结论。
 # 用法：./restart_live.sh
 # 仅检查 Python（不重启）：./restart_live.sh --check-python
-# 退出码：0 = 全部就绪；1 = TV 数据未就绪；2 = IBKR 未连接（可登录 TWS 后等自动重连）
+# AUTOTRADE_SHUTDOWN_TIMEOUT：停止旧进程和等待写锁的总时限，默认 120 秒。
+# 退出码：0 = 全部就绪；1 = 重启失败或 TV 数据未就绪；2 = IBKR 未连接（可登录 TWS 后等自动重连）
 # -----------------------------------------------
 set -u
 cd "$(dirname "$0")"
@@ -49,33 +50,120 @@ else
   TWS_OK=0
 fi
 
-echo "== [2/4] 停止旧进程 =="
-pkill -f "uvicorn console.app" 2>/dev/null && echo "  console 已停止" || echo "  无运行中的 console"
-sleep 3
-pkill -f tv_cloud_daemon 2>/dev/null
-sleep 1
-
-echo "== [3/4] 实盘启动 =="
-echo "=== restart $(date) LIVE (restart_live.sh) ===" >> "$LOG"
+echo "== [2/4] 停止旧进程并等待订单写锁释放 =="
 guard_fa_default=1
 if [[ -n "${EXTERNAL_MANUAL_GUARD_TEST_ACCOUNT:-}" ]]; then
   guard_fa_default=0
 fi
-EXECUTION_ENABLED=1 \
+if ! EXECUTION_ENABLED=1 \
 EXTERNAL_MANUAL_GUARD_ENABLED="${EXTERNAL_MANUAL_GUARD_ENABLED:-1}" \
 EXTERNAL_MANUAL_GUARD_FA_SCOPE="${EXTERNAL_MANUAL_GUARD_FA_SCOPE:-$guard_fa_default}" \
-"$PYTHON_BIN" - "$LOG" <<'PY'
-import subprocess, sys
+"$PYTHON_BIN" -u - "$LOG" <<'PY_LAUNCH'
+import fcntl
+import math
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
 
-# A separate session survives the launcher/tool process group exiting.
-with open(sys.argv[1], 'ab', buffering=0) as log:
-    process = subprocess.Popen(
-        [sys.executable, '-m', 'uvicorn', 'console.app:app', '--host', '0.0.0.0', '--port', '8000'],
-        stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-        start_new_session=True, close_fds=True,
+from execution.writer_lock import acquire_writer_lock, release_writer_lock
+
+
+def process_table():
+    rows = subprocess.run(
+        ['ps', '-axww', '-o', 'pid=', '-o', 'stat=', '-o', 'command='],
+        check=True, capture_output=True, text=True, timeout=5,
+    ).stdout.splitlines()
+    processes = {}
+    for row in rows:
+        fields = row.strip().split(None, 2)
+        if len(fields) == 3 and fields[0].isdigit() and not fields[1].startswith('Z'):
+            processes[int(fields[0])] = fields[2]
+    return processes
+
+
+def wait_until_ready(check, deadline, blocked_message):
+    while not check():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(blocked_message)
+        time.sleep(min(0.25, remaining))
+
+
+def stop_processes(pattern, label, deadline):
+    old_pids = {pid for pid, command in process_table().items() if pattern.search(command)}
+    if not old_pids:
+        return
+    for pid in old_pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    names = ', '.join(map(str, sorted(old_pids)))
+    print(f'  等待{label}退出（PID {names}）')
+    wait_until_ready(
+        lambda: not old_pids.intersection(process_table()), deadline,
+        f'{label}未在时限内退出（PID {names}）',
     )
-print(f'  已启动 pid {process.pid}（日志 {sys.argv[1]}）')
-PY
+
+
+def writer_available(path):
+    if not acquire_writer_lock(str(path)):
+        return False
+    release_writer_lock()
+    return True
+
+
+def launch(log_path, timeout):
+    console = re.compile(r'(?:^|[\s/])uvicorn\s+console\.app:app(?:\s|$)')
+    daemon_path = re.escape(str(Path('service/tv_cloud_daemon.js').resolve()))
+    daemon = re.compile(r'(?:^|\s)' + daemon_path + r'(?:\s|$)')
+    writer_path = log_path.with_name('autotrade_writer.lock')
+    with log_path.with_name('autotrade_restart.lock').open('a') as restart_lock:
+        try:
+            fcntl.flock(restart_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError('另一个重启脚本正在停止或启动控制台') from error
+        with log_path.open('ab', buffering=0) as log:
+            deadline = time.monotonic() + timeout
+            # Let the console finish cleanup before stopping any orphaned TV daemon.
+            stop_processes(console, '旧控制台', deadline)
+            stop_processes(daemon, '旧 TV 行情进程', deadline)
+            wait_until_ready(
+                lambda: writer_available(writer_path), deadline,
+                '订单写锁仍被占用',
+            )
+            if any(console.search(command) or daemon.search(command)
+                   for command in process_table().values()):
+                raise RuntimeError('等待期间出现了新的控制台或 TV 行情进程')
+            print('  已确认旧进程退出、订单写锁释放')
+            print('== [3/4] 实盘启动 ==')
+            stamp = datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')
+            log.write(f'=== restart {stamp} LIVE (restart_live.sh) ===\n'.encode())
+            # The application itself acquires the writer lock again during startup.
+            process = subprocess.Popen(
+                [sys.executable, '-m', 'uvicorn', 'console.app:app', '--host', '0.0.0.0', '--port', '8000'],
+                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                start_new_session=True, close_fds=True,
+            )
+    print(f'  已启动 pid {process.pid}（日志 {log_path}）')
+
+
+try:
+    timeout = float(os.environ.get('AUTOTRADE_SHUTDOWN_TIMEOUT', '120'))
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError('AUTOTRADE_SHUTDOWN_TIMEOUT 必须为正数')
+    launch(Path(sys.argv[1]), timeout)
+except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as error:
+    sys.exit(f'错误：{error}。未启动新控制台，请检查日志。')
+PY_LAUNCH
+then
+  exit 1
+fi
 
 echo "== [4/4] 就绪验证 =="
 "$PYTHON_BIN" - <<'EOF'

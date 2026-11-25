@@ -20,8 +20,10 @@ def three_views():
         sign=1 if i<12 else -1;value=sign*(12-i%12)
         rows.append({'symbol':s,'rank':0,'direction_sign':sign,'opening_position':value,'score':abs(value)})
     rows.sort(key=lambda r:(-r['score'],r['symbol']))
-    def view(sign):return [{**r,'rank':i+1} for i,r in enumerate([r for r in rows if not sign or r['direction_sign']==sign][:10])]
-    data['rankings']={'mixed':view(0),'long':view(1),'short':view(-1)};data['ranks']=data['rankings']['mixed']
+    def view(sign):return [{**r,'rank':i+1} for i,r in enumerate(r for r in rows if not sign or r['direction_sign']==sign)]
+    all_views={'mixed':view(0),'long':view(1),'short':view(-1)}
+    data['rankings']={name:rows[:10] for name,rows in all_views.items()};data['ranks']=data['rankings']['mixed']
+    data['rank_positions']={name:{row['symbol']:row['rank'] for row in rows} for name,rows in all_views.items()}
     data['coverage']={'total':24,'aligned':24,'received':24,'missing':[]};data['scoring'].update(ready=24,eligible=24)
     data['beta']=[];return data
 
@@ -48,6 +50,18 @@ def test_partial_minute_retains_all_three_views_and_same_snapshot_id(tmp_path):
     put(path,changed);after=reader.read(now=NOW+60)
     assert after['ranking_snapshot']==before['ranking_snapshot'] and after['rankings']==before['rankings']
     assert after['batch_progress']['waiting']
+    assert after['rank_positions'] == before['rank_positions']
+    assert after['rank_positions']['mixed']['NASDAQ:L11'] == 23
+    assert after['rank_positions']['long']['NASDAQ:L11'] == 12
+
+
+def test_full_pool_ranks_must_agree_with_top_ten(tmp_path):
+    path = tmp_path / 'rhythm.json'
+    data = three_views()
+    positions = data['rank_positions']['mixed']
+    positions['NASDAQ:L00'], positions['NASDAQ:L11'] = positions['NASDAQ:L11'], positions['NASDAQ:L00']
+    put(path, data)
+    assert MarketRhythmReader(path).read(now=NOW)['status'] == 'error'
 
 
 @pytest.mark.parametrize('view',['mixed','long','short'])

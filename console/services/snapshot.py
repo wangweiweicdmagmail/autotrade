@@ -32,6 +32,7 @@ class SnapshotService:
             "ipo_openings": self.context.ipo_alerts.snapshot(self.context.collector,time.time()),
             "entry_candidates": candidates['trend'],
             "entry_candidate_views": candidates['views'],
+            "holding_rank_monitor": candidates.get('rank_monitor'),
             "confirmed_td": candidates['confirmed_td'],
             "confirmed_vwap": candidates['confirmed_vwap'],
             "status": {

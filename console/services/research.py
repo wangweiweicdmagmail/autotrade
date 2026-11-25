@@ -42,7 +42,15 @@ class ResearchService:
         td=build_snapshot(market,now)
         direction=build_snapshot(market,now,require_td=False)
         views={view:candidate_snapshot(frame,now,market,view=view,td_snapshot=td,direction_snapshot=direction) for view in ('mixed','long','short')}
-        return {'trend':views['mixed'],'views':views,'confirmed_td':td,'confirmed_vwap':direction}
+        rank_monitor = None
+        if frame.get('status') == 'ready' and (frame.get('ranking_session') or {}).get('phase') != 'premarket':
+            rank_monitor = {
+                'snapshot': frame['ranking_snapshot'],
+                'top10': [row['symbol'] for row in frame['ranks']],
+                'positions': (frame.get('rank_positions') or {}).get('mixed', {}),
+            }
+        return {'trend':views['mixed'],'views':views,'confirmed_td':td,'confirmed_vwap':direction,
+                'rank_monitor':rank_monitor}
 
     async def api_market_rhythm(self, symbol: str = "", watch: str = "") -> dict:
         return await asyncio.to_thread(self._market_rhythm.read, symbol, watch=watch)

@@ -662,15 +662,22 @@ test('visible minute ranking reorders independently of ten-minute TV seats and r
 test('held stocks remain pinned while all ten current candidates keep their real ranks',()=>{
  const {MarketRhythm}=require('../console/static/market-rhythm');
  const ui={...MarketRhythm.data(),...MarketRhythm.methods,positionsReady:true,
-  lots:[{symbol:'NASDAQ:HELD',state:'ACTIVE',filled_qty:5,side:'long',entry_time:1}],market:{},frame:rankedFrame(rankedSymbols)};
+  lots:[{symbol:'NASDAQ:HELD',state:'ACTIVE',filled_qty:5,side:'long',entry_time:1}],market:{},
+  frame:{...rankedFrame(rankedSymbols),rank_positions:{mixed:{'NASDAQ:HELD':17}}}};
  for(const key of ['positions','sourceTracks','rows','rankingRows'])Object.defineProperty(ui,key,{get:()=>MarketRhythm.computed[key].call(ui)});
  ui.reconcileDisplay();assert.equal(ui.rows.length,10);assert.equal(ui.rankingRows.length,11);
- assert.equal(ui.rankingRows[0].symbol,'NASDAQ:HELD');assert.equal(ui.rankingRows[0].rank,null);
+ assert.equal(ui.rankingRows[0].symbol,'NASDAQ:HELD');assert.equal(ui.rankingRows[0].rank,17);
  assert.equal(ui.rankingRows[0].gridSeat,null);assert.equal(ui.rankingRows[0].referenceSlot,0);
  assert.equal(ui.gridLocation(ui.rankingRows[0]),'TV六格下中 · 持仓');
  assert.match(ui.scoreDescription(ui.rankingRows[0]),/TV六格下中/);
  assert.deepEqual(ui.rows.map(r=>r.symbol),rankedSymbols);
  assert.deepEqual(ui.rankingRows.slice(1).map(r=>r.rank),[1,2,3,4,5,6,7,8,9,10]);
+ ui.lots.push({symbol:rankedSymbols[3],state:'ACTIVE',filled_qty:3,side:'long',entry_time:2});
+ assert.deepEqual(ui.rankingRows.slice(0,2).map(row=>row.rank),[4,17]);
+ ui.selected='NASDAQ:HELD';
+ assert.deepEqual(ui.rankingRows.slice(0,2).map(row=>row.rank),[17,4]);
+ assert.deepEqual(ui.rankingRows.filter(row=>row.candidateRank).map(row=>row.rank).sort((a,b)=>a-b),
+  [1,2,3,4,5,6,7,8,9,10]);
 });
 
 test('a closed-minute candidate snapshot is accepted once; later revisions cannot change names or rank metadata',()=>{
@@ -881,4 +888,37 @@ test('new client refuses an old scoring model instead of presenting its rows as 
  await ui.refresh();assert.equal(ui.frame,null);assert.match(ui.error,/重启控制台/);
  ui.displayState={candidateRows:[{symbol:'NASDAQ:OLD'}]};ui.rows=[];ui.liveTd=()=>({count:null});
  assert.deepEqual(MarketRhythm.computed.rankingRows.call(ui),[]);
+});
+
+test('held ranks remind every minute on the last accepted mixed board and stop on recovery or exit',()=>{
+ const {rhythmHoldingRankChanges}=require('../console/static/market-rhythm');
+ const symbol='NASDAQ:HELD',lots=[{symbol:'BATS:HELD',state:'ACTIVE',filled_qty:5,side:'long'}];
+ const at=minute=>OPEN+minute*60;
+ const board=(minute,rank)=>({
+  snapshot:{version:1,id:'snapshot-'+minute,day:'2026-11-18',as_of:at(minute)},
+  top10:rank<=10?[symbol]:[],positions:{[symbol]:rank},
+ });
+ let result=rhythmHoldingRankChanges(null,board(1,8),lots,at(1));
+ assert.equal(result.remind,false);
+ result=rhythmHoldingRankChanges(result.state,board(1,14),lots,at(1)+5);
+ assert.equal(result.remind,false); // Same-minute revisions do not change the accepted board.
+ result=rhythmHoldingRankChanges(result.state,board(2,14),lots,at(2));
+ assert.equal(result.remind,true);
+ assert.deepEqual(result.outside,[{symbol,rank:14}]);
+ result=rhythmHoldingRankChanges(result.state,undefined,lots,at(2)+25);
+ assert.equal(result.remind,false);
+ result=rhythmHoldingRankChanges(result.state,undefined,lots,at(3));
+ assert.equal(result.remind,true);
+ assert.equal(result.stale,true);
+ assert.deepEqual(result.outside,[{symbol,rank:14}]);
+ result=rhythmHoldingRankChanges(result.state,board(4,7),lots,at(4));
+ assert.deepEqual(result.outside,[]);
+ assert.equal(result.remind,false);
+ result=rhythmHoldingRankChanges(result.state,board(5,11),lots,at(5));
+ assert.equal(result.remind,true);
+ result=rhythmHoldingRankChanges(result.state,undefined,[],at(6));
+ assert.deepEqual(result.outside,[]);
+ assert.equal(result.remind,false);
+ const alreadyOutside=rhythmHoldingRankChanges(null,board(5,11),lots,at(5));
+ assert.equal(alreadyOutside.remind,true);
 });

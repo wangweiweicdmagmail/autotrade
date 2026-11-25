@@ -74,6 +74,25 @@ function rhythmPositions(lots=[], universe=[]) {
     .map(p=>({...p,side:p.longQty&&p.shortQty?'mixed':p.longQty?'long':'short'}));
 }
 
+// Remind once per wall-clock minute using the latest accepted mixed board.
+function rhythmHoldingRankChanges(previous,current,lots,now) {
+  const incoming=current?.snapshot,latest=previous?.board?.snapshot;
+  const accepted=incoming?.version===1&&incoming.id&&incoming.day
+    &&Number.isSafeInteger(incoming.as_of)&&incoming.as_of>0&&incoming.as_of<=now
+    &&Array.isArray(current.top10)&&(!latest||incoming.as_of>latest.as_of);
+  const board=accepted?current:previous?.board;
+  if(!board||!Number.isFinite(now))return {state:previous,outside:[],remind:false};
+  const top10=new Set(board.top10);
+  const known=new Set([...top10,...Object.keys(board.positions||{}),...(previous?.heldKnown||[])]);
+  const heldKnown=rhythmPositions(lots,[...known]).map(p=>p.symbol).filter(symbol=>known.has(symbol));
+  const outside=heldKnown.filter(symbol=>!top10.has(symbol))
+    .map(symbol=>({symbol,rank:board.positions?.[symbol]??null}));
+  const minute=Math.floor(now/60),lastReminder=previous?.lastReminder??-1;
+  const remind=outside.length>0&&minute>lastReminder;
+  return {state:{board,heldKnown,lastReminder:remind?minute:lastReminder},outside,remind,
+    stale:now-board.snapshot.as_of>=60};
+}
+
 // A partial minute is not evidence that a stock has left the cross-section.
 function rhythmRankingReady(frame) {
   const c=frame?.coverage;
@@ -331,13 +350,19 @@ const MarketRhythm = {
       const candidates=[...(this.frame?((this.frame.rankings||{})[this.rankingView||'mixed']||this.displayState?.candidateRows||[]):[])].sort((a,b)=>a.rank-b.rank);
       const positions=this.positions||[],held=new Map(positions.map(p=>[p.symbol,p]));
       const bySymbol=new Map(candidates.map(r=>[r.symbol,r]));
-      const order=[...positions.map(p=>p.symbol),...candidates.map(r=>r.symbol).filter(s=>!held.has(s))];
+      const view=this.rankingView||'mixed',byView=this.frame?.rank_positions||{};
+      const actualRank=symbol=>bySymbol.get(symbol)?.rank??byView[view]?.[symbol]??null;
+      const pinned=positions.map(p=>p.symbol).sort((a,b)=>
+        Number(b===this.selected)-Number(a===this.selected)
+        || (actualRank(a)??Number.MAX_SAFE_INTEGER)-(actualRank(b)??Number.MAX_SAFE_INTEGER));
+      const order=[...pinned,...candidates.map(r=>r.symbol).filter(s=>!held.has(s))];
       return order.map(symbol=>{
         const raw=bySymbol.get(symbol),position=held.get(symbol),seat=this.rows.find(r=>r.symbol===symbol);
         const fact=this.liveTd(symbol),td=fact.count,direction=position?(position.side==='long'?1:position.side==='short'?-1:0):raw?.direction_sign;
         const referenceSlot=(this.displayState?.referenceSlots||[]).indexOf(symbol);
         const entry=this.liveDirection(symbol);
-        return {...raw,symbol,rank:raw?.rank??null,candidateRank:raw?.rank??null,gridSeat:seat?.rank??null,referenceSlot,
+        const rank=actualRank(symbol), mixedRank=byView.mixed?.[symbol]??this.frame?.ranks?.find(r=>r.symbol===symbol)?.rank??null;
+        return {...raw,symbol,rank,mixedRank,candidateRank:raw?.rank??null,gridSeat:seat?.rank??null,referenceSlot,
           isHeld:!!position,position,direction_sign:direction,entryDirection:entry.known?entry.direction:0,entryReason:entry.reason,tdCount:td,tdState:rhythmTdState(td),
           tdLabel:td==null?'TD —':'TD '+(td>0?'+':'')+td,tdTitle:this.tdTitle(fact)};
       });
@@ -367,7 +392,13 @@ const MarketRhythm = {
     sessionState(){return rhythmSessionState(this.frame?.as_of||0,this.clockNow,this.frame?.ranking_session);},
     facts(){return this.tracks.filter(t=>t.is_beta).map(t=>{const p=t.points?.at(-1),z=p?.[8];return this.ticker(t.symbol)+' '+(!t.aligned?'数据待齐':!Number.isFinite(z)?'轨道未就绪':z>1?'上轨外':z<-1?'下轨外':z>=0?'上区间':'下区间');}).join(' · ');},
   },
-  methods:{issueLabel:reason=>RHYTHM_ISSUES[reason]||reason,eventLabel:type=>RHYTHM_EVENTS[type]||type,clock:rhythmTime,ticker:rhythmTicker,number:rhythmNumber,signed:rhythmSigned,phase:p=>RHYTHM_LABELS[p]||p,
+  methods:{
+    rankTitle(row){
+      if(row.rank)return '本分钟榜单第 '+row.rank+' 名';
+      if(row.mixedRank)return '本方向无名次 · 混合榜第 '+row.mixedRank+' 名';
+      return '无确认名次';
+    },
+    issueLabel:reason=>RHYTHM_ISSUES[reason]||reason,eventLabel:type=>RHYTHM_EVENTS[type]||type,clock:rhythmTime,ticker:rhythmTicker,number:rhythmNumber,signed:rhythmSigned,phase:p=>RHYTHM_LABELS[p]||p,
     liveDirection(symbol){return rhythmVwapFact(this.directionSnapshot?.rows?.[symbol],this.now??this.clockNow);},
     liveTd(symbol){return rhythmTdFact(this.tdSnapshot?.rows?.[symbol],this.now??this.clockNow);},
     tdTitle(fact){return fact.known?'K线 '+rhythmTime(fact.bar_time)+' ET · '+rhythmTime(fact.confirmed_at)+' 收盘确认 · TD '+(fact.count>0?'+':'')+fact.count+(fact.ready?'':' · '+fact.reason):fact.reason;},
@@ -480,27 +511,31 @@ const MarketRhythm = {
 
   },
   template:`<div class="market-rhythm rhythm-native" aria-label="前十候选与订单批次工作台" :data-ranking-snapshot-id="displayState?.candidateSnapshotId || ''" :data-ranking-as-of="displayState?.candidateAsOf || ''">
-    <header class="rhythm-toolbar"><div class="rhythm-protection-controls"><slot name="protection-controls"></slot></div><div class="rhythm-orders-controls"><slot name="order-controls"></slot></div></header>
-    <div v-if="error" class="rhythm-message" role="status">{{ error }}<span v-if="frame"> · 保留上次榜单</span></div>
-    <div v-if="rankingPending" class="rhythm-message" role="status">下一批收盘数据 {{ rankingProgress.aligned || 0 }}/{{ rankingProgress.total || '—' }} · {{ frame?.batch_progress?.message || '候选未收齐' }}，保留上批榜单与宫格</div>
-    <div v-if="frame?.ranking_session?.phase==='premarket'" class="rhythm-message" role="status">盘前观察榜 · {{ clock(frame.as_of) }} ET · 本批对齐 {{ frame.coverage.aligned }}/{{ frame.coverage.total }} · {{ frame.coverage.missing.length }}只缺本分钟数据，{{ frame.scoring.pending.length }}只评分待齐 · 仅供观察，常规盘才可开仓</div>
     <div class="rhythm-board">
-      <aside class="rhythm-ranking" aria-label="固定指数与每分钟候选排名"><header><strong>趋势榜</strong><span>小区间归一化</span></header>
+      <aside class="rhythm-ranking" aria-label="固定指数与每分钟候选排名">
+        <header class="rhythm-ranking-tools">
+        <strong :title="tvSyncStatus || '一分钟收盘更新 · 持仓置顶'">趋势榜</strong>
         <div class="rhythm-view-switch" role="group" aria-label="候选方向筛选"><button v-for="option in [{value:'mixed',label:'混合'},{value:'long',label:'只看多头'},{value:'short',label:'只看空头'}]" :key="option.value" type="button" :aria-pressed="rankingView===option.value" :class="{selected:rankingView===option.value}" @click="rankingView=option.value">{{ option.label }}</button></div>
-        <p>一分钟收盘更新 · 持仓置顶<small>TV席位每10分钟重排 · 进出榜局部替换</small></p>
+        <button type="button" class="rhythm-refresh" title="刷新数据" aria-label="刷新数据" @click="refresh(true)">↻</button>
+        </header>
+        <div v-if="error" class="rhythm-message rhythm-compact-status" role="status" :title="error">{{ error }}</div>
+        <div v-else-if="rankingPending" class="rhythm-message rhythm-compact-status" role="status" :title="frame?.batch_progress?.message || '保留上批榜单与宫格'">待齐 {{ rankingProgress.aligned || 0 }}/{{ rankingProgress.total || '—' }}</div>
+        <div v-else-if="frame && ['premarket','history','stale'].includes(sessionState)" class="rhythm-message rhythm-compact-status" role="status">{{ sessionState==='premarket'?'盘前观察':sessionState==='history'?'历史榜单':'榜单滞后' }}</div>
         <div class="rhythm-benchmarks" role="list" aria-label="固定大盘指数TD"><div v-for="row in benchmarkRows" :key="row.symbol" class="rhythm-benchmark-row" role="listitem" :data-symbol="row.symbol" :title="row.tdTitle">
           <span class="rhythm-benchmark-kind">指</span><b>{{ ticker(row.symbol) }}</b><time>{{ row.confirmedAt ? clock(row.confirmedAt)+' ET' : '待确认' }}</time><span class="rhythm-rank-td" :class="'rhythm-td-'+row.tdState">{{ row.tdLabel }}</span>
         </div></div>
-        <div v-if="positionOverflow" class="rhythm-message">另有 {{ positionOverflow }} 只持仓未放入TV，请在订单批次查看</div>
+        <div v-if="positionOverflow" class="rhythm-message rhythm-compact-status" role="status">TV 未放入 {{ positionOverflow }} 只持仓</div>
         <div v-if="visibleRankingRows.length" class="rhythm-rank-list" role="list"><div v-for="row in visibleRankingRows" :key="row.symbol" class="rhythm-rank-row" role="listitem" :class="[row.direction_sign===1?'rhythm-long':row.direction_sign===-1?'rhythm-short':'',{'rhythm-rank-selected':selected===row.symbol,'rhythm-held':row.isHeld}]">
-          <button type="button" class="rhythm-rank-pick" :aria-label="'选中'+ticker(row.symbol)" :aria-pressed="selected===row.symbol" @click="choose(row.symbol)"><span class="rhythm-rank" :title="row.rank?'本分钟候选排名 '+row.rank:'榜外持仓'">{{ row.rank || '持' }}</span><span><b class="rhythm-rank-name"><span>{{ ticker(row.symbol) }} <i>{{ row.isHeld ? (row.position.side==='long'?'持多':row.position.side==='short'?'持空':'持仓') : row.direction_sign===1?'多':row.direction_sign===-1?'空':row.tdCount==null?'待确认':'中性' }}</i></span><span class="rhythm-rank-td" :class="'rhythm-td-'+row.tdState" :title="row.tdTitle">{{ row.tdLabel }}</span></b><small :title="scoreDescription(row)">{{ rowDescription(row) }}</small></span></button>
+          <button type="button" class="rhythm-rank-pick" :aria-label="'选中'+ticker(row.symbol)" :aria-pressed="selected===row.symbol" @click="choose(row.symbol)" :title="scoreDescription(row)+' · '+rowDescription(row)"><span class="rhythm-rank" :class="{'rhythm-rank-out':row.isHeld&&(row.rank||row.mixedRank)>10}" :title="rankTitle(row)">{{ row.rank || (row.mixedRank ? '混'+row.mixedRank : '—') }}</span><span><b class="rhythm-rank-name"><span>{{ ticker(row.symbol) }} <i>{{ row.isHeld ? (row.position.side==='long'?'持多':row.position.side==='short'?'持空':'持仓') : row.direction_sign===1?'多':row.direction_sign===-1?'空':row.tdCount==null?'待确认':'中性' }}</i></span><small v-if="Number.isFinite(row.opening_position)" :title="scoreDescription(row)">{{ signed(row.opening_position) }}</small><span class="rhythm-rank-td" :class="'rhythm-td-'+row.tdState" :title="row.tdTitle">{{ row.tdLabel }}</span></b></span></button>
           <button type="button" class="rhythm-open-order" :class="!row.isHeld ? (row.entryDirection===1?'rhythm-long':row.entryDirection===-1?'rhythm-short':'') : ''" :title="row.isHeld?'管理现有批次':'打开开仓卡片；按VWAP趋势方向交易，TD仅供参考'" :aria-label="ticker(row.symbol)+(row.isHeld?'管理持仓':'开仓')" @click="openRank(row)">{{ row.isHeld?'管理':row.entryDirection===1?'开多':row.entryDirection===-1?'开空':'开仓' }}</button>
         </div></div>
-        <div v-if="!visibleRankingRows.length" class="rhythm-track-empty">{{ positionsReady===false?'正在同步持仓':'等待持仓或有效趋势候选' }}</div><footer><button type="button" @click="refresh(true)">刷新数据</button><small title="榜单每分钟收盘更新；TV席位每10分钟重排，进出榜只局部替换">持仓即时更新</small></footer>
+        <div v-if="!visibleRankingRows.length" class="rhythm-track-empty">{{ positionsReady===false?'正在同步持仓':'等待持仓或有效趋势候选' }}</div>
       </aside>
-      <section class="rhythm-orders" aria-label="订单批次"><slot><div class="rhythm-track-empty">等待订单批次</div></slot></section>
+      <section class="rhythm-orders" aria-label="订单批次">
+        <header class="rhythm-order-header"><div class="rhythm-orders-controls"><slot name="order-controls"></slot></div><slot name="protection-controls"></slot></header>
+        <slot><div class="rhythm-track-empty">等待订单批次</div></slot>
+      </section>
     </div>
-    <footer class="rhythm-bottom"><span>{{ frame?.ranking_session?.phase==='premarket'?'盘前观察候选 · 等常规盘完整榜单后开仓':'榜单按小区间中点位置 · 开仓按VWAP方向 · 09:45起允许新开仓' }}</span><span>{{ sessionState==='premarket'?'盘前观察 · ':sessionState==='history'?'历史榜单 · ':sessionState==='stale'?'排名批次滞后 · ':'' }}auto_trade 八格 / auto_trade2 六格 / 控制台独立窗口</span></footer>
   </div>`,
 };
-if(typeof module!=='undefined')module.exports={MarketRhythm,RhythmTrack,rhythmChartModel,rhythmTime,rhythmSessionState,rhythmTradePreview,rhythmConfirmedTd,rhythmFormingPoint,rhythmPositions,rhythmDisplaySlots,rhythmRankingReady,rhythmTdFact,rhythmVwapFact,rhythmEntryWindow};
+if(typeof module!=='undefined')module.exports={MarketRhythm,RhythmTrack,rhythmChartModel,rhythmTime,rhythmSessionState,rhythmTradePreview,rhythmConfirmedTd,rhythmFormingPoint,rhythmPositions,rhythmHoldingRankChanges,rhythmDisplaySlots,rhythmRankingReady,rhythmTdFact,rhythmVwapFact,rhythmEntryWindow};
